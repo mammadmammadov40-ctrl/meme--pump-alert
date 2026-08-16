@@ -96,6 +96,7 @@ def check():
             )
 
             send_message(message)
+            send_message("🟢 BOT STARTED - Telegram bağlantısı işləyir")
 
 while True:
     try:
