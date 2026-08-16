@@ -16,11 +16,17 @@ seen = set()
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={
+
+    r = requests.post(url, json={
         "chat_id": CHAT_ID,
         "text": text,
         "disable_web_page_preview": True
-    })
+    }, timeout=20)
+
+    print("TELEGRAM STATUS:", r.status_code)
+    print("TELEGRAM RESPONSE:", r.text)
+
+    r.raise_for_status()
 
 def get_tokens():
     url = "https://api.dexscreener.com/token-profiles/latest/v1"
