@@ -1,4 +1,4 @@
-MEME PUMP ALERT — bot.py
+import  os
 
 import os
 import time
