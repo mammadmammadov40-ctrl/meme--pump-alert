@@ -1,3 +1,5 @@
+MEME PUMP ALERT — bot.py
+
 import os
 import time
 import requests
@@ -15,22 +17,21 @@ CHAT_ID = os.environ["CHAT_ID"]
 
 CHAIN = "solana"
 
-# Yeni tokenləri tutmaq üçün
-MAX_AGE_MINUTES = 60
+# Pair yaşı: 3 - 120 gün
+MIN_AGE_DAYS = 3
+MAX_AGE_DAYS = 120
 
-# Çox kiçik/zəif pool-ları azaltmaq üçün
+# Likvidlik: minimum $10,000
 MIN_LIQUIDITY = 10_000
 
-# Market cap üçün minimum
-MIN_MARKET_CAP = 20_000
-
-# 5 dəqiqəlik dəyişiklik
-MIN_5M_CHANGE = 5
+# Market Cap: $10,000 - $1,000,000
+MIN_MARKET_CAP = 10_000
+MAX_MARKET_CAP = 1_000_000
 
 # 5 dəqiqəlik minimum volume
 MIN_5M_VOLUME = 5_000
 
-# Eyni tokeni təkrar göndərməsin
+# Eyni pair-i təkrar göndərməmək üçün
 seen = set()
 
 
@@ -58,7 +59,7 @@ def send_message(text):
 
 
 # =========================
-# GET LATEST TOKENS
+# DEXSCREENER
 # =========================
 
 def get_latest_tokens():
@@ -73,21 +74,16 @@ def get_latest_tokens():
 
     data = response.json()
 
-    if not isinstance(data, list):
-        return []
+    if isinstance(data, list):
+        return data
 
-    return data
+    return []
 
-
-# =========================
-# GET TOKEN PAIRS
-# =========================
 
 def get_pairs(token_address):
-
     url = (
         f"https://api.dexscreener.com/"
-        f"tokens/v1/{CHAIN}/{token_address}"
+        f"token-pairs/v1/{CHAIN}/{token_address}"
     )
 
     response = requests.get(
@@ -99,23 +95,21 @@ def get_pairs(token_address):
 
     data = response.json()
 
-    if not isinstance(data, list):
-        return []
+    if isinstance(data, list):
+        return data
 
-    return data
+    return []
 
 
 # =========================
-# CHECK TOKENS
+# CHECK
 # =========================
 
 def check():
 
-    print("Checking new tokens...")
-
     tokens = get_latest_tokens()
 
-    print("Latest profiles:", len(tokens))
+    print("TOKENS FOUND:", len(tokens))
 
     for token in tokens:
 
@@ -130,137 +124,163 @@ def check():
             if not address:
                 continue
 
-            # Təkrar token
-            if address in seen:
-                continue
-
+            # Tokenin pair-lərini al
             pairs = get_pairs(address)
 
             if not pairs:
                 continue
 
-            # Ən uyğun pair-i seç
-            valid_pairs = [
-                p for p in pairs
-                if p.get("chainId") == CHAIN
-            ]
+            for pair in pairs:
 
-            if not valid_pairs:
-                continue
+                try:
 
-            # Liquidity ən yüksək olan pair
-            pair = max(
-                valid_pairs,
-                key=lambda p: (
-                    p.get("liquidity") or {}
-                ).get("usd") or 0
-            )
+                    # Yalnız Solana
+                    if pair.get("chainId") != CHAIN:
+                        continue
 
-            # =========================
-            # DATA
-            # =========================
+                    pair_address = pair.get("pairAddress")
 
-            liquidity = (
-                pair.get("liquidity") or {}
-            ).get("usd") or 0
+                    if not pair_address:
+                        continue
 
-            market_cap = (
-                pair.get("marketCap")
-                or pair.get("fdv")
-                or 0
-            )
+                    # Eyni pair artıq göndərilibsə keç
+                    if pair_address in seen:
+                        continue
 
-            price_change = (
-                pair.get("priceChange") or {}
-            ).get("m5") or 0
+                    # =========================
+                    # PAIR AGE
+                    # =========================
 
-            volume_5m = (
-                pair.get("volume") or {}
-            ).get("m5") or 0
+                    created = pair.get("pairCreatedAt")
 
-            created = pair.get("pairCreatedAt")
+                    if not created:
+                        continue
 
-            if not created:
-                continue
+                    age_days = (
+                        (time.time() * 1000 - created)
+                        / 1000
+                        / 60
+                        / 60
+                        / 24
+                    )
 
-            # milliseconds -> seconds
-            age_minutes = (
-                time.time() - (created / 1000)
-            ) / 60
+                    # 3 - 120 gün
+                    if age_days < MIN_AGE_DAYS:
+                        continue
 
-            # =========================
-            # FILTERS
-            # =========================
+                    if age_days > MAX_AGE_DAYS:
+                        continue
 
-            if age_minutes < 0:
-                continue
+                    # =========================
+                    # LIQUIDITY
+                    # =========================
 
-            if age_minutes > MAX_AGE_MINUTES:
-                continue
+                    liquidity_data = pair.get("liquidity") or {}
 
-            if liquidity < MIN_LIQUIDITY:
-                continue
+                    liquidity = float(
+                        liquidity_data.get("usd") or 0
+                    )
 
-            if market_cap < MIN_MARKET_CAP:
-                continue
+                    if liquidity < MIN_LIQUIDITY:
+                        continue
 
-            if price_change < MIN_5M_CHANGE:
-                continue
+                    # =========================
+                    # MARKET CAP
+                    # =========================
 
-            if volume_5m < MIN_5M_VOLUME:
-                continue
+                    market_cap = float(
+                        pair.get("marketCap")
+                        or pair.get("fdv")
+                        or 0
+                    )
 
-            # =========================
-            # TOKEN INFO
-            # =========================
+                    if market_cap < MIN_MARKET_CAP:
+                        continue
 
-            base_token = pair.get(
-                "baseToken"
-            ) or {}
+                    if market_cap > MAX_MARKET_CAP:
+                        continue
 
-            name = base_token.get(
-                "name",
-                "Unknown"
-            )
+                    # =========================
+                    # 5M VOLUME
+                    # =========================
 
-            symbol = base_token.get(
-                "symbol",
-                "?"
-            )
+                    volume_data = pair.get("volume") or {}
 
-            pair_url = pair.get(
-                "url",
-                f"https://dexscreener.com/solana/{address}"
-            )
+                    volume_5m = float(
+                        volume_data.get("m5") or 0
+                    )
 
-            # =========================
-            # MARK AS SEEN
-            # =========================
+                    if volume_5m < MIN_5M_VOLUME:
+                        continue
 
-            seen.add(address)
+                    # =========================
+                    # TOKEN INFO
+                    # =========================
 
-            # =========================
-            # ALERT
-            # =========================
+                    base_token = pair.get("baseToken") or {}
 
-            message = (
-                "🚨 MEME PUMP ALERT\n\n"
-                f"🪙 {name} ({symbol})\n\n"
-                f"⏱ Yaş: {age_minutes:.1f} dəq\n"
-                f"📈 5 dəq: +{price_change:.1f}%\n"
-                f"💰 Market Cap: ${market_cap:,.0f}\n"
-                f"💧 Liquidity: ${liquidity:,.0f}\n"
-                f"📊 5 dəq Volume: ${volume_5m:,.0f}\n\n"
-                f"🔗 {pair_url}"
-            )
+                    symbol = base_token.get(
+                        "symbol",
+                        "UNKNOWN"
+                    )
 
-            send_message(message)
+                    name = base_token.get(
+                        "name",
+                        "UNKNOWN"
+                    )
 
-            print(
-                "ALERT SENT:",
-                symbol,
-                address
-            )
+                    pair_url = pair.get(
+                        "url",
+                        f"https://dexscreener.com/solana/{pair_address}"
+                    )
+
+                    # =========================
+                    # 5M PRICE CHANGE
+                    # =========================
+
+                    price_change_data = pair.get(
+                        "priceChange"
+                    ) or {}
+
+                    price_change_5m = float(
+                        price_change_data.get("m5") or 0
+                    )
+
+                    # =========================
+                    # MARK AS SEEN
+                    # =========================
+
+                    seen.add(pair_address)
+
+                    # =========================
+                    # TELEGRAM ALERT
+                    # =========================
+
+                    message = (
+                        "🚨 MEME PUMP ALERT\n\n"
+                        f"🪙 {name} ({symbol})\n"
+                        f"⏱ Yaş: {age_days:.1f} gün\n"
+                        f"📈 5 dəq: {price_change_5m:+.1f}%\n"
+                        f"💰 Market Cap: ${market_cap:,.0f}\n"
+                        f"💧 Liquidity: ${liquidity:,.0f}\n"
+                        f"📊 5 dəq Volume: ${volume_5m:,.0f}\n\n"
+                        f"🔗 {pair_url}"
+                    )
+
+                    send_message(message)
+
+                    print(
+                        "ALERT SENT:",
+                        symbol,
+                        pair_address
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "PAIR ERROR:",
+                        e
+                    )
 
         except Exception as e:
 
@@ -271,32 +291,19 @@ def check():
 
 
 # =========================
-# STARTUP
+# START
 # =========================
 
-print("================================")
-print("🟢 MEME PUMP ALERT STARTING")
-print("================================")
-
-try:
-
-    send_message(
-        "🟢 BOT STARTED\n\n"
-        "Meme Pump Alert işləyir.\n"
-        "Solana tokenləri yoxlanılır..."
-    )
-
-except Exception as e:
-
-    print(
-        "STARTUP TELEGRAM ERROR:",
-        e
-    )
-
-
-# =========================
-# MAIN LOOP
-# =========================
+send_message(
+    "🟢 BOT STARTED\n\n"
+    "Meme Pump Alert işləyir.\n"
+    "Solana pair-ləri yoxlanılır...\n\n"
+    "Filtrlər:\n"
+    "• Yaş: 3 - 120 gün\n"
+    "• Liquidity: ≥ $10,000\n"
+    "• Market Cap: $10,000 - $1,000,000\n"
+    "• 5 dəq Volume: ≥ $5,000"
+)
 
 while True:
 
@@ -311,8 +318,5 @@ while True:
             e
         )
 
-    print(
-        "Waiting 30 seconds..."
-    )
-
+    # 30 saniyədən bir yoxla
     time.sleep(30)
