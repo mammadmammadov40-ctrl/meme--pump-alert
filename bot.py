@@ -2,70 +2,200 @@ import os
 import time
 import requests
 
+# =========================
+# ENV VARIABLES
+# =========================
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-MIN_LIQUIDITY = 100_000
-MIN_MARKET_CAP = 1_000_000
-MIN_AGE_DAYS = 3
-MAX_AGE_DAYS = 120
-MIN_5M_CHANGE = 5
-MIN_5M_VOLUME = 20_000
+# =========================
+# SETTINGS
+# =========================
 
+CHAIN = "solana"
+
+# Yeni tokenləri tutmaq üçün
+MAX_AGE_MINUTES = 60
+
+# Çox kiçik/zəif pool-ları azaltmaq üçün
+MIN_LIQUIDITY = 10_000
+
+# Market cap üçün minimum
+MIN_MARKET_CAP = 20_000
+
+# 5 dəqiqəlik dəyişiklik
+MIN_5M_CHANGE = 5
+
+# 5 dəqiqəlik minimum volume
+MIN_5M_VOLUME = 5_000
+
+# Eyni tokeni təkrar göndərməsin
 seen = set()
+
+
+# =========================
+# TELEGRAM
+# =========================
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    r = requests.post(url, json={
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True
-    }, timeout=20)
+    response = requests.post(
+        url,
+        json={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": True
+        },
+        timeout=20
+    )
 
-    print("TELEGRAM STATUS:", r.status_code)
-    print("TELEGRAM RESPONSE:", r.text)
+    print("TELEGRAM STATUS:", response.status_code)
+    print("TELEGRAM RESPONSE:", response.text)
 
-    r.raise_for_status()
+    response.raise_for_status()
 
-def get_tokens():
+
+# =========================
+# GET LATEST TOKENS
+# =========================
+
+def get_latest_tokens():
     url = "https://api.dexscreener.com/token-profiles/latest/v1"
-    r = requests.get(url, timeout=20)
-    return r.json()
 
-def get_pairs(chain, address):
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
-    r = requests.get(url, timeout=20)
-    data = r.json()
-    return data.get("pairs", [])
+    response = requests.get(
+        url,
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if not isinstance(data, list):
+        return []
+
+    return data
+
+
+# =========================
+# GET TOKEN PAIRS
+# =========================
+
+def get_pairs(token_address):
+
+    url = (
+        f"https://api.dexscreener.com/"
+        f"tokens/v1/{CHAIN}/{token_address}"
+    )
+
+    response = requests.get(
+        url,
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if not isinstance(data, list):
+        return []
+
+    return data
+
+
+# =========================
+# CHECK TOKENS
+# =========================
 
 def check():
-    tokens = get_tokens()
+
+    print("Checking new tokens...")
+
+    tokens = get_latest_tokens()
+
+    print("Latest profiles:", len(tokens))
 
     for token in tokens:
-        if token.get("chainId") != "solana":
-            continue
 
-        address = token.get("tokenAddress")
-        if not address:
-            continue
+        try:
 
-        for pair in get_pairs("solana", address):
-            if pair.get("chainId") != "solana":
+            # Yalnız Solana
+            if token.get("chainId") != CHAIN:
                 continue
 
-            liquidity = (pair.get("liquidity") or {}).get("usd") or 0
-            market_cap = pair.get("marketCap") or 0
-            change_5m = (pair.get("priceChange") or {}).get("m5") or 0
-            volume_5m = (pair.get("volume") or {}).get("m5") or 0
+            address = token.get("tokenAddress")
+
+            if not address:
+                continue
+
+            # Təkrar token
+            if address in seen:
+                continue
+
+            pairs = get_pairs(address)
+
+            if not pairs:
+                continue
+
+            # Ən uyğun pair-i seç
+            valid_pairs = [
+                p for p in pairs
+                if p.get("chainId") == CHAIN
+            ]
+
+            if not valid_pairs:
+                continue
+
+            # Liquidity ən yüksək olan pair
+            pair = max(
+                valid_pairs,
+                key=lambda p: (
+                    p.get("liquidity") or {}
+                ).get("usd") or 0
+            )
+
+            # =========================
+            # DATA
+            # =========================
+
+            liquidity = (
+                pair.get("liquidity") or {}
+            ).get("usd") or 0
+
+            market_cap = (
+                pair.get("marketCap")
+                or pair.get("fdv")
+                or 0
+            )
+
+            price_change = (
+                pair.get("priceChange") or {}
+            ).get("m5") or 0
+
+            volume_5m = (
+                pair.get("volume") or {}
+            ).get("m5") or 0
+
             created = pair.get("pairCreatedAt")
 
             if not created:
                 continue
 
-            age_days = (time.time() * 1000 - created) / 86400000
+            # milliseconds -> seconds
+            age_minutes = (
+                time.time() - (created / 1000)
+            ) / 60
 
-            if not (MIN_AGE_DAYS <= age_days <= MAX_AGE_DAYS):
+            # =========================
+            # FILTERS
+            # =========================
+
+            if age_minutes < 0:
+                continue
+
+            if age_minutes > MAX_AGE_MINUTES:
                 continue
 
             if liquidity < MIN_LIQUIDITY:
@@ -74,40 +204,115 @@ def check():
             if market_cap < MIN_MARKET_CAP:
                 continue
 
-            if change_5m < MIN_5M_CHANGE:
+            if price_change < MIN_5M_CHANGE:
                 continue
 
             if volume_5m < MIN_5M_VOLUME:
                 continue
 
-            key = pair.get("pairAddress")
+            # =========================
+            # TOKEN INFO
+            # =========================
 
-            if key in seen:
-                continue
+            base_token = pair.get(
+                "baseToken"
+            ) or {}
 
-            seen.add(key)
+            name = base_token.get(
+                "name",
+                "Unknown"
+            )
 
-            symbol = pair.get("baseToken", {}).get("symbol", "?")
-            name = pair.get("baseToken", {}).get("name", "?")
+            symbol = base_token.get(
+                "symbol",
+                "?"
+            )
+
+            pair_url = pair.get(
+                "url",
+                f"https://dexscreener.com/solana/{address}"
+            )
+
+            # =========================
+            # MARK AS SEEN
+            # =========================
+
+            seen.add(address)
+
+            # =========================
+            # ALERT
+            # =========================
 
             message = (
                 "🚨 MEME PUMP ALERT\n\n"
-                f"🪙 {name} ({symbol})\n"
-                f"📈 5 dəq: +{change_5m:.1f}%\n"
+                f"🪙 {name} ({symbol})\n\n"
+                f"⏱ Yaş: {age_minutes:.1f} dəq\n"
+                f"📈 5 dəq: +{price_change:.1f}%\n"
                 f"💰 Market Cap: ${market_cap:,.0f}\n"
                 f"💧 Liquidity: ${liquidity:,.0f}\n"
-                f"📊 5 dəq Volume: ${volume_5m:,.0f}\n"
-                f"🕒 Yaş: {age_days:.0f} gün\n\n"
-                f"🔗 https://dexscreener.com/solana/{key}"
+                f"📊 5 dəq Volume: ${volume_5m:,.0f}\n\n"
+                f"🔗 {pair_url}"
             )
 
             send_message(message)
-            send_message("🟢 BOT STARTED - Telegram bağlantısı işləyir")
+
+            print(
+                "ALERT SENT:",
+                symbol,
+                address
+            )
+
+        except Exception as e:
+
+            print(
+                "TOKEN ERROR:",
+                e
+            )
+
+
+# =========================
+# STARTUP
+# =========================
+
+print("================================")
+print("🟢 MEME PUMP ALERT STARTING")
+print("================================")
+
+try:
+
+    send_message(
+        "🟢 BOT STARTED\n\n"
+        "Meme Pump Alert işləyir.\n"
+        "Solana tokenləri yoxlanılır..."
+    )
+
+except Exception as e:
+
+    print(
+        "STARTUP TELEGRAM ERROR:",
+        e
+    )
+
+
+# =========================
+# MAIN LOOP
+# =========================
 
 while True:
+
     try:
+
         check()
+
     except Exception as e:
-        print("Error:", e)
+
+        print(
+            "MAIN ERROR:",
+            e
+        )
+
+    print(
+        "Waiting 30 seconds..."
+    )
 
     time.sleep(30)
