@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 
 
@@ -17,56 +18,65 @@ CHAT_ID = os.environ["CHAT_ID"]
 
 BINANCE_URL = "https://api.binance.com"
 
-# 5 dəqiqə
+# Hər 5 dəqiqədən bir
 CHECK_INTERVAL = 300
 
-# ------------------------------------------------------------
-# VOLUME RULES
-# ------------------------------------------------------------
-
-# Son 5M candle-da minimum volume
-MIN_5M_VOLUME = 50_000
-
-# Cari 5M volume əvvəlki 3 candle ortalamasından
-# ən azı neçə dəfə böyük olmalıdır
-MIN_VOLUME_MULTIPLIER = 2.0
-
-# Minimum real volume artımı
-MIN_VOLUME_INCREASE = 25_000
-
-# ------------------------------------------------------------
-# PRICE RULES
-# ------------------------------------------------------------
-
-# Cari 5M candle müsbət olmalıdır
-MIN_PRICE_CHANGE = 0.0
-
-# Çox gec qaçmış coinləri azaltmaq üçün
-MAX_PRICE_CHANGE_5M = 15.0
-
-# ------------------------------------------------------------
-# ALERT RULES
-# ------------------------------------------------------------
-
-# Eyni coin yalnız 1 dəfə alert
-ONE_ALERT_PER_COIN = True
-
-# Bir scan-da maksimum alert
-MAX_ALERTS_PER_SCAN = 5
-
-# HTTP timeout
 REQUEST_TIMEOUT = 15
 
-# Binance API sorğuları arasında kiçik fasilə
 REQUEST_DELAY = 0.05
 
 
 # ============================================================
-# MEMORY
+# VOLUME RULES
 # ============================================================
 
-# Artıq alert verilmiş coinlər
-alerted_coins = set()
+# Son tamamlanmış 5M candle minimum volume
+MIN_5M_VOLUME = 50_000
+
+# Cari volume əvvəlki 3 candle ortalamasından
+# minimum 2 dəfə böyük olmalıdır
+MIN_VOLUME_MULTIPLIER = 2.0
+
+# Volume ən azı $25K artmalıdır
+MIN_VOLUME_INCREASE = 25_000
+
+
+# ============================================================
+# PRICE RULES
+# ============================================================
+
+# ÇOX VACİB:
+# 5M candle qiymət artımı minimum +20% olmalıdır.
+#
+# +1%  -> ALERT YOX
+# +10% -> ALERT YOX
+# +15% -> ALERT YOX
+# +19% -> ALERT YOX
+# +20% -> ALERT VAR
+# +30% -> ALERT VAR
+# +50% -> ALERT VAR
+
+MIN_PRICE_CHANGE_5M = 20.0
+
+
+# ============================================================
+# ALERT RULES
+# ============================================================
+
+# Eyni coin yalnız 1 dəfə alert
+ONE_ALERT_PER_COIN = True
+
+# Bir scan zamanı maksimum alert
+MAX_ALERTS_PER_SCAN = 5
+
+
+# ============================================================
+# MEMORY FILE
+# ============================================================
+
+# Railway restart etsə belə alert edilmiş coinləri
+# yadda saxlamaq üçün fayl
+ALERTED_FILE = "alerted_coins.json"
 
 
 # ============================================================
@@ -76,20 +86,99 @@ alerted_coins = set()
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "Binance-5M-Volume-Alert/1.0"
+    "User-Agent": "Binance-5M-Volume-Alert/2.0"
 })
+
+
+# ============================================================
+# LOAD ALERTED COINS
+# ============================================================
+
+def load_alerted_coins():
+
+    try:
+
+        if not os.path.exists(ALERTED_FILE):
+            return set()
+
+        with open(
+            ALERTED_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            data = json.load(f)
+
+            if isinstance(data, list):
+
+                return set(data)
+
+    except Exception as e:
+
+        print(
+            "ALERT MEMORY LOAD ERROR:",
+            e
+        )
+
+    return set()
+
+
+# ============================================================
+# SAVE ALERTED COINS
+# ============================================================
+
+def save_alerted_coins():
+
+    try:
+
+        with open(
+            ALERTED_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                sorted(alerted_coins),
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as e:
+
+        print(
+            "ALERT MEMORY SAVE ERROR:",
+            e
+        )
+
+
+# ============================================================
+# MEMORY
+# ============================================================
+
+alerted_coins = load_alerted_coins()
+
+print(
+    "ALREADY ALERTED COINS:",
+    len(alerted_coins)
+)
 
 
 # ============================================================
 # SAFE FLOAT
 # ============================================================
 
-def safe_float(value, default=0.0):
+def safe_float(
+    value,
+    default=0.0
+):
 
     try:
+
         return float(value)
 
     except Exception:
+
         return default
 
 
@@ -170,7 +259,7 @@ def get_symbols():
             []
         ):
 
-            # Yalnız aktiv coinlər
+            # Aktiv olmalıdır
             if item.get("status") != "TRADING":
                 continue
 
@@ -178,14 +267,17 @@ def get_symbols():
             if item.get("quoteAsset") != "USDT":
                 continue
 
-            # Yalnız Spot
+            # Spot
             if item.get(
                 "isSpotTradingAllowed",
                 True
             ) is False:
+
                 continue
 
-            symbol = item.get("symbol")
+            symbol = item.get(
+                "symbol"
+            )
 
             if not symbol:
                 continue
@@ -205,7 +297,7 @@ def get_symbols():
 
 
 # ============================================================
-# GET 5 MINUTE CANDLES
+# GET 5M DATA
 # ============================================================
 
 def get_5m_data(symbol):
@@ -240,20 +332,26 @@ def get_5m_data(symbol):
 
             return None
 
-        # ----------------------------------------------------
-        # SON TAMAMLANMIŞ CANDLE
-        # ----------------------------------------------------
+
+        # ====================================================
+        # SON TAMAMLANMIŞ 5M CANDLE
+        # ====================================================
 
         current = data[-2]
 
-        # Əvvəlki 3 tamamlanmış candle
+
+        # ====================================================
+        # ƏVVƏLKİ 3 TAMAMLANMIŞ CANDLE
+        # ====================================================
+
         old_1 = data[-3]
         old_2 = data[-4]
         old_3 = data[-5]
 
-        # ----------------------------------------------------
-        # CURRENT
-        # ----------------------------------------------------
+
+        # ====================================================
+        # CURRENT CANDLE
+        # ====================================================
 
         open_price = safe_float(
             current[1]
@@ -276,9 +374,10 @@ def get_5m_data(symbol):
             current[7]
         )
 
-        # ----------------------------------------------------
-        # PREVIOUS 3 VOLUMES
-        # ----------------------------------------------------
+
+        # ====================================================
+        # PREVIOUS VOLUMES
+        # ====================================================
 
         volume_1 = safe_float(
             old_1[7]
@@ -292,15 +391,17 @@ def get_5m_data(symbol):
             old_3[7]
         )
 
+
         average_volume = (
             volume_1
             + volume_2
             + volume_3
         ) / 3
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # PRICE CHANGE
-        # ----------------------------------------------------
+        # ====================================================
 
         if open_price <= 0:
 
@@ -314,9 +415,10 @@ def get_5m_data(symbol):
             / open_price
         ) * 100
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # VOLUME MULTIPLIER
-        # ----------------------------------------------------
+        # ====================================================
 
         if average_volume > 0:
 
@@ -329,14 +431,16 @@ def get_5m_data(symbol):
 
             volume_multiplier = 0
 
+
+        # ====================================================
+        # VOLUME INCREASE
+        # ====================================================
+
         volume_increase = (
             current_volume
             - average_volume
         )
 
-        # ----------------------------------------------------
-        # RETURN
-        # ----------------------------------------------------
 
         return {
 
@@ -352,7 +456,8 @@ def get_5m_data(symbol):
 
             "volume": current_volume,
 
-            "average_volume": average_volume,
+            "average_volume":
+                average_volume,
 
             "volume_multiplier":
                 volume_multiplier,
@@ -363,6 +468,7 @@ def get_5m_data(symbol):
             "price_change":
                 price_change
         }
+
 
     except Exception as e:
 
@@ -377,17 +483,17 @@ def get_5m_data(symbol):
 
 
 # ============================================================
-# CHECK VOLUME SIGNAL
+# CHECK SIGNAL
 # ============================================================
 
 def is_volume_signal(data):
 
-    symbol = data["symbol"]
+    symbol = data[
+        "symbol"
+    ]
 
-    volume = data["volume"]
-
-    average_volume = data[
-        "average_volume"
+    volume = data[
+        "volume"
     ]
 
     multiplier = data[
@@ -402,9 +508,10 @@ def is_volume_signal(data):
         "price_change"
     ]
 
-    # --------------------------------------------------------
-    # EYNİ COINİ TƏKRAR VERMƏ
-    # --------------------------------------------------------
+
+    # ========================================================
+    # ONE ALERT PER COIN
+    # ========================================================
 
     if ONE_ALERT_PER_COIN:
 
@@ -412,45 +519,46 @@ def is_volume_signal(data):
 
             return False
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # MINIMUM VOLUME
-    # --------------------------------------------------------
+    # ========================================================
 
     if volume < MIN_5M_VOLUME:
 
         return False
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # VOLUME MULTIPLIER
-    # --------------------------------------------------------
+    # ========================================================
 
     if multiplier < MIN_VOLUME_MULTIPLIER:
 
         return False
 
-    # --------------------------------------------------------
-    # REAL VOLUME ARTIŞI
-    # --------------------------------------------------------
+
+    # ========================================================
+    # REAL VOLUME INCREASE
+    # ========================================================
 
     if volume_increase < MIN_VOLUME_INCREASE:
 
         return False
 
-    # --------------------------------------------------------
-    # PRICE
-    # --------------------------------------------------------
 
-    if price_change < MIN_PRICE_CHANGE:
+    # ========================================================
+    # PRICE +20% RULE
+    # ========================================================
 
-        return False
-
-    # --------------------------------------------------------
-    # ÇOX GEC QALMIŞ TOKEN
-    # --------------------------------------------------------
-
-    if price_change > MAX_PRICE_CHANGE_5M:
+    if price_change < MIN_PRICE_CHANGE_5M:
 
         return False
+
+
+    # ========================================================
+    # SIGNAL PASSED
+    # ========================================================
 
     return True
 
@@ -475,61 +583,57 @@ def calculate_score(data):
         "volume"
     ]
 
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
+
+    # ========================================================
+    # VOLUME SCORE
+    # ========================================================
 
     if multiplier >= 2:
-
         score += 30
 
     if multiplier >= 3:
-
         score += 15
 
     if multiplier >= 5:
-
         score += 20
 
     if multiplier >= 10:
-
         score += 20
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # ABSOLUTE VOLUME
-    # --------------------------------------------------------
+    # ========================================================
 
     if volume >= 100_000:
-
         score += 10
 
     if volume >= 250_000:
-
         score += 10
 
     if volume >= 500_000:
-
         score += 10
 
     if volume >= 1_000_000:
-
         score += 10
 
-    # --------------------------------------------------------
-    # PRICE
-    # --------------------------------------------------------
 
-    if price_change > 0:
+    # ========================================================
+    # PRICE SCORE
+    # ========================================================
 
-        score += 5
+    if price_change >= 20:
+        score += 20
 
-    if price_change >= 2:
-
+    if price_change >= 30:
         score += 10
 
-    if price_change >= 5:
-
+    if price_change >= 50:
         score += 10
+
+    if price_change >= 100:
+        score += 20
+
 
     return score
 
@@ -546,7 +650,7 @@ def scan(symbols):
     )
 
     print(
-        "🔎 BINANCE 5M VOLUME SCAN"
+        "🔎 BINANCE 5M VOLUME + PRICE SCAN"
     )
 
     print(
@@ -556,6 +660,11 @@ def scan(symbols):
     candidates = []
 
     total = len(symbols)
+
+
+    # ========================================================
+    # SCAN COINS
+    # ========================================================
 
     for index, symbol in enumerate(
         symbols,
@@ -570,14 +679,15 @@ def scan(symbols):
 
             continue
 
-        if is_volume_signal(
-            data
-        ):
+
+        # ====================================================
+        # PRINT ONLY STRONG CANDIDATES
+        # ====================================================
+
+        if is_volume_signal(data):
 
             data["score"] = (
-                calculate_score(
-                    data
-                )
+                calculate_score(data)
             )
 
             candidates.append(
@@ -585,29 +695,34 @@ def scan(symbols):
             )
 
             print(
-                "🔥 CANDIDATE:",
+                "🔥 STRONG CANDIDATE:",
                 symbol,
-                "|",
+                "| PRICE:",
+                f"{data['price_change']:+.2f}%",
+                "| VOLUME:",
                 f"{data['volume_multiplier']:.2f}x"
             )
 
-        # API-ni çox yükləməmək
+
         time.sleep(
             REQUEST_DELAY
         )
 
+
     # ========================================================
-    # SCORE-YA GÖRƏ SIRALA
+    # SORT
     # ========================================================
 
     candidates.sort(
         key=lambda x: (
             x["score"],
+            x["price_change"],
             x["volume_multiplier"],
             x["volume"]
         ),
         reverse=True
     )
+
 
     print()
     print(
@@ -616,15 +731,22 @@ def scan(symbols):
     )
 
     print(
-        "CANDIDATES:",
+        "STRONG CANDIDATES:",
         len(candidates)
     )
+
+    print(
+        "ALREADY ALERTED:",
+        len(alerted_coins)
+    )
+
 
     # ========================================================
     # SEND ALERTS
     # ========================================================
 
     alerts_sent = 0
+
 
     for data in candidates:
 
@@ -634,6 +756,7 @@ def scan(symbols):
         ):
 
             break
+
 
         symbol = data[
             "symbol"
@@ -663,15 +786,19 @@ def scan(symbols):
             "score"
         ]
 
-        # ----------------------------------------------------
-        # MESSAGE
-        # ----------------------------------------------------
+
+        # ====================================================
+        # TELEGRAM MESSAGE
+        # ====================================================
 
         message = (
 
-            "🚨 BINANCE 5M VOLUME ALERT\n\n"
+            "🚨 BINANCE 5M STRONG PUMP ALERT\n\n"
 
             f"🪙 Coin: {symbol}\n\n"
+
+            f"📈 5M Price Change: "
+            f"{price_change:+.2f}%\n\n"
 
             f"💰 5M Volume: "
             f"${volume:,.0f}\n"
@@ -685,45 +812,51 @@ def scan(symbols):
             f"🚀 Volume Multiplier: "
             f"{multiplier:.2f}x\n\n"
 
-            f"📈 5M Price Change: "
-            f"{price_change:+.2f}%\n\n"
-
             f"⭐ Signal Score: "
             f"{score}\n\n"
+
+            "✅ PRICE FILTER:\n"
+            "5M price change ≥ +20%\n\n"
 
             "⚠️ Bu coin üçün yalnız "
             "1 dəfə alert veriləcək.\n"
 
-            "Sonradan +20%, +50%, "
-            "+100% qalxsa ikinci alert "
-            "gəlməyəcək.\n\n"
+            "Sonradan +20%, +50%, +100% "
+            "qalxsa ikinci alert gəlməyəcək.\n\n"
 
             f"🔗 https://www.binance.com/"
             f"en/trade/{symbol}?type=spot"
         )
 
-        # ----------------------------------------------------
-        # TELEGRAM
-        # ----------------------------------------------------
+
+        # ====================================================
+        # SEND
+        # ====================================================
 
         if send_message(
             message
         ):
 
+            # Yaddaşa əlavə et
             alerted_coins.add(
                 symbol
             )
 
+            # Fayla yaz
+            save_alerted_coins()
+
             alerts_sent += 1
+
 
             print(
                 "🚨 ALERT SENT:",
                 symbol,
-                "| SCORE:",
-                score,
+                "| PRICE:",
+                f"{price_change:+.2f}%",
                 "| VOLUME:",
                 f"{multiplier:.2f}x"
             )
+
 
     print()
     print(
@@ -733,17 +866,16 @@ def scan(symbols):
 
 
 # ============================================================
-# WAIT UNTIL NEXT 5-MINUTE CANDLE
+# WAIT FOR NEXT 5 MINUTE
 # ============================================================
 
 def wait_for_next_5m():
 
     now = time.time()
 
-    # Növbəti 5 dəqiqəlik sərhəd
     next_run = (
-        ((int(now) // 300) + 1)
-        * 300
+        ((int(now) // CHECK_INTERVAL) + 1)
+        * CHECK_INTERVAL
     )
 
     wait_seconds = (
@@ -753,6 +885,7 @@ def wait_for_next_5m():
     if wait_seconds < 1:
 
         wait_seconds = 1
+
 
     print(
         f"⏳ Next 5M scan in "
@@ -770,7 +903,7 @@ def wait_for_next_5m():
 
 print()
 print(
-    "🟢 BINANCE 5M VOLUME MOMENTUM BOT"
+    "🟢 BINANCE 5M STRONG MOMENTUM BOT"
 )
 print()
 
@@ -798,17 +931,17 @@ print(
 )
 
 print(
-    "Minimum 5M Price Change:",
-    f"{MIN_PRICE_CHANGE}%"
-)
-
-print(
-    "Maximum 5M Price Change:",
-    f"{MAX_PRICE_CHANGE_5M}%"
+    "🔥 MINIMUM PRICE CHANGE:",
+    f"+{MIN_PRICE_CHANGE_5M}%"
 )
 
 print(
     "One Alert Per Coin: ON"
+)
+
+print(
+    "Alert Memory:",
+    "PERSISTENT"
 )
 
 print()
@@ -820,23 +953,26 @@ print()
 
 send_message(
 
-    "🟢 BINANCE 5M VOLUME BOT STARTED\n\n"
+    "🟢 BINANCE 5M STRONG MOMENTUM BOT STARTED\n\n"
 
     "🎯 Məqsəd:\n"
-    "Binance Spot-da volume qəfil "
-    "yüklənən coinləri tapmaq.\n\n"
+    "Binance Spot-da güclü hərəkət edən "
+    "coinləri tapmaq.\n\n"
 
     "📊 Yoxlama:\n"
     "• Hər 5 dəqiqədən bir\n"
     "• Son tamamlanmış 5M candle\n"
     "• Əvvəlki 3×5M orta volume ilə müqayisə\n\n"
 
-    "🔥 Qaydalar:\n"
+    "🔥 ƏSAS QAYDA:\n"
+    "• 5M qiymət artımı minimum +20%\n"
+    "• +1%, +5%, +10%, +15% → ALERT YOX\n"
+    "• +20% və yuxarı → ALERT MÜMKÜNDÜR\n\n"
+
+    "💰 Volume qaydaları:\n"
     "• 5M Volume ≥ $50K\n"
     "• Volume ≥ 2x əvvəlki 3×5M orta\n"
-    "• Volume artımı ≥ $25K\n"
-    "• Qiymət mənfi olmamalıdır\n"
-    "• Çox qaçmış coinlər filtrdən çıxır\n\n"
+    "• Volume artımı ≥ $25K\n\n"
 
     "⚠️ Eyni coin yalnız 1 dəfə alert.\n"
     "Sonradan +20%, +50%, +100% "
@@ -854,7 +990,6 @@ while True:
 
     try:
 
-        # Binance coin siyahısı
         symbols = get_symbols()
 
         print(
@@ -875,5 +1010,4 @@ while True:
             e
         )
 
-    # Növbəti 5M perioduna qədər gözlə
     wait_for_next_5m()
