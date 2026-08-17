@@ -17,7 +17,7 @@ CHAT_ID = os.environ["CHAT_ID"]
 
 CHAIN = "solana"
 
-# Pair age: 0 - 60 gün
+# Pair age: 3 - 60 gün
 MIN_AGE_HOURS = 72
 MAX_AGE_HOURS = 60 * 24
 
