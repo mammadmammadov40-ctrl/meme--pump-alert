@@ -1,13 +1,10 @@
 import os
 import time
-import json
-import asyncio
 import requests
-import websockets
 
 
 # ============================================================
-# ENV
+# ENVIRONMENT
 # ============================================================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -18,32 +15,58 @@ CHAT_ID = os.environ["CHAT_ID"]
 # SETTINGS
 # ============================================================
 
-# Binance spot USDT coinləri
-QUOTE_ASSET = "USDT"
+BINANCE_URL = "https://api.binance.com"
 
-# 5 dəqiqəlik şam
-INTERVAL = "5m"
+# 5 dəqiqə
+CHECK_INTERVAL = 300
 
-# Cari 5M volume əvvəlki neçə şamla müqayisə edilsin
-BASELINE_CANDLES = 12
+# ------------------------------------------------------------
+# VOLUME RULES
+# ------------------------------------------------------------
 
-# Volume orta göstəricidən neçə dəfə çox olmalıdır
-VOLUME_MULTIPLIER = 2.5
+# Son 5M candle-da minimum volume
+MIN_5M_VOLUME = 50_000
 
-# Qiymət minimum neçə faiz hərəkət etməlidir
-MIN_PRICE_CHANGE = 1.0
+# Cari 5M volume əvvəlki 3 candle ortalamasından
+# ən azı neçə dəfə böyük olmalıdır
+MIN_VOLUME_MULTIPLIER = 2.0
+
+# Minimum real volume artımı
+MIN_VOLUME_INCREASE = 25_000
+
+# ------------------------------------------------------------
+# PRICE RULES
+# ------------------------------------------------------------
+
+# Cari 5M candle müsbət olmalıdır
+MIN_PRICE_CHANGE = 0.0
+
+# Çox gec qaçmış coinləri azaltmaq üçün
+MAX_PRICE_CHANGE_5M = 15.0
+
+# ------------------------------------------------------------
+# ALERT RULES
+# ------------------------------------------------------------
 
 # Eyni coin yalnız 1 dəfə alert
-ONE_ALERT_PER_SYMBOL = True
+ONE_ALERT_PER_COIN = True
 
-# Binance REST
-BINANCE_API = "https://api.binance.com"
+# Bir scan-da maksimum alert
+MAX_ALERTS_PER_SCAN = 5
 
-# Binance WebSocket
-BINANCE_WS = "wss://stream.binance.com:9443/stream"
+# HTTP timeout
+REQUEST_TIMEOUT = 15
 
-# Telegram
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+# Binance API sorğuları arasında kiçik fasilə
+REQUEST_DELAY = 0.05
+
+
+# ============================================================
+# MEMORY
+# ============================================================
+
+# Artıq alert verilmiş coinlər
+alerted_coins = set()
 
 
 # ============================================================
@@ -53,29 +76,33 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "BinanceVolumeAlert/1.0"
+    "User-Agent": "Binance-5M-Volume-Alert/1.0"
 })
 
 
 # ============================================================
-# MEMORY
+# SAFE FLOAT
 # ============================================================
 
-# Əvvəllər alert verilmiş coinlər
-alerted_symbols = set()
+def safe_float(value, default=0.0):
 
-# Son volume məlumatları
-volume_history = {}
+    try:
+        return float(value)
 
-# Son qiymətlər
-price_history = {}
+    except Exception:
+        return default
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def send_telegram(text):
+def send_message(text):
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendMessage"
+    )
 
     payload = {
         "chat_id": CHAT_ID,
@@ -86,17 +113,18 @@ def send_telegram(text):
     try:
 
         response = session.post(
-            TELEGRAM_API,
+            url,
             json=payload,
-            timeout=20
+            timeout=REQUEST_TIMEOUT
         )
 
         print(
-            "TELEGRAM:",
+            "TELEGRAM STATUS:",
             response.status_code
         )
 
         if not response.ok:
+
             print(
                 "TELEGRAM ERROR:",
                 response.text
@@ -107,7 +135,7 @@ def send_telegram(text):
     except Exception as e:
 
         print(
-            "TELEGRAM EXCEPTION:",
+            "TELEGRAM CONNECTION ERROR:",
             e
         )
 
@@ -115,21 +143,20 @@ def send_telegram(text):
 
 
 # ============================================================
-# GET BINANCE SYMBOLS
+# GET BINANCE USDT SPOT COINS
 # ============================================================
 
 def get_symbols():
 
     url = (
-        f"{BINANCE_API}"
-        "/api/v3/exchangeInfo"
+        f"{BINANCE_URL}/api/v3/exchangeInfo"
     )
 
     try:
 
         response = session.get(
             url,
-            timeout=30
+            timeout=REQUEST_TIMEOUT
         )
 
         response.raise_for_status()
@@ -143,40 +170,34 @@ def get_symbols():
             []
         ):
 
-            # Yalnız SPOT
-            if item.get(
-                "status"
-            ) != "TRADING":
-
+            # Yalnız aktiv coinlər
+            if item.get("status") != "TRADING":
                 continue
 
-            if item.get(
-                "quoteAsset"
-            ) != QUOTE_ASSET:
-
+            # Yalnız USDT
+            if item.get("quoteAsset") != "USDT":
                 continue
 
+            # Yalnız Spot
             if item.get(
-                "isSpotTradingAllowed"
-            ) is not True:
-
+                "isSpotTradingAllowed",
+                True
+            ) is False:
                 continue
 
-            symbol = item.get(
-                "symbol"
-            )
+            symbol = item.get("symbol")
 
-            if symbol:
-                symbols.append(
-                    symbol.lower()
-                )
+            if not symbol:
+                continue
+
+            symbols.append(symbol)
 
         return symbols
 
     except Exception as e:
 
         print(
-            "SYMBOL ERROR:",
+            "BINANCE SYMBOL ERROR:",
             e
         )
 
@@ -184,22 +205,21 @@ def get_symbols():
 
 
 # ============================================================
-# GET HISTORICAL VOLUME
+# GET 5 MINUTE CANDLES
 # ============================================================
 
-def get_initial_volume_history(
-    symbol
-):
+def get_5m_data(symbol):
 
     url = (
-        f"{BINANCE_API}"
-        "/api/v3/klines"
+        f"{BINANCE_URL}/api/v3/klines"
     )
 
     params = {
-        "symbol": symbol.upper(),
-        "interval": INTERVAL,
-        "limit": BASELINE_CANDLES + 1
+        "symbol": symbol,
+        "interval": "5m",
+
+        # Son 5 candle
+        "limit": 5
     }
 
     try:
@@ -207,75 +227,333 @@ def get_initial_volume_history(
         response = session.get(
             url,
             params=params,
-            timeout=20
+            timeout=REQUEST_TIMEOUT
         )
 
-        response.raise_for_status()
+        if not response.ok:
 
-        candles = response.json()
+            return None
 
-        volumes = []
+        data = response.json()
 
-        prices = []
+        if len(data) < 5:
 
-        # Son açıq şamı baseline-a daxil etmirik
-        for candle in candles[:-1]:
+            return None
 
-            volume = float(
-                candle[5]
-            )
+        # ----------------------------------------------------
+        # SON TAMAMLANMIŞ CANDLE
+        # ----------------------------------------------------
 
-            open_price = float(
-                candle[1]
-            )
+        current = data[-2]
 
-            close_price = float(
-                candle[4]
-            )
+        # Əvvəlki 3 tamamlanmış candle
+        old_1 = data[-3]
+        old_2 = data[-4]
+        old_3 = data[-5]
 
-            volumes.append(
-                volume
-            )
+        # ----------------------------------------------------
+        # CURRENT
+        # ----------------------------------------------------
 
-            prices.append(
+        open_price = safe_float(
+            current[1]
+        )
+
+        high_price = safe_float(
+            current[2]
+        )
+
+        low_price = safe_float(
+            current[3]
+        )
+
+        close_price = safe_float(
+            current[4]
+        )
+
+        # Quote volume = USDT
+        current_volume = safe_float(
+            current[7]
+        )
+
+        # ----------------------------------------------------
+        # PREVIOUS 3 VOLUMES
+        # ----------------------------------------------------
+
+        volume_1 = safe_float(
+            old_1[7]
+        )
+
+        volume_2 = safe_float(
+            old_2[7]
+        )
+
+        volume_3 = safe_float(
+            old_3[7]
+        )
+
+        average_volume = (
+            volume_1
+            + volume_2
+            + volume_3
+        ) / 3
+
+        # ----------------------------------------------------
+        # PRICE CHANGE
+        # ----------------------------------------------------
+
+        if open_price <= 0:
+
+            return None
+
+        price_change = (
+            (
                 close_price
+                - open_price
+            )
+            / open_price
+        ) * 100
+
+        # ----------------------------------------------------
+        # VOLUME MULTIPLIER
+        # ----------------------------------------------------
+
+        if average_volume > 0:
+
+            volume_multiplier = (
+                current_volume
+                / average_volume
             )
 
-        if volumes:
+        else:
 
-            volume_history[
-                symbol.lower()
-            ] = volumes
+            volume_multiplier = 0
 
-        if prices:
+        volume_increase = (
+            current_volume
+            - average_volume
+        )
 
-            price_history[
-                symbol.lower()
-            ] = prices[-1]
+        # ----------------------------------------------------
+        # RETURN
+        # ----------------------------------------------------
 
-        return True
+        return {
+
+            "symbol": symbol,
+
+            "open": open_price,
+
+            "high": high_price,
+
+            "low": low_price,
+
+            "close": close_price,
+
+            "volume": current_volume,
+
+            "average_volume": average_volume,
+
+            "volume_multiplier":
+                volume_multiplier,
+
+            "volume_increase":
+                volume_increase,
+
+            "price_change":
+                price_change
+        }
 
     except Exception as e:
 
         print(
-            "HISTORY ERROR",
+            "KLINE ERROR:",
             symbol,
+            "|",
             e
         )
 
+        return None
+
+
+# ============================================================
+# CHECK VOLUME SIGNAL
+# ============================================================
+
+def is_volume_signal(data):
+
+    symbol = data["symbol"]
+
+    volume = data["volume"]
+
+    average_volume = data[
+        "average_volume"
+    ]
+
+    multiplier = data[
+        "volume_multiplier"
+    ]
+
+    volume_increase = data[
+        "volume_increase"
+    ]
+
+    price_change = data[
+        "price_change"
+    ]
+
+    # --------------------------------------------------------
+    # EYNİ COINİ TƏKRAR VERMƏ
+    # --------------------------------------------------------
+
+    if ONE_ALERT_PER_COIN:
+
+        if symbol in alerted_coins:
+
+            return False
+
+    # --------------------------------------------------------
+    # MINIMUM VOLUME
+    # --------------------------------------------------------
+
+    if volume < MIN_5M_VOLUME:
+
         return False
 
+    # --------------------------------------------------------
+    # VOLUME MULTIPLIER
+    # --------------------------------------------------------
+
+    if multiplier < MIN_VOLUME_MULTIPLIER:
+
+        return False
+
+    # --------------------------------------------------------
+    # REAL VOLUME ARTIŞI
+    # --------------------------------------------------------
+
+    if volume_increase < MIN_VOLUME_INCREASE:
+
+        return False
+
+    # --------------------------------------------------------
+    # PRICE
+    # --------------------------------------------------------
+
+    if price_change < MIN_PRICE_CHANGE:
+
+        return False
+
+    # --------------------------------------------------------
+    # ÇOX GEC QALMIŞ TOKEN
+    # --------------------------------------------------------
+
+    if price_change > MAX_PRICE_CHANGE_5M:
+
+        return False
+
+    return True
+
 
 # ============================================================
-# BOOTSTRAP
+# SCORE
 # ============================================================
 
-def bootstrap(symbols):
+def calculate_score(data):
+
+    score = 0
+
+    multiplier = data[
+        "volume_multiplier"
+    ]
+
+    price_change = data[
+        "price_change"
+    ]
+
+    volume = data[
+        "volume"
+    ]
+
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    if multiplier >= 2:
+
+        score += 30
+
+    if multiplier >= 3:
+
+        score += 15
+
+    if multiplier >= 5:
+
+        score += 20
+
+    if multiplier >= 10:
+
+        score += 20
+
+    # --------------------------------------------------------
+    # ABSOLUTE VOLUME
+    # --------------------------------------------------------
+
+    if volume >= 100_000:
+
+        score += 10
+
+    if volume >= 250_000:
+
+        score += 10
+
+    if volume >= 500_000:
+
+        score += 10
+
+    if volume >= 1_000_000:
+
+        score += 10
+
+    # --------------------------------------------------------
+    # PRICE
+    # --------------------------------------------------------
+
+    if price_change > 0:
+
+        score += 5
+
+    if price_change >= 2:
+
+        score += 10
+
+    if price_change >= 5:
+
+        score += 10
+
+    return score
+
+
+# ============================================================
+# SCAN BINANCE
+# ============================================================
+
+def scan(symbols):
 
     print()
     print(
-        "Loading historical volume..."
+        "=========================================="
     )
+
+    print(
+        "🔎 BINANCE 5M VOLUME SCAN"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    candidates = []
 
     total = len(symbols)
 
@@ -284,470 +562,318 @@ def bootstrap(symbols):
         start=1
     ):
 
-        get_initial_volume_history(
+        data = get_5m_data(
             symbol
         )
 
-        if index % 50 == 0:
+        if data is None:
+
+            continue
+
+        if is_volume_signal(
+            data
+        ):
+
+            data["score"] = (
+                calculate_score(
+                    data
+                )
+            )
+
+            candidates.append(
+                data
+            )
 
             print(
-                "Loaded:",
-                index,
-                "/",
-                total
-            )
-
-        # Binance API-yə həddindən artıq yük verməmək
-        time.sleep(0.03)
-
-    print(
-        "Historical data loaded:",
-        len(volume_history)
-    )
-
-
-# ============================================================
-# FORMAT VOLUME
-# ============================================================
-
-def format_volume(value):
-
-    if value >= 1_000_000_000:
-        return f"${value / 1_000_000_000:.2f}B"
-
-    if value >= 1_000_000:
-        return f"${value / 1_000_000:.2f}M"
-
-    if value >= 1_000:
-        return f"${value / 1_000:.2f}K"
-
-    return f"${value:.2f}"
-
-
-# ============================================================
-# PROCESS KLINE
-# ============================================================
-
-def process_kline(data):
-
-    try:
-
-        kline = data.get(
-            "k"
-        )
-
-        if not kline:
-            return
-
-        symbol = kline[
-            "s"
-        ].lower()
-
-        # Cari 5M şamın volume-u
-        current_volume = float(
-            kline["v"]
-        )
-
-        open_price = float(
-            kline["o"]
-        )
-
-        current_price = float(
-            kline["c"]
-        )
-
-        # ----------------------------------------------------
-        # BASELINE
-        # ----------------------------------------------------
-
-        history = volume_history.get(
-            symbol,
-            []
-        )
-
-        if len(history) < BASELINE_CANDLES:
-
-            history.append(
-                current_volume
-            )
-
-            volume_history[
-                symbol
-            ] = history[-BASELINE_CANDLES:]
-
-            return
-
-        # ----------------------------------------------------
-        # ORTA VOLUME
-        # ----------------------------------------------------
-
-        average_volume = (
-            sum(history)
-            / len(history)
-        )
-
-        if average_volume <= 0:
-
-            return
-
-        volume_ratio = (
-            current_volume
-            / average_volume
-        )
-
-        # ----------------------------------------------------
-        # PRICE CHANGE
-        # ----------------------------------------------------
-
-        price_change = (
-            (
-                current_price
-                - open_price
-            )
-            / open_price
-        ) * 100
-
-        # ----------------------------------------------------
-        # CURRENT CANDLE
-        # ----------------------------------------------------
-
-        candle_closed = bool(
-            kline["x"]
-        )
-
-        # ----------------------------------------------------
-        # LOG
-        # ----------------------------------------------------
-
-        if volume_ratio >= VOLUME_MULTIPLIER:
-
-            print(
-                "🔥 VOLUME SPIKE:",
-                symbol.upper(),
+                "🔥 CANDIDATE:",
+                symbol,
                 "|",
-                round(
-                    volume_ratio,
-                    2
-                ),
-                "x",
-                "| PRICE:",
-                round(
-                    price_change,
-                    2
-                ),
-                "%"
+                f"{data['volume_multiplier']:.2f}x"
             )
 
-        # ----------------------------------------------------
-        # ALREADY ALERTED
-        # ----------------------------------------------------
-
-        if (
-            ONE_ALERT_PER_SYMBOL
-            and symbol in alerted_symbols
-        ):
-
-            # Yaddaşı yenilə
-            if candle_closed:
-
-                history.append(
-                    current_volume
-                )
-
-                volume_history[
-                    symbol
-                ] = history[
-                    -BASELINE_CANDLES:
-                ]
-
-            return
-
-        # ----------------------------------------------------
-        # FINAL SIGNAL
-        # ----------------------------------------------------
-
-        volume_signal = (
-            volume_ratio
-            >= VOLUME_MULTIPLIER
+        # API-ni çox yükləməmək
+        time.sleep(
+            REQUEST_DELAY
         )
 
-        price_signal = (
-            price_change
-            >= MIN_PRICE_CHANGE
-        )
+    # ========================================================
+    # SCORE-YA GÖRƏ SIRALA
+    # ========================================================
 
-        if (
-            volume_signal
-            and price_signal
-        ):
-
-            message = (
-                "🚨 BINANCE VOLUME ALERT\n\n"
-
-                f"🪙 Coin: "
-                f"{symbol.upper()}\n\n"
-
-                f"📊 5M Volume: "
-                f"{format_volume(current_volume)}\n"
-
-                f"📈 Average 5M Volume: "
-                f"{format_volume(average_volume)}\n"
-
-                f"🔥 Volume Spike: "
-                f"{volume_ratio:.2f}x\n\n"
-
-                f"💰 5M Price Change: "
-                f"{price_change:+.2f}%\n\n"
-
-                f"📍 Market: "
-                f"Binance Spot\n\n"
-
-                "⚠️ Bu avtomatik həcm siqnalıdır.\n"
-                "Qiymətin gələcəkdə mütləq "
-                "qalxacağı demək deyil."
-            )
-
-            success = send_telegram(
-                message
-            )
-
-            if success:
-
-                alerted_symbols.add(
-                    symbol
-                )
-
-                print(
-                    "🚨 ALERT SENT:",
-                    symbol.upper(),
-                    "|",
-                    round(
-                        volume_ratio,
-                        2
-                    ),
-                    "x"
-                )
-
-        # ----------------------------------------------------
-        # UPDATE HISTORY
-        # ----------------------------------------------------
-
-        if candle_closed:
-
-            history.append(
-                current_volume
-            )
-
-            volume_history[
-                symbol
-            ] = history[
-                -BASELINE_CANDLES:
-            ]
-
-    except Exception as e:
-
-        print(
-            "PROCESS ERROR:",
-            e
-        )
-
-
-# ============================================================
-# WEBSOCKET
-# ============================================================
-
-async def websocket_loop(
-    symbols
-):
-
-    streams = "/".join(
-        f"{symbol}@kline_{INTERVAL}"
-        for symbol in symbols
-    )
-
-    url = (
-        f"{BINANCE_WS}"
-        f"?streams={streams}"
+    candidates.sort(
+        key=lambda x: (
+            x["score"],
+            x["volume_multiplier"],
+            x["volume"]
+        ),
+        reverse=True
     )
 
     print()
     print(
-        "Connecting Binance WebSocket..."
+        "COINS SCANNED:",
+        total
     )
 
-    async with websockets.connect(
-        url,
-        ping_interval=20,
-        ping_timeout=20,
-        max_size=None
-    ) as websocket:
+    print(
+        "CANDIDATES:",
+        len(candidates)
+    )
 
-        print(
-            "🟢 BINANCE WEBSOCKET CONNECTED"
+    # ========================================================
+    # SEND ALERTS
+    # ========================================================
+
+    alerts_sent = 0
+
+    for data in candidates:
+
+        if (
+            alerts_sent
+            >= MAX_ALERTS_PER_SCAN
+        ):
+
+            break
+
+        symbol = data[
+            "symbol"
+        ]
+
+        volume = data[
+            "volume"
+        ]
+
+        average_volume = data[
+            "average_volume"
+        ]
+
+        multiplier = data[
+            "volume_multiplier"
+        ]
+
+        volume_increase = data[
+            "volume_increase"
+        ]
+
+        price_change = data[
+            "price_change"
+        ]
+
+        score = data[
+            "score"
+        ]
+
+        # ----------------------------------------------------
+        # MESSAGE
+        # ----------------------------------------------------
+
+        message = (
+
+            "🚨 BINANCE 5M VOLUME ALERT\n\n"
+
+            f"🪙 Coin: {symbol}\n\n"
+
+            f"💰 5M Volume: "
+            f"${volume:,.0f}\n"
+
+            f"📊 Previous 3×5M Average: "
+            f"${average_volume:,.0f}\n"
+
+            f"🔥 Volume Increase: "
+            f"+${volume_increase:,.0f}\n"
+
+            f"🚀 Volume Multiplier: "
+            f"{multiplier:.2f}x\n\n"
+
+            f"📈 5M Price Change: "
+            f"{price_change:+.2f}%\n\n"
+
+            f"⭐ Signal Score: "
+            f"{score}\n\n"
+
+            "⚠️ Bu coin üçün yalnız "
+            "1 dəfə alert veriləcək.\n"
+
+            "Sonradan +20%, +50%, "
+            "+100% qalxsa ikinci alert "
+            "gəlməyəcək.\n\n"
+
+            f"🔗 https://www.binance.com/"
+            f"en/trade/{symbol}?type=spot"
         )
 
-        while True:
+        # ----------------------------------------------------
+        # TELEGRAM
+        # ----------------------------------------------------
 
-            try:
+        if send_message(
+            message
+        ):
 
-                message = await websocket.recv()
+            alerted_coins.add(
+                symbol
+            )
 
-                data = json.loads(
-                    message
-                )
+            alerts_sent += 1
 
-                # Combined stream
-                payload = data.get(
-                    "data"
-                )
+            print(
+                "🚨 ALERT SENT:",
+                symbol,
+                "| SCORE:",
+                score,
+                "| VOLUME:",
+                f"{multiplier:.2f}x"
+            )
 
-                if payload:
+    print()
+    print(
+        "ALERTS SENT:",
+        alerts_sent
+    )
 
-                    process_kline(
-                        payload
-                    )
 
-            except Exception as e:
+# ============================================================
+# WAIT UNTIL NEXT 5-MINUTE CANDLE
+# ============================================================
 
-                print(
-                    "WEBSOCKET ERROR:",
-                    e
-                )
+def wait_for_next_5m():
 
-                raise
+    now = time.time()
+
+    # Növbəti 5 dəqiqəlik sərhəd
+    next_run = (
+        ((int(now) // 300) + 1)
+        * 300
+    )
+
+    wait_seconds = (
+        next_run - now
+    )
+
+    if wait_seconds < 1:
+
+        wait_seconds = 1
+
+    print(
+        f"⏳ Next 5M scan in "
+        f"{int(wait_seconds)} seconds..."
+    )
+
+    time.sleep(
+        wait_seconds
+    )
 
 
 # ============================================================
 # START
 # ============================================================
 
-async def main():
+print()
+print(
+    "🟢 BINANCE 5M VOLUME MOMENTUM BOT"
+)
+print()
 
-    print()
-    print(
-        "=========================================="
-    )
+print(
+    "Source: Binance Spot"
+)
 
-    print(
-        "🟢 BINANCE VOLUME ALERT BOT"
-    )
+print(
+    "Scan interval: 5 minutes"
+)
 
-    print(
-        "=========================================="
-    )
+print(
+    "Minimum 5M Volume:",
+    f"${MIN_5M_VOLUME:,}"
+)
 
-    print()
-    print(
-        "Market: Binance Spot"
-    )
+print(
+    "Minimum Volume Multiplier:",
+    f"{MIN_VOLUME_MULTIPLIER}x"
+)
 
-    print(
-        "Interval: 5 minutes"
-    )
+print(
+    "Minimum Volume Increase:",
+    f"${MIN_VOLUME_INCREASE:,}"
+)
 
-    print(
-        "Baseline:",
-        BASELINE_CANDLES,
-        "completed candles"
-    )
+print(
+    "Minimum 5M Price Change:",
+    f"{MIN_PRICE_CHANGE}%"
+)
 
-    print(
-        "Volume multiplier:",
-        VOLUME_MULTIPLIER,
-        "x"
-    )
+print(
+    "Maximum 5M Price Change:",
+    f"{MAX_PRICE_CHANGE_5M}%"
+)
 
-    print(
-        "Minimum price change:",
-        MIN_PRICE_CHANGE,
-        "%"
-    )
+print(
+    "One Alert Per Coin: ON"
+)
 
-    print(
-        "One alert per coin: ON"
-    )
+print()
 
-    print()
 
-    # --------------------------------------------------------
-    # TELEGRAM START MESSAGE
-    # --------------------------------------------------------
+# ============================================================
+# TELEGRAM START MESSAGE
+# ============================================================
 
-    send_telegram(
-        "🟢 BINANCE VOLUME ALERT BOT STARTED\n\n"
+send_message(
 
-        "📊 Market: Binance Spot\n"
-        "⏱ Timeframe: 5M\n"
-        "🔥 Volume spike: ≥ 2.5x average\n"
-        "📈 Price movement: ≥ +1%\n\n"
+    "🟢 BINANCE 5M VOLUME BOT STARTED\n\n"
 
-        "⚠️ Eyni coinə yalnız 1 dəfə alert "
-        "veriləcək.\n\n"
+    "🎯 Məqsəd:\n"
+    "Binance Spot-da volume qəfil "
+    "yüklənən coinləri tapmaq.\n\n"
 
-        "Gündəlik volume filtri yoxdur."
-    )
+    "📊 Yoxlama:\n"
+    "• Hər 5 dəqiqədən bir\n"
+    "• Son tamamlanmış 5M candle\n"
+    "• Əvvəlki 3×5M orta volume ilə müqayisə\n\n"
 
-    # --------------------------------------------------------
-    # SYMBOLS
-    # --------------------------------------------------------
+    "🔥 Qaydalar:\n"
+    "• 5M Volume ≥ $50K\n"
+    "• Volume ≥ 2x əvvəlki 3×5M orta\n"
+    "• Volume artımı ≥ $25K\n"
+    "• Qiymət mənfi olmamalıdır\n"
+    "• Çox qaçmış coinlər filtrdən çıxır\n\n"
 
-    symbols = get_symbols()
+    "⚠️ Eyni coin yalnız 1 dəfə alert.\n"
+    "Sonradan +20%, +50%, +100% "
+    "qalxsa ikinci alert gəlməyəcək.\n\n"
 
-    print(
-        "BINANCE USDT SYMBOLS:",
-        len(symbols)
-    )
+    "🔵 Mənbə: Binance Spot"
+)
 
-    if not symbols:
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+while True:
+
+    try:
+
+        # Binance coin siyahısı
+        symbols = get_symbols()
 
         print(
-            "No symbols found."
+            "BINANCE USDT SPOT COINS:",
+            len(symbols)
         )
 
-        return
+        if symbols:
 
-    # --------------------------------------------------------
-    # HISTORICAL DATA
-    # --------------------------------------------------------
-
-    bootstrap(
-        symbols
-    )
-
-    # --------------------------------------------------------
-    # WEBSOCKET
-    # --------------------------------------------------------
-
-    while True:
-
-        try:
-
-            await websocket_loop(
+            scan(
                 symbols
             )
 
-        except Exception as e:
+    except Exception as e:
 
-            print(
-                "CONNECTION LOST:",
-                e
-            )
+        print(
+            "MAIN LOOP ERROR:",
+            e
+        )
 
-            print(
-                "Reconnecting in 10 seconds..."
-            )
-
-            await asyncio.sleep(
-                10
-            )
-
-
-# ============================================================
-# RUN
-# ============================================================
-
-if __name__ == "__main__":
-
-    asyncio.run(
-        main()
-    )
+    # Növbəti 5M perioduna qədər gözlə
+    wait_for_next_5m()
