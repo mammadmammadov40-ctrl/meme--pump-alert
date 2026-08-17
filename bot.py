@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 
 
@@ -17,80 +18,44 @@ CHAT_ID = os.environ["CHAT_ID"]
 
 CHAIN = "solana"
 
-# ------------------------------------------------------------
 # TOKEN YAŞI
 # 3 gün - 60 gün
-# ------------------------------------------------------------
-
 MIN_AGE_HOURS = 3 * 24
 MAX_AGE_HOURS = 60 * 24
 
-
-# ------------------------------------------------------------
 # ƏSAS FİLTRLƏR
-# ------------------------------------------------------------
-
 MIN_MARKET_CAP = 10_000
 MIN_LIQUIDITY = 10_000
+
+# 5 dəqiqəlik minimum volume
 MIN_5M_VOLUME = 500
 
-
-# ------------------------------------------------------------
-# MOMENTUM
-# ------------------------------------------------------------
-
-# 5 dəqiqəlik qiymət maksimum +50%-ə qədər qəbul edilir.
-#
-# Məsələn:
-# +5%  -> qəbul
-# +20% -> qəbul
-# +40% -> qəbul
-# +50% -> qəbul
-# +51% -> artıq gec hesab edilir
-# ------------------------------------------------------------
-
-MAX_CURRENT_5M_PRICE = 50
-
-
-# ------------------------------------------------------------
-# BUY PRESSURE
-# ------------------------------------------------------------
-
+# Buy pressure
 MIN_BUY_RATIO = 55
 
+# 5M-də minimum hərəkət
+# 0 qoyuruq ki, yalnız qiymətə görə bloklanmasın.
+MIN_PRICE_CHANGE_5M = 0
 
-# ------------------------------------------------------------
-# SCAN
-# ------------------------------------------------------------
-
+# Scan intervalı
 CHECK_INTERVAL = 30
 
-
-# ------------------------------------------------------------
-# BİR TOKENƏ YALNIZ 1 ALERT
-# ------------------------------------------------------------
-
-# Token bir dəfə siqnal aldıqdan sonra:
-#
-# +20%
-# +40%
-# +50%
-# +100%
-#
-# olsa belə yenidən alert verməyəcək.
-#
-# Yalnız bot restart olunanda RAM yaddaşı sıfırlanır.
-# ------------------------------------------------------------
-
-alerted_tokens = set()
+# Bir scan-da maksimum alert
+MAX_ALERTS_PER_SCAN = 5
 
 
 # ============================================================
 # MEMORY
 # ============================================================
 
-# Əvvəlki scan məlumatları
 previous = {}
+
+# Bu tokenlərə artıq SIQNAL verilib
+# Eyni token bir daha alert almayacaq.
+alerted_tokens = set()
+
+# Railway restart zamanı da mümkün qədər yadda saxlamaq üçün
+ALERT_FILE = "alerted_tokens.json"
 
 
 # ============================================================
@@ -100,8 +65,72 @@ previous = {}
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "MemePumpEarlyScannerV5"
+    "User-Agent": "MemePumpEarlyScanner/5.0"
 })
+
+
+# ============================================================
+# LOAD ALERTED TOKENS
+# ============================================================
+
+def load_alerted_tokens():
+
+    global alerted_tokens
+
+    try:
+
+        if os.path.exists(ALERT_FILE):
+
+            with open(
+                ALERT_FILE,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
+                data = json.load(f)
+
+                if isinstance(data, list):
+
+                    alerted_tokens = set(data)
+
+        print(
+            "ALREADY ALERTED TOKENS:",
+            len(alerted_tokens)
+        )
+
+    except Exception as e:
+
+        print(
+            "LOAD MEMORY ERROR:",
+            e
+        )
+
+
+# ============================================================
+# SAVE ALERTED TOKENS
+# ============================================================
+
+def save_alerted_tokens():
+
+    try:
+
+        with open(
+            ALERT_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                list(alerted_tokens),
+                f
+            )
+
+    except Exception as e:
+
+        print(
+            "SAVE MEMORY ERROR:",
+            e
+        )
 
 
 # ============================================================
@@ -111,18 +140,22 @@ session.headers.update({
 def safe_float(value, default=0):
 
     try:
+
         return float(value or default)
 
     except Exception:
+
         return default
 
 
 def safe_int(value, default=0):
 
     try:
+
         return int(float(value or default))
 
     except Exception:
+
         return default
 
 
@@ -179,7 +212,7 @@ def send_message(text):
 # DEXSCREENER - LATEST PROFILES
 # ============================================================
 
-def get_latest_profiles():
+def get_dex_profiles():
 
     url = (
         "https://api.dexscreener.com/"
@@ -214,86 +247,10 @@ def get_latest_profiles():
 
 
 # ============================================================
-# DEXSCREENER - LATEST BOOSTS
-# ============================================================
-
-def get_latest_boosts():
-
-    url = (
-        "https://api.dexscreener.com/"
-        "token-boosts/latest/v1"
-    )
-
-    try:
-
-        response = session.get(
-            url,
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if isinstance(data, list):
-
-            return data
-
-        return []
-
-    except Exception as e:
-
-        print(
-            "DEX BOOST ERROR:",
-            e
-        )
-
-        return []
-
-
-# ============================================================
-# DEXSCREENER - TOP BOOSTS
-# ============================================================
-
-def get_top_boosts():
-
-    url = (
-        "https://api.dexscreener.com/"
-        "token-boosts/top/v1"
-    )
-
-    try:
-
-        response = session.get(
-            url,
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if isinstance(data, list):
-
-            return data
-
-        return []
-
-    except Exception as e:
-
-        print(
-            "DEX TOP BOOST ERROR:",
-            e
-        )
-
-        return []
-
-
-# ============================================================
 # DEXSCREENER - TOKEN PAIRS
 # ============================================================
 
-def get_token_pairs(token_address):
+def get_dex_pairs(token_address):
 
     url = (
         f"https://api.dexscreener.com/"
@@ -339,12 +296,10 @@ def calculate_age_hours(created_ms):
 
     try:
 
-        age = (
+        return (
             time.time() * 1000
             - float(created_ms)
-        )
-
-        return age / 1000 / 60 / 60
+        ) / 1000 / 60 / 60
 
     except Exception:
 
@@ -369,7 +324,7 @@ def extract_pair(pair):
 
 
         # ----------------------------------------------------
-        # PAIR ADDRESS
+        # PAIR
         # ----------------------------------------------------
 
         pair_address = pair.get(
@@ -379,35 +334,6 @@ def extract_pair(pair):
         if not pair_address:
 
             return None
-
-
-        # ----------------------------------------------------
-        # TOKEN
-        # ----------------------------------------------------
-
-        base = (
-            pair.get("baseToken")
-            or {}
-        )
-
-        token_address = base.get(
-            "address",
-            ""
-        )
-
-        if not token_address:
-
-            return None
-
-        name = base.get(
-            "name",
-            "UNKNOWN"
-        )
-
-        symbol = base.get(
-            "symbol",
-            "UNKNOWN"
-        )
 
 
         # ----------------------------------------------------
@@ -425,11 +351,6 @@ def extract_pair(pair):
         if age_hours is None:
 
             return None
-
-
-        # ----------------------------------------------------
-        # 3 - 60 GÜN
-        # ----------------------------------------------------
 
         if age_hours < MIN_AGE_HOURS:
 
@@ -499,14 +420,14 @@ def extract_pair(pair):
             m5.get("sells")
         )
 
-        total_txns = buys + sells
+        total = buys + sells
 
         buy_ratio = 0
 
-        if total_txns > 0:
+        if total > 0:
 
             buy_ratio = (
-                buys / total_txns
+                buys / total
             ) * 100
 
 
@@ -543,10 +464,30 @@ def extract_pair(pair):
 
 
         # ----------------------------------------------------
-        # ÇOX GECİKMİŞ TOKENİ İSTƏMİRİK
+        # TOKEN
         # ----------------------------------------------------
 
-        if price_5m > MAX_CURRENT_5M_PRICE:
+        base = (
+            pair.get("baseToken")
+            or {}
+        )
+
+        name = base.get(
+            "name",
+            "UNKNOWN"
+        )
+
+        symbol = base.get(
+            "symbol",
+            "UNKNOWN"
+        )
+
+        token_address = base.get(
+            "address",
+            ""
+        )
+
+        if not token_address:
 
             return None
 
@@ -556,20 +497,11 @@ def extract_pair(pair):
         # ----------------------------------------------------
 
         pair_url = pair.get(
-            "url"
+            "url",
+            f"https://dexscreener.com/"
+            f"{CHAIN}/{pair_address}"
         )
 
-        if not pair_url:
-
-            pair_url = (
-                f"https://dexscreener.com/"
-                f"{CHAIN}/{pair_address}"
-            )
-
-
-        # ----------------------------------------------------
-        # RESULT
-        # ----------------------------------------------------
 
         return {
 
@@ -710,8 +642,6 @@ def calculate_score(current, old):
             score += 10
 
 
-        # Volume artımı
-
         if volume_increase > 0:
 
             score += 5
@@ -769,10 +699,6 @@ def calculate_score(current, old):
 
         score += 5
 
-    if price >= 40:
-
-        score += 5
-
     if price >= 50:
 
         score += 5
@@ -800,38 +726,36 @@ def calculate_score(current, old):
 
 def analyze(current):
 
-    pair = current["pair"]
-
     token = current["token"]
 
+    pair = current["pair"]
 
-    # --------------------------------------------------------
-    # TOKEN ARTİQ ALERT ALIBSA
-    # --------------------------------------------------------
+
+    # ========================================================
+    # ƏVVƏL ALERT VERİLİBSƏ
+    #
+    # NƏ OLURSA OLSUN YENİDƏN ALERT YOXDUR.
+    # ========================================================
 
     if token in alerted_tokens:
 
         return False
 
 
-    # --------------------------------------------------------
-    # ƏVVƏLKİ SCAN
-    # --------------------------------------------------------
-
     old = previous.get(
         pair
     )
 
-    # İlk dəfə görürüksə,
-    # yadda saxla, amma alert vermə.
+
+    # İlk dəfə gördük
     if old is None:
 
         return False
 
 
-    # --------------------------------------------------------
-    # DƏYİŞİKLİK
-    # --------------------------------------------------------
+    # ========================================================
+    # DELTA
+    # ========================================================
 
     buy_increase = (
         current["buys"]
@@ -844,9 +768,21 @@ def analyze(current):
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
+    # SCORE
+    # ========================================================
+
+    score = calculate_score(
+        current,
+        old
+    )
+
+    current["score"] = score
+
+
+    # ========================================================
     # MOMENTUM
-    # --------------------------------------------------------
+    # ========================================================
 
     momentum = False
 
@@ -866,9 +802,15 @@ def analyze(current):
         momentum = True
 
 
-    # --------------------------------------------------------
+    # Qiymət ciddi hərəkət edirsə
+    if current["price_5m"] >= 5:
+
+        momentum = True
+
+
+    # ========================================================
     # BUY PRESSURE
-    # --------------------------------------------------------
+    # ========================================================
 
     buy_pressure = (
         current["buy_ratio"]
@@ -876,31 +818,19 @@ def analyze(current):
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # PRICE
-    # --------------------------------------------------------
+    # ========================================================
 
     price_ok = (
         current["price_5m"]
-        <= MAX_CURRENT_5M_PRICE
+        >= MIN_PRICE_CHANGE_5M
     )
 
 
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
-    score = calculate_score(
-        current,
-        old
-    )
-
-    current["score"] = score
-
-
-    # --------------------------------------------------------
+    # ========================================================
     # FINAL SIGNAL
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         score >= 35
@@ -916,7 +846,7 @@ def analyze(current):
 
 
 # ============================================================
-# MEMORY
+# REMEMBER
 # ============================================================
 
 def remember(current):
@@ -946,111 +876,6 @@ def remember(current):
 
 
 # ============================================================
-# COLLECT TOKEN ADDRESSES
-# ============================================================
-
-def get_token_addresses():
-
-    addresses = set()
-
-
-    # --------------------------------------------------------
-    # PROFILES
-    # --------------------------------------------------------
-
-    profiles = get_latest_profiles()
-
-    print(
-        "PROFILES:",
-        len(profiles)
-    )
-
-
-    for item in profiles:
-
-        if item.get(
-            "chainId"
-        ) != CHAIN:
-
-            continue
-
-        address = item.get(
-            "tokenAddress"
-        )
-
-        if address:
-
-            addresses.add(
-                address
-            )
-
-
-    # --------------------------------------------------------
-    # LATEST BOOSTS
-    # --------------------------------------------------------
-
-    latest_boosts = get_latest_boosts()
-
-    print(
-        "LATEST BOOSTS:",
-        len(latest_boosts)
-    )
-
-
-    for item in latest_boosts:
-
-        if item.get(
-            "chainId"
-        ) != CHAIN:
-
-            continue
-
-        address = item.get(
-            "tokenAddress"
-        )
-
-        if address:
-
-            addresses.add(
-                address
-            )
-
-
-    # --------------------------------------------------------
-    # TOP BOOSTS
-    # --------------------------------------------------------
-
-    top_boosts = get_top_boosts()
-
-    print(
-        "TOP BOOSTS:",
-        len(top_boosts)
-    )
-
-
-    for item in top_boosts:
-
-        if item.get(
-            "chainId"
-        ) != CHAIN:
-
-            continue
-
-        address = item.get(
-            "tokenAddress"
-        )
-
-        if address:
-
-            addresses.add(
-                address
-            )
-
-
-    return addresses
-
-
-# ============================================================
 # SCAN DEXSCREENER
 # ============================================================
 
@@ -1058,20 +883,33 @@ def scan_dex():
 
     results = {}
 
-    token_addresses = (
-        get_token_addresses()
-    )
-
+    profiles = get_dex_profiles()
 
     print(
-        "DISCOVERED TOKENS:",
-        len(token_addresses)
+        "PROFILES:",
+        len(profiles)
     )
 
 
-    for token_address in token_addresses:
+    for profile in profiles:
 
-        pairs = get_token_pairs(
+        if profile.get(
+            "chainId"
+        ) != CHAIN:
+
+            continue
+
+
+        token_address = profile.get(
+            "tokenAddress"
+        )
+
+        if not token_address:
+
+            continue
+
+
+        pairs = get_dex_pairs(
             token_address
         )
 
@@ -1082,21 +920,15 @@ def scan_dex():
                 pair
             )
 
-            if result is None:
+            if result:
 
-                continue
+                pair_address = result[
+                    "pair"
+                ]
 
-
-            pair_address = result[
-                "pair"
-            ]
-
-
-            # Eyni pair-i iki dəfə əlavə etmə
-
-            results[
-                pair_address
-            ] = result
+                results[
+                    pair_address
+                ] = result
 
 
     return results
@@ -1110,18 +942,20 @@ def scan():
 
     print()
     print(
-        "=================================================="
+        "=========================================="
     )
+
     print(
         "🔎 NEW SCAN"
     )
+
     print(
-        "=================================================="
+        "=========================================="
     )
 
 
     # --------------------------------------------------------
-    # DEXSCREENER
+    # DEX
     # --------------------------------------------------------
 
     try:
@@ -1131,22 +965,16 @@ def scan():
     except Exception as e:
 
         print(
-            "DEX SCAN ERROR:",
+            "DEX ERROR:",
             e
         )
 
-        return
+        results = {}
 
 
-    print()
     print(
-        "CANDIDATES:",
+        "DISCOVERED TOKENS:",
         len(results)
-    )
-
-    print(
-        "ALREADY ALERTED TOKENS:",
-        len(alerted_tokens)
     )
 
 
@@ -1154,10 +982,33 @@ def scan():
     # ANALYZE
     # ========================================================
 
-    alerts = []
+    candidates = 0
+
+    early_signals = []
+
+    already_alerted = 0
 
 
     for current in results.values():
+
+        token = current["token"]
+
+
+        # Artıq alert verilib
+        if token in alerted_tokens:
+
+            already_alerted += 1
+
+            remember(
+                current
+            )
+
+            continue
+
+
+        # Əsas qaydalara düşür
+        candidates += 1
+
 
         should_alert = analyze(
             current
@@ -1166,82 +1017,69 @@ def scan():
 
         if should_alert:
 
-            alerts.append(
+            early_signals.append(
                 current
             )
 
 
         # Sonrakı scan üçün yadda saxla
-
         remember(
             current
         )
 
 
     # ========================================================
-    # SCORE
+    # SORT
     # ========================================================
 
-    alerts.sort(
+    early_signals.sort(
         key=lambda x: (
-            x.get(
-                "score",
-                0
-            ),
-
-            x.get(
-                "buy_ratio",
-                0
-            ),
-
-            x.get(
-                "buys",
-                0
-            ),
-
-            x.get(
-                "volume_5m",
-                0
-            )
+            x.get("score", 0),
+            x.get("buy_ratio", 0),
+            x.get("price_5m", 0),
+            x.get("buys", 0)
         ),
-
         reverse=True
     )
 
 
     print(
+        "CANDIDATES:",
+        candidates
+    )
+
+    print(
+        "ALREADY ALERTED TOKENS:",
+        already_alerted
+    )
+
+    print(
         "EARLY SIGNALS:",
-        len(alerts)
+        len(early_signals)
     )
 
 
     # ========================================================
-    # TELEGRAM
+    # SEND TELEGRAM
     # ========================================================
 
     sent = 0
 
 
-    for result in alerts:
+    for result in early_signals:
 
-        token = result[
-            "token"
-        ]
+        token = result["token"]
 
 
-        # ----------------------------------------------------
-        # TƏHLÜKƏSİZLİK
-        # Eyni tokeni bu scan zamanı da təkrar göndərmə
-        # ----------------------------------------------------
-
+        # Təhlükəsizlik:
+        # eyni scan-da da iki dəfə göndərilməsin.
         if token in alerted_tokens:
 
             continue
 
 
         message = (
-
-            "🚨 EARLY MOMENTUM ALERT\n\n"
+            "🚨 EARLY MOMENTUM SIGNAL\n\n"
 
             f"🪙 {result['name']} "
             f"({result['symbol']})\n\n"
@@ -1270,10 +1108,8 @@ def scan():
             f"📈 5M Price: "
             f"{result['price_5m']:+.2f}%\n\n"
 
-            f"🔥 Early Score: "
+            f"🔥 Score: "
             f"{result['score']}\n\n"
-
-            f"🔎 Source: DEX Screener\n\n"
 
             f"🔗 {result['url']}"
         )
@@ -1283,41 +1119,37 @@ def scan():
             message
         ):
 
-            # ------------------------------------------------
-            # ƏN VACİB:
-            # TOKENİ ALERT EDİLMİŞ KİMİ YADDA SAXLA
-            # ------------------------------------------------
+            # =================================================
+            # ƏN VACİB HİSSƏ
+            #
+            # Bu token artıq bir dəfə alert aldı.
+            # Sonrakı +20%, +40%, +50%, +100%
+            # hərəkətlərdə YENİ alert gəlməyəcək.
+            # =================================================
 
             alerted_tokens.add(
                 token
             )
 
+            save_alerted_tokens()
 
             sent += 1
 
 
             print(
-                "🚨 ALERT:",
+                "🚨 ALERT SENT:",
                 result["symbol"],
-
                 "| SCORE:",
                 result["score"],
-
                 "| PRICE:",
-                round(
-                    result["price_5m"],
-                    2
-                ),
-
-                "| BUYS:",
-                result["buys"],
-
-                "| BUY RATIO:",
-                round(
-                    result["buy_ratio"],
-                    1
-                )
+                result["price_5m"],
+                "%"
             )
+
+
+        if sent >= MAX_ALERTS_PER_SCAN:
+
+            break
 
 
     print(
@@ -1325,10 +1157,17 @@ def scan():
         sent
     )
 
+    print(
+        "=========================================="
+    )
+
 
 # ============================================================
 # START
 # ============================================================
+
+load_alerted_tokens()
+
 
 print()
 print(
@@ -1336,98 +1175,63 @@ print(
 )
 print()
 
-
 print(
     "Source: DEX Screener"
 )
-
-
-print(
-    "Chain:",
-    CHAIN
-)
-
 
 print(
     "Pair age: 3 - 60 days"
 )
 
-
 print(
-    "Minimum Market Cap:",
-    f"${MIN_MARKET_CAP:,}"
+    "Minimum Market Cap: $10,000"
 )
 
-
 print(
-    "Minimum Liquidity:",
-    f"${MIN_LIQUIDITY:,}"
+    "Minimum Liquidity: $10,000"
 )
 
-
 print(
-    "Minimum 5M Volume:",
-    f"${MIN_5M_VOLUME:,}"
+    "Minimum 5M Volume: $500"
 )
 
-
 print(
-    "Minimum Buy Ratio:",
-    f"{MIN_BUY_RATIO}%"
+    "Minimum Buy Ratio: 55%"
 )
 
-
 print(
-    "Maximum 5M Price:",
-    f"+{MAX_CURRENT_5M_PRICE}%"
+    "Scan interval: 30 seconds"
 )
 
-
 print(
-    "Scan interval:",
-    f"{CHECK_INTERVAL} seconds"
+    "ONE TOKEN = ONE ALERT"
 )
-
-
-print(
-    "One alert per token: ON"
-)
-
 
 print()
 
 
 # ============================================================
-# TELEGRAM START MESSAGE
+# TELEGRAM START
 # ============================================================
 
 send_message(
-
     "🟢 MEME PUMP EARLY SCANNER V5 STARTED\n\n"
 
     "🔎 Source:\n"
     "• DEX Screener\n\n"
 
-    "⚙️ Filtrlər:\n"
-    "• Solana\n"
+    "⚙️ Rules:\n"
     "• Pair age: 3 - 60 gün\n"
     "• Market Cap: ≥ $10K\n"
     "• Liquidity: ≥ $10K\n"
     "• 5M Volume: ≥ $500\n"
-    "• Buy ratio: ≥ 55%\n"
-    "• 5M Price: maksimum +50%\n\n"
+    "• Buy ratio: ≥ 55%\n\n"
 
-    "🔥 Momentum:\n"
-    "• Yeni buy artımı\n"
-    "• Volume artımı\n"
-    "• Buy pressure\n"
-    "• Momentum score\n\n"
+    "🔥 Early momentum aktivdir.\n\n"
 
-    "🚨 Eyni tokenə yalnız 1 dəfə alert.\n"
-    "Token daha sonra +20%, +40%, +50% "
-    "və ya daha çox qalxsa belə ikinci alert gəlməyəcək.\n\n"
-
-    "⏱ Scan: hər 30 saniyə"
+    "⚠️ Eyni tokenə yalnız 1 dəfə alert veriləcək.\n"
+    "Token daha sonra +20%, +40%, +50% və ya +100%\n"
+    "qalxsa belə ikinci alert gəlməyəcək."
 )
 
 
@@ -1450,11 +1254,13 @@ while True:
 
 
     print()
+
     print(
         "Next scan in",
         CHECK_INTERVAL,
         "seconds..."
     )
+
     print()
 
 
