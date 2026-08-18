@@ -2,357 +2,650 @@ import os
 import time
 import json
 import threading
-from datetime import datetime, timezone
+from collections import defaultdict, deque
 
 import requests
 import websocket
 
 
 # ============================================================
-# CONFIG
+# SETTINGS
 # ============================================================
 
+CMC_API_KEY = os.getenv("CMC_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-CMC_API_KEY = os.getenv("CMC_API_KEY", "")
 
-# 3 x 5M PRICE RULE
-MIN_3CANDLE_PRICE_CHANGE = 5.0
-
-# 3 x 5M VOLUME RULE
-MIN_3CANDLE_VOLUME = 50_000
-
-# CMC RANK
-CMC_RANK_MIN = 1
-CMC_RANK_MAX = 2000
-
-# Scan interval
-SCAN_INTERVAL = 30
-
-# Binance
 BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/stream"
 
+INTERVAL = "5m"
+
+# CMC
+CMC_MIN_RANK = 1
+CMC_MAX_RANK = 2000
+
+# SIGNAL
+MIN_PRICE_CHANGE = 5.0
+MIN_TOTAL_VOLUME = 50_000.0
+
+# WebSocket groups
+WS_CHUNK_SIZE = 100
+
+# Keep enough candles for rolling windows
+MAX_CANDLES = 10
+
+# Reconnect
+RECONNECT_SECONDS = 3
+
+
 # ============================================================
-# GLOBAL DATA
+# DATA
 # ============================================================
 
 coins = {}
-ranks = {}
+cmc_ranks = {}
 
-lock = threading.Lock()
+# symbol -> deque of candles
+history = defaultdict(
+    lambda: deque(maxlen=MAX_CANDLES)
+)
 
-alerted = set()
+# Already alerted rolling windows
+alerted_windows = set()
 
-last_scan = 0
-ws_connected = False
+data_lock = threading.RLock()
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def telegram_send(text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("TELEGRAM CONFIG MISSING")
+def send_telegram(text):
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("TELEGRAM_BOT_TOKEN MISSING", flush=True)
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    if not TELEGRAM_CHAT_ID:
+        print("TELEGRAM_CHAT_ID MISSING", flush=True)
+        return False
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
 
     try:
-        r = requests.post(
+
+        response = requests.post(
             url,
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": text,
                 "disable_web_page_preview": True,
             },
-            timeout=15,
+            timeout=10,
         )
 
-        if r.status_code == 200:
-            print("TELEGRAM SENT")
+        if response.status_code == 200:
+
+            print(
+                "TELEGRAM SENT",
+                flush=True
+            )
+
             return True
 
-        print("TELEGRAM ERROR:", r.status_code, r.text[:300])
+        print(
+            "TELEGRAM ERROR:",
+            response.status_code,
+            response.text[:500],
+            flush=True
+        )
+
         return False
 
     except Exception as e:
-        print("TELEGRAM EXCEPTION:", e)
+
+        print(
+            "TELEGRAM EXCEPTION:",
+            e,
+            flush=True
+        )
+
         return False
 
 
 # ============================================================
-# CMC RANKS
+# CMC
 # ============================================================
 
-def load_cmc_ranks():
-    global ranks
+def load_cmc():
 
     if not CMC_API_KEY:
-        print("CMC_API_KEY MISSING")
-        return
 
-    print("CMC: loading rankings...")
+        print(
+            "CMC_API_KEY MISSING",
+            flush=True
+        )
 
-    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+        return False
+
+    print(
+        "CMC: LOADING TOP 2000...",
+        flush=True
+    )
+
+    url = (
+        "https://pro-api.coinmarketcap.com"
+        "/v1/cryptocurrency/listings/latest"
+    )
 
     headers = {
-        "X-CMC_PRO_API_KEY": CMC_API_KEY
+        "X-CMC_PRO_API_KEY": CMC_API_KEY,
+        "Accept": "application/json",
     }
 
     params = {
         "start": 1,
         "limit": 2000,
         "convert": "USD",
+        "sort": "market_cap",
+        "sort_dir": "desc",
     }
 
     try:
-        r = requests.get(
+
+        response = requests.get(
             url,
             headers=headers,
             params=params,
             timeout=30,
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
-        data = r.json().get("data", [])
+        data = response.json().get(
+            "data",
+            []
+        )
 
         new_ranks = {}
 
         for coin in data:
-            symbol = coin.get("symbol", "").upper()
-            rank = coin.get("cmc_rank")
 
-            if symbol and rank:
-                # Keep first occurrence of a symbol
+            symbol = str(
+                coin.get(
+                    "symbol",
+                    ""
+                )
+            ).upper()
+
+            rank = coin.get(
+                "cmc_rank"
+            )
+
+            if not symbol or rank is None:
+                continue
+
+            rank = int(rank)
+
+            if (
+                CMC_MIN_RANK
+                <= rank
+                <= CMC_MAX_RANK
+            ):
+
                 if symbol not in new_ranks:
-                    new_ranks[symbol] = int(rank)
 
-        ranks = new_ranks
+                    new_ranks[symbol] = rank
 
-        print(f"CMC RANKS LOADED: {len(ranks)}")
+        with data_lock:
+
+            cmc_ranks.clear()
+
+            cmc_ranks.update(
+                new_ranks
+            )
+
+        print(
+            f"CMC COINS: {len(new_ranks)} "
+            f"(RANK {CMC_MIN_RANK}-{CMC_MAX_RANK})",
+            flush=True
+        )
+
+        return True
 
     except Exception as e:
-        print("CMC ERROR:", e)
+
+        print(
+            "CMC ERROR:",
+            e,
+            flush=True
+        )
+
+        return False
 
 
 # ============================================================
 # BINANCE SYMBOLS
 # ============================================================
 
-def get_binance_symbols():
-    print("BINANCE: loading USDT spot symbols...")
+def load_binance_symbols():
 
-    url = f"{BINANCE_REST}/api/v3/exchangeInfo"
+    print(
+        "BINANCE: LOADING USDT SPOT...",
+        flush=True
+    )
+
+    url = (
+        f"{BINANCE_REST}"
+        "/api/v3/exchangeInfo"
+    )
 
     try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
 
-        data = r.json()
+        response = requests.get(
+            url,
+            timeout=30
+        )
 
-        result = []
+        response.raise_for_status()
 
-        for s in data.get("symbols", []):
+        data = response.json()
 
-            if s.get("status") != "TRADING":
+        result = {}
+
+        with data_lock:
+
+            ranks = dict(
+                cmc_ranks
+            )
+
+        for item in data.get(
+            "symbols",
+            []
+        ):
+
+            if item.get(
+                "status"
+            ) != "TRADING":
                 continue
 
-            if s.get("quoteAsset") != "USDT":
+            if item.get(
+                "quoteAsset"
+            ) != "USDT":
                 continue
 
-            if s.get("isSpotTradingAllowed") is not True:
+            if item.get(
+                "isSpotTradingAllowed"
+            ) is False:
                 continue
 
-            symbol = s.get("symbol")
+            symbol = str(
+                item.get(
+                    "symbol",
+                    ""
+                )
+            ).upper()
 
-            base = s.get("baseAsset", "").upper()
+            base = str(
+                item.get(
+                    "baseAsset",
+                    ""
+                )
+            ).upper()
 
-            # CMC rank filtering
-            rank = ranks.get(base)
+            if not symbol or not base:
+                continue
+
+            rank = ranks.get(
+                base
+            )
 
             if rank is None:
                 continue
 
-            if not (CMC_RANK_MIN <= rank <= CMC_RANK_MAX):
+            if not (
+                CMC_MIN_RANK
+                <= rank
+                <= CMC_MAX_RANK
+            ):
                 continue
 
-            result.append(symbol)
+            # Ignore leveraged tokens
+            if base.endswith(
+                (
+                    "UP",
+                    "DOWN",
+                    "BULL",
+                    "BEAR",
+                )
+            ):
+                continue
 
-        print(f"BINANCE USDT SPOT: {len(result)}")
-        print(f"TRACKED COINS: {len(result)}")
+            result[symbol] = {
+                "base": base,
+                "rank": rank,
+                "name": base,
+            }
 
-        return result
+        with data_lock:
+
+            coins.clear()
+
+            coins.update(
+                result
+            )
+
+        print(
+            f"BINANCE USDT SPOT: "
+            f"{len(result)}",
+            flush=True
+        )
+
+        print(
+            f"TRACKED COINS: "
+            f"{len(result)}",
+            flush=True
+        )
+
+        return list(
+            result.keys()
+        )
 
     except Exception as e:
-        print("BINANCE SYMBOL ERROR:", e)
+
+        print(
+            "BINANCE SYMBOL ERROR:",
+            e,
+            flush=True
+        )
+
         return []
 
 
 # ============================================================
-# HISTORICAL 5M CANDLES
+# HISTORICAL DATA
 # ============================================================
 
 def load_history(symbols):
 
-    print(f"BOOTSTRAP START: {len(symbols)} coins")
+    print(
+        f"BOOTSTRAP START: "
+        f"{len(symbols)} coins",
+        flush=True
+    )
 
-    total = len(symbols)
+    ready = 0
 
-    for i, symbol in enumerate(symbols, 1):
+    for index, symbol in enumerate(
+        symbols,
+        start=1
+    ):
 
         try:
 
-            url = f"{BINANCE_REST}/api/v3/klines"
+            url = (
+                f"{BINANCE_REST}"
+                "/api/v3/klines"
+            )
 
             params = {
                 "symbol": symbol,
-                "interval": "5m",
-                "limit": 3,
+                "interval": INTERVAL,
+                "limit": 5,
             }
 
-            r = requests.get(
+            response = requests.get(
                 url,
                 params=params,
-                timeout=10,
+                timeout=10
             )
 
-            if r.status_code != 200:
+            if response.status_code != 200:
                 continue
 
-            data = r.json()
+            rows = response.json()
 
-            candles = []
+            with data_lock:
 
-            for k in data:
+                history[symbol].clear()
 
-                candles.append({
-                    "open_time": int(k[0]),
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5]),
-                    "close_time": int(k[6]),
-                })
+                for row in rows:
 
-            with lock:
-                coins[symbol] = candles
+                    history[symbol].append(
+                        {
+                            "open_time": int(
+                                row[0]
+                            ),
+                            "open": float(
+                                row[1]
+                            ),
+                            "high": float(
+                                row[2]
+                            ),
+                            "low": float(
+                                row[3]
+                            ),
+                            "close": float(
+                                row[4]
+                            ),
+                            "base_volume": float(
+                                row[5]
+                            ),
+                            "close_time": int(
+                                row[6]
+                            ),
+                            # IMPORTANT:
+                            # Binance quote volume = USDT volume
+                            "quote_volume": float(
+                                row[7]
+                            ),
+                        }
+                    )
 
-            if i % 100 == 0:
-                print(f"BOOTSTRAP: {i}/{total}")
+            ready += 1
 
-            # Small delay to avoid hammering REST API
-            time.sleep(0.02)
+            if index % 100 == 0:
+
+                print(
+                    f"BOOTSTRAP: "
+                    f"{index}/{len(symbols)}",
+                    flush=True
+                )
+
+            # Respect REST API
+            time.sleep(0.03)
 
         except Exception as e:
-            print(f"HISTORY ERROR {symbol}: {e}")
 
-    print("BOOTSTRAP FINISHED")
+            print(
+                f"HISTORY ERROR "
+                f"{symbol}: {e}",
+                flush=True
+            )
+
+    print(
+        f"BOOTSTRAP FINISHED "
+        f"HISTORY_READY={ready}",
+        flush=True
+    )
 
 
 # ============================================================
-# CANDLE UPDATE
+# LIVE CANDLE UPDATE
 # ============================================================
 
-def update_candle(symbol, k):
+def update_live_candle(
+    symbol,
+    kline
+):
 
     candle = {
-        "open_time": int(k["t"]),
-        "open": float(k["o"]),
-        "high": float(k["h"]),
-        "low": float(k["l"]),
-        "close": float(k["c"]),
-        "volume": float(k["v"]),
-        "close_time": int(k["T"]),
+
+        "open_time": int(
+            kline["t"]
+        ),
+
+        "open": float(
+            kline["o"]
+        ),
+
+        "high": float(
+            kline["h"]
+        ),
+
+        "low": float(
+            kline["l"]
+        ),
+
+        "close": float(
+            kline["c"]
+        ),
+
+        "base_volume": float(
+            kline["v"]
+        ),
+
+        "close_time": int(
+            kline["T"]
+        ),
+
+        # q = quote volume, i.e. USDT volume
+        "quote_volume": float(
+            kline["q"]
+        ),
+
+        "closed": bool(
+            kline["x"]
+        ),
     }
 
-    with lock:
+    with data_lock:
 
         if symbol not in coins:
-            coins[symbol] = []
+            return
 
-        arr = coins[symbol]
+        candles = history[
+            symbol
+        ]
 
-        if arr and arr[-1]["open_time"] == candle["open_time"]:
+        # Same 5-minute candle:
+        # update it immediately.
+        if (
+            candles
+            and
+            candles[-1]["open_time"]
+            == candle["open_time"]
+        ):
 
-            # LIVE UPDATE OF CURRENT 5M CANDLE
-            arr[-1] = candle
+            candles[-1] = candle
 
         else:
 
-            arr.append(candle)
-
-        # Keep only latest candles
-        coins[symbol] = arr[-5:]
+            # New 5-minute candle:
+            # rolling window moves forward.
+            candles.append(
+                candle
+            )
 
 
 # ============================================================
-# 3 x 5M CONDITION
+# ROLLING 3-CANDLE CHECK
 # ============================================================
 
-def check_signal(symbol):
+def check_rolling_3(
+    symbol
+):
 
-    with lock:
+    with data_lock:
 
-        candles = list(coins.get(symbol, []))
+        candles = list(
+            history.get(
+                symbol,
+                []
+            )
+        )
+
+        info = coins.get(
+            symbol
+        )
+
+    if info is None:
+        return None
 
     if len(candles) < 3:
         return None
 
-    # Last 3 candles
+    # --------------------------------------------------------
+    # ONLY THE LAST 3 CANDLES
+    #
+    # 1-2-3
+    # then when a new candle appears:
+    # 2-3-4
+    # then:
+    # 3-4-5
+    # etc.
+    #
+    # During the third/current candle, its CLOSE,
+    # HIGH and QUOTE VOLUME are updated LIVE.
+    # --------------------------------------------------------
+
     c1 = candles[-3]
     c2 = candles[-2]
     c3 = candles[-1]
 
-    # --------------------------------------------------------
-    # PRICE
-    # Overall price change:
-    # first candle OPEN -> current third candle CLOSE
-    # --------------------------------------------------------
-
     first_open = c1["open"]
-    current_close = c3["close"]
+    current_price = c3["close"]
 
     if first_open <= 0:
         return None
 
-    price_change = ((current_close / first_open) - 1) * 100
+    # Overall change from first candle OPEN
+    # to current third candle price.
+    price_change = (
+        (
+            current_price
+            / first_open
+        ) - 1.0
+    ) * 100.0
 
-    if price_change < MIN_3CANDLE_PRICE_CHANGE:
-        return None
-
-    # --------------------------------------------------------
-    # VOLUME
-    # Sum of all 3 x 5M candles
-    # --------------------------------------------------------
-
+    # Total volume of all 3 candles.
+    # q = USDT quote volume.
     total_volume = (
-        c1["volume"] +
-        c2["volume"] +
-        c3["volume"]
+        c1["quote_volume"]
+        + c2["quote_volume"]
+        + c3["quote_volume"]
     )
 
-    if total_volume < MIN_3CANDLE_VOLUME:
+    # Main rules
+    if price_change < MIN_PRICE_CHANGE:
         return None
 
-    # --------------------------------------------------------
-    # SIGNAL ID
-    # One alert per 3-candle window
-    # --------------------------------------------------------
+    if total_volume < MIN_TOTAL_VOLUME:
+        return None
 
-    window_id = f"{symbol}:{c1['open_time']}:{c3['open_time']}"
+    # Unique rolling window.
+    # This prevents repeated Telegram messages
+    # while the third candle is still moving.
+    window_id = (
+        f"{symbol}:"
+        f"{c1['open_time']}:"
+        f"{c2['open_time']}:"
+        f"{c3['open_time']}"
+    )
 
-    if window_id in alerted:
+    if window_id in alerted_windows:
         return None
 
     return {
         "symbol": symbol,
+        "rank": info["rank"],
+        "price": current_price,
         "price_change": price_change,
         "volume": total_volume,
-        "price": current_close,
         "window_id": window_id,
         "c1": c1,
         "c2": c2,
@@ -364,204 +657,339 @@ def check_signal(symbol):
 # SEND SIGNAL
 # ============================================================
 
-def send_signal(signal):
+def send_signal(
+    signal
+):
 
-    symbol = signal["symbol"]
+    window_id = signal[
+        "window_id"
+    ]
 
-    rank = ranks.get(
-        symbol.replace("USDT", ""),
-        "?"
+    # Mark immediately.
+    alerted_windows.add(
+        window_id
     )
 
-    price_change = signal["price_change"]
-    volume = signal["volume"]
-    price = signal["price"]
+    symbol = signal[
+        "symbol"
+    ]
+
+    rank = signal[
+        "rank"
+    ]
+
+    price = signal[
+        "price"
+    ]
+
+    price_change = signal[
+        "price_change"
+    ]
+
+    total_volume = signal[
+        "volume"
+    ]
 
     c1 = signal["c1"]
     c2 = signal["c2"]
     c3 = signal["c3"]
 
-    # Mark BEFORE sending to prevent duplicates
-    alerted.add(signal["window_id"])
+    def candle_percent(c):
+
+        if c["open"] <= 0:
+            return 0.0
+
+        return (
+            (
+                c["close"]
+                / c["open"]
+            ) - 1
+        ) * 100
+
+    p1 = candle_percent(c1)
+    p2 = candle_percent(c2)
+    p3 = candle_percent(c3)
+
+    # Is the current third candle still open?
+    live_status = (
+        "🟢 LIVE / 3-cü şam hələ bağlanmayıb"
+        if not c3.get("closed", False)
+        else
+        "🔵 3-cü şam bağlanıb"
+    )
 
     message = (
-        "🚨 BINANCE 3×5M EARLY MOMENTUM\n\n"
+        "🚨 PUMP SIGNAL\n\n"
 
         f"🪙 {symbol}\n"
         f"🏆 CMC Rank: #{rank}\n\n"
 
-        f"📈 3×5M PRICE: +{price_change:.2f}%\n"
-        f"💰 3×5M VOLUME: ${volume:,.0f}\n"
-        f"💵 Current Price: {price:.10g}\n\n"
+        f"📈 3×5M ÜMUMİ: "
+        f"+{price_change:.2f}%\n"
 
-        "🕯 5M candles:\n"
-        f"1️⃣ +{((c1['close']/c1['open'])-1)*100:.2f}%\n"
-        f"2️⃣ +{((c2['close']/c2['open'])-1)*100:.2f}%\n"
-        f"3️⃣ +{((c3['close']/c3['open'])-1)*100:.2f}%\n\n"
+        f"💰 3×5M ÜMUMİ VOLUME: "
+        f"${total_volume:,.0f}\n\n"
 
-        "⚡ LIVE 3×5M momentum detected\n"
-        "🔵 Binance Spot"
+        f"🕯️ 1-ci şam: "
+        f"{p1:+.2f}%\n"
+
+        f"🕯️ 2-ci şam: "
+        f"{p2:+.2f}%\n"
+
+        f"🕯️ 3-cü şam: "
+        f"{p3:+.2f}%\n\n"
+
+        f"💵 Cari qiymət: "
+        f"{price:.10g}\n\n"
+
+        f"{live_status}\n"
+
+        "⚡ Rolling 3×5M\n"
+        "📊 Binance Spot\n"
+        "🎯 Şərt: ≥5% + ≥$50K"
     )
 
-    print("\n" + "=" * 50)
-    print(message)
-    print("=" * 50 + "\n")
+    print(
+        "\n" + "=" * 70,
+        flush=True
+    )
 
-    telegram_send(message)
+    print(
+        message,
+        flush=True
+    )
 
+    print(
+        "=" * 70 + "\n",
+        flush=True
+    )
 
-# ============================================================
-# SCANNER
-# ============================================================
-
-def scanner_loop():
-
-    global last_scan
-
-    while True:
-
-        try:
-
-            now = time.time()
-
-            if now - last_scan >= SCAN_INTERVAL:
-
-                last_scan = now
-
-                checked = 0
-                signals = 0
-
-                with lock:
-                    symbols = list(coins.keys())
-
-                for symbol in symbols:
-
-                    checked += 1
-
-                    signal = check_signal(symbol)
-
-                    if signal:
-
-                        signals += 1
-                        send_signal(signal)
-
-                print(
-                    f"SCAN | TRACKED={len(symbols)} "
-                    f"| CHECKED={checked} "
-                    f"| SIGNALS={signals} "
-                    f"| WS={ws_connected}"
-                )
-
-            time.sleep(1)
-
-        except Exception as e:
-
-            print("SCANNER ERROR:", e)
-            time.sleep(5)
+    # Telegram request is made immediately
+    # when the WebSocket update triggers the signal.
+    send_telegram(
+        message
+    )
 
 
 # ============================================================
-# WEBSOCKET
+# REAL-TIME SIGNAL CHECK
 # ============================================================
 
-def websocket_message(ws, message):
+def process_signal_immediately(
+    symbol
+):
+
+    signal = check_rolling_3(
+        symbol
+    )
+
+    if signal is None:
+        return
+
+    # Run Telegram sending in another thread
+    # so one slow Telegram request does not
+    # block Binance WebSocket processing.
+    threading.Thread(
+        target=send_signal,
+        args=(signal,),
+        daemon=True,
+    ).start()
+
+
+# ============================================================
+# WEBSOCKET MESSAGE
+# ============================================================
+
+def websocket_message(
+    ws,
+    message
+):
 
     try:
 
-        data = json.loads(message)
+        payload = json.loads(
+            message
+        )
 
-        payload = data.get("data", data)
+        # Combined stream:
+        # {"stream":"...","data":{...}}
+        data = payload.get(
+            "data",
+            payload
+        )
 
-        stream = data.get("stream", "")
-
-        if payload.get("e") != "kline":
+        if data.get("e") != "kline":
             return
 
-        k = payload.get("k")
+        kline = data.get(
+            "k"
+        )
 
-        if not k:
+        if not kline:
             return
 
-        symbol = k["s"].upper()
+        symbol = str(
+            kline.get(
+                "s",
+                ""
+            )
+        ).upper()
 
-        update_candle(symbol, k)
+        if not symbol:
+            return
+
+        # Update candle immediately.
+        update_live_candle(
+            symbol,
+            kline
+        )
+
+        # IMPORTANT:
+        # No 30-second scanner here.
+        #
+        # Every Binance WebSocket update is checked
+        # immediately.
+        process_signal_immediately(
+            symbol
+        )
 
     except Exception as e:
 
-        print("WS MESSAGE ERROR:", e)
-
-
-def websocket_open(ws):
-
-    global ws_connected
-
-    ws_connected = True
-
-    print("WEBSOCKET CONNECTED")
-
-    telegram_send(
-        "🟢 MEME PUMP ALERT ACTIVE\n\n"
-        "Binance canlı WebSocket bağlantısı hazırdır.\n"
-        "3×5M early momentum scanner işləyir."
-    )
-
-
-def websocket_close(ws, close_status_code, close_msg):
-
-    global ws_connected
-
-    ws_connected = False
-
-    print(
-        "WEBSOCKET CLOSED:",
-        close_status_code,
-        close_msg
-    )
-
-
-def websocket_error(ws, error):
-
-    print("WEBSOCKET ERROR:", error)
-
-
-# ============================================================
-# WEBSOCKET LOOP
-# ============================================================
-
-def websocket_loop(symbols):
-
-    global ws_connected
-
-    # Binance stream names
-    streams = []
-
-    for symbol in symbols:
-
-        streams.append(
-            f"{symbol.lower()}@kline_5m"
+        print(
+            "WS MESSAGE ERROR:",
+            e,
+            flush=True
         )
 
-    # Binance combined stream URL
-    url = (
-        BINANCE_WS
-        + "?streams="
-        + "/".join(streams)
-    )
+
+# ============================================================
+# WEBSOCKET OPEN
+# ============================================================
+
+def websocket_open(
+    ws,
+    worker_id,
+    symbols
+):
 
     print(
-        f"WS 1: CONNECTING ({len(streams)} streams)"
+        f"WS {worker_id}: "
+        f"CONNECTED "
+        f"({len(symbols)} streams)",
+        flush=True
     )
+
+    streams = [
+        f"{s.lower()}@kline_5m"
+        for s in symbols
+    ]
+
+    # Since this is a combined-stream connection,
+    # the streams are already in the URL.
+    print(
+        f"WS {worker_id}: "
+        f"LIVE 5M STREAMS ACTIVE",
+        flush=True
+    )
+
+
+# ============================================================
+# WEBSOCKET CLOSE
+# ============================================================
+
+def websocket_close(
+    ws,
+    code,
+    message,
+    worker_id
+):
+
+    print(
+        f"WS {worker_id}: CLOSED "
+        f"code={code} "
+        f"message={message}",
+        flush=True
+    )
+
+
+# ============================================================
+# WEBSOCKET ERROR
+# ============================================================
+
+def websocket_error(
+    ws,
+    error,
+    worker_id
+):
+
+    print(
+        f"WS {worker_id}: ERROR "
+        f"{error}",
+        flush=True
+    )
+
+
+# ============================================================
+# WEBSOCKET WORKER
+# ============================================================
+
+def websocket_worker(
+    symbols,
+    worker_id
+):
 
     while True:
 
         try:
 
+            streams = [
+                f"{s.lower()}@kline_5m"
+                for s in symbols
+            ]
+
+            url = (
+                BINANCE_WS
+                + "?streams="
+                + "/".join(streams)
+            )
+
+            print(
+                f"WS {worker_id}: "
+                f"CONNECTING "
+                f"({len(symbols)} streams)",
+                flush=True
+            )
+
             ws = websocket.WebSocketApp(
+
                 url,
-                on_open=websocket_open,
-                on_message=websocket_message,
-                on_error=websocket_error,
-                on_close=websocket_close,
+
+                on_open=lambda ws:
+                    websocket_open(
+                        ws,
+                        worker_id,
+                        symbols
+                    ),
+
+                on_message=
+                    websocket_message,
+
+                on_error=lambda ws, error:
+                    websocket_error(
+                        ws,
+                        error,
+                        worker_id
+                    ),
+
+                on_close=lambda ws,
+                    code,
+                    message:
+                    websocket_close(
+                        ws,
+                        code,
+                        message,
+                        worker_id
+                    ),
             )
 
             ws.run_forever(
@@ -571,71 +999,220 @@ def websocket_loop(symbols):
 
         except Exception as e:
 
-            ws_connected = False
+            print(
+                f"WS {worker_id}: "
+                f"EXCEPTION {e}",
+                flush=True
+            )
 
-            print("WS LOOP ERROR:", e)
+        print(
+            f"WS {worker_id}: "
+            f"RECONNECTING IN "
+            f"{RECONNECT_SECONDS}s",
+            flush=True
+        )
 
-        print("WEBSOCKET RECONNECTING IN 5 SECONDS...")
-
-        time.sleep(5)
+        time.sleep(
+            RECONNECT_SECONDS
+        )
 
 
 # ============================================================
-# STARTUP
+# WEBSOCKET START
+# ============================================================
+
+def start_websockets(
+    symbols
+):
+
+    chunks = [
+
+        symbols[i:i + WS_CHUNK_SIZE]
+
+        for i in range(
+            0,
+            len(symbols),
+            WS_CHUNK_SIZE
+        )
+    ]
+
+    print(
+        f"WEBSOCKET CONNECTIONS: "
+        f"{len(chunks)}",
+        flush=True
+    )
+
+    for worker_id, chunk in enumerate(
+        chunks,
+        start=1
+    ):
+
+        thread = threading.Thread(
+            target=websocket_worker,
+            args=(
+                chunk,
+                worker_id
+            ),
+            daemon=True,
+        )
+
+        thread.start()
+
+        # Don't open all connections
+        # at exactly the same millisecond.
+        time.sleep(1)
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 def main():
 
-    print("=" * 60)
-    print("MEME PUMP ALERT STARTING")
-    print("=" * 60)
-
-    print()
-    print("RULES:")
-    print("CMC RANK: 1-2000")
-    print("PRICE: 3 x 5M >= +5.0%")
-    print("VOLUME: 3 x 5M >= $50,000")
-    print("MAX PRICE: DISABLED")
-    print("LIVE 3RD CANDLE: ENABLED")
-    print("SCAN: EVERY 30 SECONDS")
-    print("REPEAT ALERT: DISABLED")
-    print()
-
-    # Telegram test
-    telegram_send(
-        "✅ MEME PUMP ALERT STARTED\n\n"
-        "Bot Telegram bağlantısı işləyir.\n"
-        "Binance canlı WebSocket bağlantıları hazırlanır."
+    print(
+        "\n"
+        "========================================\n"
+        "      FAST MEME PUMP ALERT STARTING\n"
+        "========================================",
+        flush=True
     )
-
-    # CMC
-    load_cmc_ranks()
-
-    # Binance
-    symbols = get_binance_symbols()
-
-    if not symbols:
-        print("NO SYMBOLS FOUND")
-        return
-
-    # History
-    load_history(symbols)
 
     print(
-        f"STATUS | TRACKED={len(coins)} "
-        f"| HISTORY_READY={len(coins)}"
+        f"CMC RANK: "
+        f"{CMC_MIN_RANK}-{CMC_MAX_RANK}",
+        flush=True
     )
 
-    # Scanner thread
-    scanner = threading.Thread(
-        target=scanner_loop,
-        daemon=True,
+    print(
+        f"ROLLING WINDOW: "
+        f"3 x {INTERVAL}",
+        flush=True
     )
 
-    scanner.start()
+    print(
+        f"MIN PRICE: "
+        f"+{MIN_PRICE_CHANGE}%",
+        flush=True
+    )
 
-    # WebSocket
-    websocket_loop(symbols)
+    print(
+        f"MIN TOTAL USDT VOLUME: "
+        f"${MIN_TOTAL_VOLUME:,.0f}",
+        flush=True
+    )
+
+    print(
+        "MAX PRICE LIMIT: NONE",
+        flush=True
+    )
+
+    print(
+        "LIVE 3RD CANDLE: ENABLED",
+        flush=True
+    )
+
+    print(
+        "SCAN DELAY: NONE",
+        flush=True
+    )
+
+    print(
+        "========================================\n",
+        flush=True
+    )
+
+
+    # --------------------------------------------------------
+    # Telegram test
+    # --------------------------------------------------------
+
+    send_telegram(
+        "✅ FAST MEME PUMP ALERT STARTED\n\n"
+        "Telegram bağlantısı işləyir.\n"
+        "Rolling 3×5M LIVE scanner aktivləşir."
+    )
+
+
+    # --------------------------------------------------------
+    # CMC
+    # --------------------------------------------------------
+
+    if not load_cmc():
+
+        print(
+            "CMC LOAD FAILED",
+            flush=True
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # Binance
+    # --------------------------------------------------------
+
+    symbols = load_binance_symbols()
+
+    if not symbols:
+
+        print(
+            "NO TRACKED COINS",
+            flush=True
+        )
+
+        return
+
+
+    # --------------------------------------------------------
+    # Historical candles
+    # --------------------------------------------------------
+
+    load_history(
+        symbols
+    )
+
+
+    # --------------------------------------------------------
+    # Start WebSockets
+    # --------------------------------------------------------
+
+    start_websockets(
+        symbols
+    )
+
+
+    # --------------------------------------------------------
+    # Main process stays alive
+    # --------------------------------------------------------
+
+    while True:
+
+        with data_lock:
+
+            tracked_count = len(
+                coins
+            )
+
+            history_ready = sum(
+                1
+                for symbol in coins
+                if len(
+                    history.get(
+                        symbol,
+                        []
+                    )
+                ) >= 3
+            )
+
+        print(
+            f"STATUS | "
+            f"TRACKED={tracked_count} | "
+            f"HISTORY_READY={history_ready} | "
+            f"ROLLING=LIVE",
+            flush=True
+        )
+
+        time.sleep(60)
 
 
 # ============================================================
@@ -643,4 +1220,14 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
+
+"requirements.txt" isə əvvəlki kimi qalsın:
+
+requests
+websocket-client
+
+Bu versiyada əsas fərq: "SCAN_INTERVAL = 30" artıq siqnal üçün yoxdur. Binance-dən "kline" yenilənməsi gələn kimi "process_signal_immediately()" işləyir.
+
+Railway-də yeni deploy-dan sonra mənə Logs şəklini göndər. Orada xüsusilə "WS 1: CONNECTED", "WS 2: CONNECTED" və "LIVE 5M STREAMS ACTIVE" görmək istəyirik.
