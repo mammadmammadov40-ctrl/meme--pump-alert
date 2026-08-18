@@ -2,213 +2,102 @@ import os
 import time
 import json
 import threading
-from collections import defaultdict, deque
+from datetime import datetime, timezone
 
 import requests
 import websocket
 
 
 # ============================================================
-# ENVIRONMENT
+# CONFIG
 # ============================================================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-CMC_API_KEY = os.environ["CMC_API_KEY"]
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+CMC_API_KEY = os.getenv("CMC_API_KEY", "")
 
+# 3 x 5M PRICE RULE
+MIN_3CANDLE_PRICE_CHANGE = 5.0
 
-# ============================================================
-# SETTINGS
-# ============================================================
+# 3 x 5M VOLUME RULE
+MIN_3CANDLE_VOLUME = 50_000
 
-BINANCE_URL = "https://api.binance.com"
+# CMC RANK
+CMC_RANK_MIN = 1
+CMC_RANK_MAX = 2000
 
-# IMPORTANT:
-# We connect to Binance first and then subscribe to streams
-# using a WebSocket SUBSCRIBE message.
-BINANCE_WS = "wss://stream.binance.com:9443/ws"
+# Scan interval
+SCAN_INTERVAL = 30
 
-INTERVAL = "5m"
-
-# CMC rank
-CMC_MIN_RANK = 1
-CMC_MAX_RANK = 2000
-
-# Refresh CMC information every hour
-CMC_REFRESH_SECONDS = 3600
-
+# Binance
+BINANCE_REST = "https://api.binance.com"
+BINANCE_WS = "wss://stream.binance.com:9443/stream"
 
 # ============================================================
-# SIGNAL RULES
+# GLOBAL DATA
 # ============================================================
 
-# 3 x 5M price increase
-MIN_TOTAL_PRICE_CHANGE = 5.0
+coins = {}
+ranks = {}
 
-# 3 x 5M total USDT volume
-MIN_TOTAL_VOLUME_USDT = 50_000.0
+lock = threading.Lock()
 
-# No maximum price limit
-MAX_PRICE_CHANGE = None
+alerted = set()
 
-
-# ============================================================
-# LIVE RULE
-# ============================================================
-
-# If the latest 2 candles already satisfy:
-#
-# price >= 5%
-# volume >= $50,000
-#
-# send signal immediately.
-LIVE_TWO_CANDLE_ENABLED = True
-
-
-# Keep recent candles
-MAX_CANDLES = 6
-
-# Same coin cannot alert again for 30 minutes
-ALERT_COOLDOWN_SECONDS = 30 * 60
-
-
-# ============================================================
-# WEBSOCKET SETTINGS
-# ============================================================
-
-# Keep the number small for reliability.
-# 458 coins will become approximately:
-#
-# WS 1 = 100
-# WS 2 = 100
-# WS 3 = 100
-# WS 4 = 100
-# WS 5 = remaining
-#
-WS_CHUNK_SIZE = 100
-
-WS_RECONNECT_SECONDS = 5
-
-
-# ============================================================
-# HTTP SESSION
-# ============================================================
-
-session = requests.Session()
-
-session.headers.update({
-    "User-Agent": "meme-pump-alert/2.0"
-})
-
-
-# ============================================================
-# DATA
-# ============================================================
-
-tracked = {}
-
-candles = defaultdict(
-    lambda: deque(maxlen=MAX_CANDLES)
-)
-
-last_alert = {}
-
-state_lock = threading.RLock()
+last_scan = 0
+ws_connected = False
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def send_telegram(text):
+def telegram_send(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("TELEGRAM CONFIG MISSING")
+        return False
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     try:
-
-        response = session.post(
+        r = requests.post(
             url,
             data={
-                "chat_id": CHAT_ID,
-                "text": text
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": True,
             },
-            timeout=15
+            timeout=15,
         )
 
-        if response.status_code != 200:
+        if r.status_code == 200:
+            print("TELEGRAM SENT")
+            return True
 
-            print(
-                "TELEGRAM ERROR:",
-                response.status_code,
-                response.text[:500],
-                flush=True
-            )
-
-            return False
-
-        print(
-            "TELEGRAM: MESSAGE SENT",
-            flush=True
-        )
-
-        return True
+        print("TELEGRAM ERROR:", r.status_code, r.text[:300])
+        return False
 
     except Exception as e:
-
-        print(
-            "TELEGRAM EXCEPTION:",
-            e,
-            flush=True
-        )
-
+        print("TELEGRAM EXCEPTION:", e)
         return False
 
 
 # ============================================================
-# TELEGRAM TEST
+# CMC RANKS
 # ============================================================
 
-def telegram_startup_test():
+def load_cmc_ranks():
+    global ranks
 
-    text = (
-        "✅ MEME PUMP ALERT STARTED\n\n"
-        "Bot Telegram bağlantısı işləyir.\n"
-        "Binance canlı WebSocket bağlantıları hazırlanır."
-    )
+    if not CMC_API_KEY:
+        print("CMC_API_KEY MISSING")
+        return
 
-    ok = send_telegram(text)
+    print("CMC: loading rankings...")
 
-    if ok:
-
-        print(
-            "TELEGRAM TEST: OK",
-            flush=True
-        )
-
-    else:
-
-        print(
-            "TELEGRAM TEST: FAILED",
-            flush=True
-        )
-
-
-# ============================================================
-# COINMARKETCAP
-# ============================================================
-
-def fetch_cmc_top_2000():
-
-    url = (
-        "https://pro-api.coinmarketcap.com"
-        "/v3/cryptocurrency/listings/latest"
-    )
+    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 
     headers = {
-        "Accept": "application/json",
         "X-CMC_PRO_API_KEY": CMC_API_KEY
     }
 
@@ -216,1185 +105,542 @@ def fetch_cmc_top_2000():
         "start": 1,
         "limit": 2000,
         "convert": "USD",
-        "sort": "market_cap",
-        "sort_dir": "desc"
     }
 
-    response = session.get(
-        url,
-        headers=headers,
-        params=params,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    payload = response.json()
-
-    result = {}
-
-    for coin in payload.get("data", []):
-
-        rank = coin.get("cmc_rank")
-
-        symbol = str(
-            coin.get("symbol", "")
-        ).upper().strip()
-
-        if not symbol:
-            continue
-
-        if rank is None:
-            continue
-
-        rank = int(rank)
-
-        if not (
-            CMC_MIN_RANK
-            <= rank
-            <= CMC_MAX_RANK
-        ):
-            continue
-
-        result[symbol] = {
-            "rank": rank,
-            "name": coin.get(
-                "name",
-                symbol
-            ),
-            "slug": coin.get(
-                "slug",
-                ""
-            )
-        }
-
-    print(
-        f"CMC COINS: {len(result)} "
-        f"(rank {CMC_MIN_RANK}-{CMC_MAX_RANK})",
-        flush=True
-    )
-
-    return result
-
-
-# ============================================================
-# BINANCE SPOT USDT SYMBOLS
-# ============================================================
-
-def fetch_binance_spot_usdt_symbols():
-
-    url = (
-        f"{BINANCE_URL}"
-        "/api/v3/exchangeInfo"
-    )
-
-    response = session.get(
-        url,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    result = {}
-
-    for item in data.get(
-        "symbols",
-        []
-    ):
-
-        if item.get("status") != "TRADING":
-            continue
-
-        if item.get("quoteAsset") != "USDT":
-            continue
-
-        if item.get(
-            "isSpotTradingAllowed"
-        ) is False:
-            continue
-
-        base = str(
-            item.get(
-                "baseAsset",
-                ""
-            )
-        ).upper()
-
-        symbol = str(
-            item.get(
-                "symbol",
-                ""
-            )
-        ).upper()
-
-        if not base or not symbol:
-            continue
-
-        # Ignore leveraged tokens
-        if base.endswith(
-            (
-                "UP",
-                "DOWN",
-                "BULL",
-                "BEAR"
-            )
-        ):
-            continue
-
-        result[base] = symbol
-
-    print(
-        f"BINANCE USDT SPOT: {len(result)}",
-        flush=True
-    )
-
-    return result
-
-
-# ============================================================
-# BUILD TRACKED COINS
-# ============================================================
-
-def rebuild_tracked():
-
-    cmc = fetch_cmc_top_2000()
-
-    binance = (
-        fetch_binance_spot_usdt_symbols()
-    )
-
-    new_tracked = {}
-
-    for base, info in cmc.items():
-
-        symbol = binance.get(base)
-
-        if not symbol:
-            continue
-
-        new_tracked[symbol] = {
-
-            "base": base,
-
-            "rank": info["rank"],
-
-            "name": info["name"]
-        }
-
-    with state_lock:
-
-        old_symbols = set(tracked)
-
-        tracked.clear()
-
-        tracked.update(
-            new_tracked
+    try:
+        r = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=30,
         )
 
-        removed = (
-            old_symbols
-            - set(new_tracked)
-        )
+        r.raise_for_status()
 
-        for symbol in removed:
+        data = r.json().get("data", [])
 
-            candles.pop(
-                symbol,
-                None
-            )
+        new_ranks = {}
 
-            last_alert.pop(
-                symbol,
-                None
-            )
+        for coin in data:
+            symbol = coin.get("symbol", "").upper()
+            rank = coin.get("cmc_rank")
 
-    print(
-        f"TRACKED COINS: "
-        f"{len(new_tracked)}",
-        flush=True
-    )
+            if symbol and rank:
+                # Keep first occurrence of a symbol
+                if symbol not in new_ranks:
+                    new_ranks[symbol] = int(rank)
 
-    return list(
-        new_tracked.keys()
-    )
+        ranks = new_ranks
+
+        print(f"CMC RANKS LOADED: {len(ranks)}")
+
+    except Exception as e:
+        print("CMC ERROR:", e)
+
+
+# ============================================================
+# BINANCE SYMBOLS
+# ============================================================
+
+def get_binance_symbols():
+    print("BINANCE: loading USDT spot symbols...")
+
+    url = f"{BINANCE_REST}/api/v3/exchangeInfo"
+
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+
+        data = r.json()
+
+        result = []
+
+        for s in data.get("symbols", []):
+
+            if s.get("status") != "TRADING":
+                continue
+
+            if s.get("quoteAsset") != "USDT":
+                continue
+
+            if s.get("isSpotTradingAllowed") is not True:
+                continue
+
+            symbol = s.get("symbol")
+
+            base = s.get("baseAsset", "").upper()
+
+            # CMC rank filtering
+            rank = ranks.get(base)
+
+            if rank is None:
+                continue
+
+            if not (CMC_RANK_MIN <= rank <= CMC_RANK_MAX):
+                continue
+
+            result.append(symbol)
+
+        print(f"BINANCE USDT SPOT: {len(result)}")
+        print(f"TRACKED COINS: {len(result)}")
+
+        return result
+
+    except Exception as e:
+        print("BINANCE SYMBOL ERROR:", e)
+        return []
 
 
 # ============================================================
 # HISTORICAL 5M CANDLES
 # ============================================================
 
-def fetch_klines(
-    symbol,
-    limit=5
-):
+def load_history(symbols):
 
-    url = (
-        f"{BINANCE_URL}"
-        "/api/v3/klines"
-    )
-
-    params = {
-
-        "symbol": symbol,
-
-        "interval": INTERVAL,
-
-        "limit": limit
-    }
-
-    response = session.get(
-        url,
-        params=params,
-        timeout=15
-    )
-
-    if response.status_code != 200:
-
-        print(
-            f"KLINE ERROR {symbol}: "
-            f"{response.status_code}",
-            flush=True
-        )
-
-        return []
-
-    rows = response.json()
-
-    result = []
-
-    now_ms = int(
-        time.time() * 1000
-    )
-
-    for row in rows:
-
-        start_time = int(
-            row[0]
-        )
-
-        closed = (
-            start_time + 300000
-            <= now_ms
-        )
-
-        result.append({
-
-            "start": start_time,
-
-            "open": float(row[1]),
-
-            "high": float(row[2]),
-
-            "low": float(row[3]),
-
-            "close": float(row[4]),
-
-            "volume": float(row[5]),
-
-            # USDT quote volume
-            "quote_volume": float(row[7]),
-
-            "closed": closed
-        })
-
-    return result
-
-
-# ============================================================
-# BOOTSTRAP HISTORY
-# ============================================================
-
-def bootstrap_history(symbols):
-
-    print(
-        f"BOOTSTRAP START: "
-        f"{len(symbols)} coins",
-        flush=True
-    )
+    print(f"BOOTSTRAP START: {len(symbols)} coins")
 
     total = len(symbols)
 
-    for index, symbol in enumerate(
-        symbols,
-        start=1
-    ):
+    for i, symbol in enumerate(symbols, 1):
 
         try:
 
-            rows = fetch_klines(
-                symbol,
-                limit=5
+            url = f"{BINANCE_REST}/api/v3/klines"
+
+            params = {
+                "symbol": symbol,
+                "interval": "5m",
+                "limit": 3,
+            }
+
+            r = requests.get(
+                url,
+                params=params,
+                timeout=10,
             )
 
-            if rows:
+            if r.status_code != 200:
+                continue
 
-                with state_lock:
+            data = r.json()
 
-                    candles[
-                        symbol
-                    ].clear()
+            candles = []
 
-                    for candle in rows:
+            for k in data:
 
-                        candles[
-                            symbol
-                        ].append(
-                            candle
-                        )
+                candles.append({
+                    "open_time": int(k[0]),
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                    "close_time": int(k[6]),
+                })
+
+            with lock:
+                coins[symbol] = candles
+
+            if i % 100 == 0:
+                print(f"BOOTSTRAP: {i}/{total}")
+
+            # Small delay to avoid hammering REST API
+            time.sleep(0.02)
 
         except Exception as e:
+            print(f"HISTORY ERROR {symbol}: {e}")
 
-            print(
-                "BOOTSTRAP ERROR",
-                symbol,
-                e,
-                flush=True
-            )
-
-        if index % 100 == 0:
-
-            print(
-                f"BOOTSTRAP: "
-                f"{index}/{total}",
-                flush=True
-            )
-
-        time.sleep(0.07)
-
-    print(
-        "BOOTSTRAP FINISHED",
-        flush=True
-    )
+    print("BOOTSTRAP FINISHED")
 
 
 # ============================================================
-# PRICE CALCULATION
+# CANDLE UPDATE
 # ============================================================
 
-def calculate_price_change(window):
+def update_candle(symbol, k):
 
-    if len(window) < 2:
+    candle = {
+        "open_time": int(k["t"]),
+        "open": float(k["o"]),
+        "high": float(k["h"]),
+        "low": float(k["l"]),
+        "close": float(k["c"]),
+        "volume": float(k["v"]),
+        "close_time": int(k["T"]),
+    }
 
-        return 0.0
+    with lock:
 
-    first_open = window[0]["open"]
+        if symbol not in coins:
+            coins[symbol] = []
 
-    last_close = window[-1]["close"]
+        arr = coins[symbol]
 
-    if first_open <= 0:
+        if arr and arr[-1]["open_time"] == candle["open_time"]:
 
-        return 0.0
-
-    return (
-        (
-            last_close
-            / first_open
-        ) - 1
-    ) * 100
-
-
-# ============================================================
-# TOTAL VOLUME
-# ============================================================
-
-def calculate_total_volume(window):
-
-    return sum(
-        candle["quote_volume"]
-        for candle in window
-    )
-
-
-# ============================================================
-# RULE CHECK
-# ============================================================
-
-def rules_match(window):
-
-    if len(window) < 2:
-
-        return False
-
-    price_change = (
-        calculate_price_change(
-            window
-        )
-    )
-
-    total_volume = (
-        calculate_total_volume(
-            window
-        )
-    )
-
-    if (
-        price_change
-        < MIN_TOTAL_PRICE_CHANGE
-    ):
-
-        return False
-
-    if (
-        MAX_PRICE_CHANGE
-        is not None
-        and price_change
-        > MAX_PRICE_CHANGE
-    ):
-
-        return False
-
-    if (
-        total_volume
-        < MIN_TOTAL_VOLUME_USDT
-    ):
-
-        return False
-
-    return True
-
-
-# ============================================================
-# FIND SIGNAL
-# ============================================================
-
-def find_signal(symbol):
-
-    with state_lock:
-
-        data = list(
-            candles.get(
-                symbol,
-                []
-            )
-        )
-
-    if len(data) < 2:
-
-        return None
-
-
-    # --------------------------------------------------------
-    # LIVE 2 CANDLE
-    # --------------------------------------------------------
-
-    if LIVE_TWO_CANDLE_ENABLED:
-
-        window_2 = data[-2:]
-
-        if rules_match(
-            window_2
-        ):
-
-            return (
-                window_2,
-                "LIVE 2-CANDLE"
-            )
-
-
-    # --------------------------------------------------------
-    # ROLLING 3 CANDLE
-    # --------------------------------------------------------
-
-    if len(data) >= 3:
-
-        start_index = max(
-            0,
-            len(data) - 5
-        )
-
-        for i in range(
-            start_index,
-            len(data) - 2
-        ):
-
-            window = data[
-                i:i + 3
-            ]
-
-            if rules_match(
-                window
-            ):
-
-                return (
-                    window,
-                    "ROLLING 3-CANDLE"
-                )
-
-    return None
-
-
-# ============================================================
-# ALERT
-# ============================================================
-
-def maybe_alert(
-    symbol,
-    reason="LIVE"
-):
-
-    signal = find_signal(
-        symbol
-    )
-
-    if signal is None:
-
-        return
-
-    window, window_type = signal
-
-    with state_lock:
-
-        info = tracked.get(
-            symbol
-        )
-
-        if not info:
-
-            return
-
-        now = time.time()
-
-        previous = last_alert.get(
-            symbol,
-            0
-        )
-
-        if (
-            now - previous
-            < ALERT_COOLDOWN_SECONDS
-        ):
-
-            return
-
-        last_alert[
-            symbol
-        ] = now
-
-    price_change = (
-        calculate_price_change(
-            window
-        )
-    )
-
-    total_volume = (
-        calculate_total_volume(
-            window
-        )
-    )
-
-    first_price = (
-        window[0]["open"]
-    )
-
-    last_price = (
-        window[-1]["close"]
-    )
-
-    base = info["base"]
-
-    rank = info["rank"]
-
-    name = info["name"]
-
-    text = (
-
-        "🚨 PUMP SIGNAL\n\n"
-
-        f"🪙 {base}/USDT\n"
-
-        f"📌 {name}\n"
-
-        f"🏆 CMC Rank: #{rank}\n\n"
-
-        f"📈 Price: "
-        f"+{price_change:.2f}%\n"
-
-        f"💰 Total Volume: "
-        f"${total_volume:,.0f}\n\n"
-
-        f"💵 Start: "
-        f"{first_price:.8g}\n"
-
-        f"💵 Current: "
-        f"{last_price:.8g}\n\n"
-
-        f"📊 Window: "
-        f"{window_type}\n"
-
-        f"⚡ Trigger: "
-        f"{reason}"
-    )
-
-    print(
-        "\n" + "=" * 60,
-        flush=True
-    )
-
-    print(
-        text,
-        flush=True
-    )
-
-    print(
-        "=" * 60 + "\n",
-        flush=True
-    )
-
-    send_telegram(
-        text
-    )
-
-
-# ============================================================
-# BINANCE KLINE EVENT
-# ============================================================
-
-def process_kline(data):
-
-    kline = data.get(
-        "k",
-        {}
-    )
-
-    symbol = str(
-        kline.get(
-            "s",
-            ""
-        )
-    ).upper()
-
-    if not symbol:
-
-        return
-
-    with state_lock:
-
-        if symbol not in tracked:
-
-            return
-
-        candle = {
-
-            "start": int(
-                kline["t"]
-            ),
-
-            "open": float(
-                kline["o"]
-            ),
-
-            "high": float(
-                kline["h"]
-            ),
-
-            "low": float(
-                kline["l"]
-            ),
-
-            "close": float(
-                kline["c"]
-            ),
-
-            "volume": float(
-                kline["v"]
-            ),
-
-            "quote_volume": float(
-                kline["q"]
-            ),
-
-            "closed": bool(
-                kline["x"]
-            )
-        }
-
-        dq = candles[
-            symbol
-        ]
-
-        if (
-            dq
-            and
-            dq[-1]["start"]
-            == candle["start"]
-        ):
-
-            dq[-1] = candle
+            # LIVE UPDATE OF CURRENT 5M CANDLE
+            arr[-1] = candle
 
         else:
 
-            dq.append(
-                candle
-            )
+            arr.append(candle)
 
-    # IMPORTANT:
-    # Check every live update.
-    maybe_alert(
-        symbol,
-        "LIVE 5M UPDATE"
+        # Keep only latest candles
+        coins[symbol] = arr[-5:]
+
+
+# ============================================================
+# 3 x 5M CONDITION
+# ============================================================
+
+def check_signal(symbol):
+
+    with lock:
+
+        candles = list(coins.get(symbol, []))
+
+    if len(candles) < 3:
+        return None
+
+    # Last 3 candles
+    c1 = candles[-3]
+    c2 = candles[-2]
+    c3 = candles[-1]
+
+    # --------------------------------------------------------
+    # PRICE
+    # Overall price change:
+    # first candle OPEN -> current third candle CLOSE
+    # --------------------------------------------------------
+
+    first_open = c1["open"]
+    current_close = c3["close"]
+
+    if first_open <= 0:
+        return None
+
+    price_change = ((current_close / first_open) - 1) * 100
+
+    if price_change < MIN_3CANDLE_PRICE_CHANGE:
+        return None
+
+    # --------------------------------------------------------
+    # VOLUME
+    # Sum of all 3 x 5M candles
+    # --------------------------------------------------------
+
+    total_volume = (
+        c1["volume"] +
+        c2["volume"] +
+        c3["volume"]
     )
 
+    if total_volume < MIN_3CANDLE_VOLUME:
+        return None
 
-# ============================================================
-# WEBSOCKET MESSAGE
-# ============================================================
+    # --------------------------------------------------------
+    # SIGNAL ID
+    # One alert per 3-candle window
+    # --------------------------------------------------------
 
-def ws_on_message(
-    message
-):
+    window_id = f"{symbol}:{c1['open_time']}:{c3['open_time']}"
 
-    try:
+    if window_id in alerted:
+        return None
 
-        payload = json.loads(
-            message
-        )
-
-        # Subscription confirmation
-        if (
-            "result" in payload
-            and payload.get("id")
-        ):
-
-            print(
-                f"WS SUBSCRIBE RESPONSE: "
-                f"{payload}",
-                flush=True
-            )
-
-            return
-
-        data = payload.get(
-            "data",
-            payload
-        )
-
-        if (
-            data.get("e")
-            == "kline"
-        ):
-
-            process_kline(
-                data
-            )
-
-    except Exception as e:
-
-        print(
-            "WS MESSAGE ERROR:",
-            e,
-            flush=True
-        )
-
-
-# ============================================================
-# WEBSOCKET OPEN
-# ============================================================
-
-def ws_on_open(
-    ws,
-    symbols,
-    worker_id
-):
-
-    print(
-        f"WS {worker_id}: "
-        f"CONNECTED "
-        f"({len(symbols)} streams)",
-        flush=True
-    )
-
-    params = [
-
-        f"{symbol.lower()}@kline_5m"
-
-        for symbol in symbols
-    ]
-
-    subscribe_message = {
-
-        "method": "SUBSCRIBE",
-
-        "params": params,
-
-        "id": worker_id
+    return {
+        "symbol": symbol,
+        "price_change": price_change,
+        "volume": total_volume,
+        "price": current_close,
+        "window_id": window_id,
+        "c1": c1,
+        "c2": c2,
+        "c3": c3,
     }
 
-    try:
-
-        ws.send(
-            json.dumps(
-                subscribe_message
-            )
-        )
-
-        print(
-            f"WS {worker_id}: "
-            f"SUBSCRIBE SENT "
-            f"({len(params)} streams)",
-            flush=True
-        )
-
-    except Exception as e:
-
-        print(
-            f"WS {worker_id} "
-            f"SUBSCRIBE ERROR:",
-            e,
-            flush=True
-        )
-
 
 # ============================================================
-# WEBSOCKET ERROR
+# SEND SIGNAL
 # ============================================================
 
-def ws_on_error(
-    ws,
-    error,
-    worker_id
-):
+def send_signal(signal):
 
-    print(
-        f"WS {worker_id} ERROR:",
-        error,
-        flush=True
+    symbol = signal["symbol"]
+
+    rank = ranks.get(
+        symbol.replace("USDT", ""),
+        "?"
     )
 
+    price_change = signal["price_change"]
+    volume = signal["volume"]
+    price = signal["price"]
 
-# ============================================================
-# WEBSOCKET CLOSE
-# ============================================================
+    c1 = signal["c1"]
+    c2 = signal["c2"]
+    c3 = signal["c3"]
 
-def ws_on_close(
-    ws,
-    code,
-    message,
-    worker_id
-):
+    # Mark BEFORE sending to prevent duplicates
+    alerted.add(signal["window_id"])
 
-    print(
-        f"WS {worker_id} CLOSED:",
-        code,
-        message,
-        flush=True
+    message = (
+        "🚨 BINANCE 3×5M EARLY MOMENTUM\n\n"
+
+        f"🪙 {symbol}\n"
+        f"🏆 CMC Rank: #{rank}\n\n"
+
+        f"📈 3×5M PRICE: +{price_change:.2f}%\n"
+        f"💰 3×5M VOLUME: ${volume:,.0f}\n"
+        f"💵 Current Price: {price:.10g}\n\n"
+
+        "🕯 5M candles:\n"
+        f"1️⃣ +{((c1['close']/c1['open'])-1)*100:.2f}%\n"
+        f"2️⃣ +{((c2['close']/c2['open'])-1)*100:.2f}%\n"
+        f"3️⃣ +{((c3['close']/c3['open'])-1)*100:.2f}%\n\n"
+
+        "⚡ LIVE 3×5M momentum detected\n"
+        "🔵 Binance Spot"
     )
 
+    print("\n" + "=" * 50)
+    print(message)
+    print("=" * 50 + "\n")
+
+    telegram_send(message)
+
 
 # ============================================================
-# WEBSOCKET WORKER
+# SCANNER
 # ============================================================
 
-def ws_worker(
-    symbols,
-    worker_id
-):
+def scanner_loop():
+
+    global last_scan
 
     while True:
 
         try:
 
-            print(
-                f"WS {worker_id}: "
-                f"CONNECTING "
-                f"({len(symbols)} streams)",
-                flush=True
-            )
+            now = time.time()
+
+            if now - last_scan >= SCAN_INTERVAL:
+
+                last_scan = now
+
+                checked = 0
+                signals = 0
+
+                with lock:
+                    symbols = list(coins.keys())
+
+                for symbol in symbols:
+
+                    checked += 1
+
+                    signal = check_signal(symbol)
+
+                    if signal:
+
+                        signals += 1
+                        send_signal(signal)
+
+                print(
+                    f"SCAN | TRACKED={len(symbols)} "
+                    f"| CHECKED={checked} "
+                    f"| SIGNALS={signals} "
+                    f"| WS={ws_connected}"
+                )
+
+            time.sleep(1)
+
+        except Exception as e:
+
+            print("SCANNER ERROR:", e)
+            time.sleep(5)
+
+
+# ============================================================
+# WEBSOCKET
+# ============================================================
+
+def websocket_message(ws, message):
+
+    try:
+
+        data = json.loads(message)
+
+        payload = data.get("data", data)
+
+        stream = data.get("stream", "")
+
+        if payload.get("e") != "kline":
+            return
+
+        k = payload.get("k")
+
+        if not k:
+            return
+
+        symbol = k["s"].upper()
+
+        update_candle(symbol, k)
+
+    except Exception as e:
+
+        print("WS MESSAGE ERROR:", e)
+
+
+def websocket_open(ws):
+
+    global ws_connected
+
+    ws_connected = True
+
+    print("WEBSOCKET CONNECTED")
+
+    telegram_send(
+        "🟢 MEME PUMP ALERT ACTIVE\n\n"
+        "Binance canlı WebSocket bağlantısı hazırdır.\n"
+        "3×5M early momentum scanner işləyir."
+    )
+
+
+def websocket_close(ws, close_status_code, close_msg):
+
+    global ws_connected
+
+    ws_connected = False
+
+    print(
+        "WEBSOCKET CLOSED:",
+        close_status_code,
+        close_msg
+    )
+
+
+def websocket_error(ws, error):
+
+    print("WEBSOCKET ERROR:", error)
+
+
+# ============================================================
+# WEBSOCKET LOOP
+# ============================================================
+
+def websocket_loop(symbols):
+
+    global ws_connected
+
+    # Binance stream names
+    streams = []
+
+    for symbol in symbols:
+
+        streams.append(
+            f"{symbol.lower()}@kline_5m"
+        )
+
+    # Binance combined stream URL
+    url = (
+        BINANCE_WS
+        + "?streams="
+        + "/".join(streams)
+    )
+
+    print(
+        f"WS 1: CONNECTING ({len(streams)} streams)"
+    )
+
+    while True:
+
+        try:
 
             ws = websocket.WebSocketApp(
-
-                BINANCE_WS,
-
-                on_open=lambda ws:
-                    ws_on_open(
-                        ws,
-                        symbols,
-                        worker_id
-                    ),
-
-                on_message=lambda ws, msg:
-                    ws_on_message(
-                        msg
-                    ),
-
-                on_error=lambda ws, error:
-                    ws_on_error(
-                        ws,
-                        error,
-                        worker_id
-                    ),
-
-                on_close=lambda ws,
-                    code,
-                    message:
-                    ws_on_close(
-                        ws,
-                        code,
-                        message,
-                        worker_id
-                    )
+                url,
+                on_open=websocket_open,
+                on_message=websocket_message,
+                on_error=websocket_error,
+                on_close=websocket_close,
             )
 
             ws.run_forever(
-
-                ping_interval=15,
-
+                ping_interval=20,
                 ping_timeout=10,
-
-                ping_payload="ping"
             )
 
         except Exception as e:
 
-            print(
-                f"WS {worker_id} "
-                f"EXCEPTION:",
-                e,
-                flush=True
-            )
+            ws_connected = False
 
-        print(
-            f"WS {worker_id}: "
-            f"RECONNECTING IN "
-            f"{WS_RECONNECT_SECONDS} SEC",
-            flush=True
-        )
+            print("WS LOOP ERROR:", e)
 
-        time.sleep(
-            WS_RECONNECT_SECONDS
-        )
+        print("WEBSOCKET RECONNECTING IN 5 SECONDS...")
+
+        time.sleep(5)
 
 
 # ============================================================
-# CMC REFRESH
-# ============================================================
-
-def cmc_refresh_loop():
-
-    while True:
-
-        time.sleep(
-            CMC_REFRESH_SECONDS
-        )
-
-        try:
-
-            print(
-                "CMC REFRESH...",
-                flush=True
-            )
-
-            cmc = fetch_cmc_top_2000()
-
-            with state_lock:
-
-                for symbol, info in tracked.items():
-
-                    base = info["base"]
-
-                    if base in cmc:
-
-                        info["rank"] = (
-                            cmc[base]["rank"]
-                        )
-
-                        info["name"] = (
-                            cmc[base]["name"]
-                        )
-
-            print(
-                "CMC REFRESH FINISHED",
-                flush=True
-            )
-
-        except Exception as e:
-
-            print(
-                "CMC REFRESH ERROR:",
-                e,
-                flush=True
-            )
-
-
-# ============================================================
-# MAIN
+# STARTUP
 # ============================================================
 
 def main():
 
-    print(
-        "\n"
-        "========================================\n"
-        "       MEME PUMP ALERT STARTING\n"
-        "========================================",
-        flush=True
+    print("=" * 60)
+    print("MEME PUMP ALERT STARTING")
+    print("=" * 60)
+
+    print()
+    print("RULES:")
+    print("CMC RANK: 1-2000")
+    print("PRICE: 3 x 5M >= +5.0%")
+    print("VOLUME: 3 x 5M >= $50,000")
+    print("MAX PRICE: DISABLED")
+    print("LIVE 3RD CANDLE: ENABLED")
+    print("SCAN: EVERY 30 SECONDS")
+    print("REPEAT ALERT: DISABLED")
+    print()
+
+    # Telegram test
+    telegram_send(
+        "✅ MEME PUMP ALERT STARTED\n\n"
+        "Bot Telegram bağlantısı işləyir.\n"
+        "Binance canlı WebSocket bağlantıları hazırlanır."
     )
 
-    print(
-        f"CMC RANK: "
-        f"{CMC_MIN_RANK}-{CMC_MAX_RANK}",
-        flush=True
-    )
+    # CMC
+    load_cmc_ranks()
 
-    print(
-        f"PRICE: >= "
-        f"{MIN_TOTAL_PRICE_CHANGE}%",
-        flush=True
-    )
+    # Binance
+    symbols = get_binance_symbols()
 
-    print(
-        f"VOLUME: >= "
-        f"${MIN_TOTAL_VOLUME_USDT:,.0f}",
-        flush=True
-    )
+    if not symbols:
+        print("NO SYMBOLS FOUND")
+        return
 
-    print(
-        "MAX PRICE: DISABLED",
-        flush=True
-    )
-
-    print(
-        "LIVE 2 CANDLE: ENABLED",
-        flush=True
-    )
-
-    print(
-        "ROLLING 3 CANDLE: ENABLED",
-        flush=True
-    )
+    # History
+    load_history(symbols)
 
     print(
-        f"WEBSOCKET CHUNK: "
-        f"{WS_CHUNK_SIZE}",
-        flush=True
+        f"STATUS | TRACKED={len(coins)} "
+        f"| HISTORY_READY={len(coins)}"
     )
 
-    print(
-        "========================================\n",
-        flush=True
+    # Scanner thread
+    scanner = threading.Thread(
+        target=scanner_loop,
+        daemon=True,
     )
 
+    scanner.start()
 
-    # --------------------------------------------------------
-    # TELEGRAM TEST
-    # --------------------------------------------------------
-
-    telegram_startup_test()
-
-
-    # --------------------------------------------------------
-    # CMC + BINANCE
-    # --------------------------------------------------------
-
-    symbols = rebuild_tracked()
-
-
-    # --------------------------------------------------------
-    # HISTORY
-    # --------------------------------------------------------
-
-    bootstrap_history(
-        symbols
-    )
-
-
-    # --------------------------------------------------------
-    # SPLIT COINS INTO SMALL WEBSOCKET GROUPS
-    # --------------------------------------------------------
-
-    chunks = [
-
-        symbols[i:i + WS_CHUNK_SIZE]
-
-        for i in range(
-            0,
-            len(symbols),
-            WS_CHUNK_SIZE
-        )
-    ]
-
-    print(
-        f"WEBSOCKET CONNECTIONS: "
-        f"{len(chunks)}",
-        flush=True
-    )
-
-
-    # --------------------------------------------------------
-    # START WEBSOCKETS
-    # --------------------------------------------------------
-
-    for index, chunk in enumerate(
-        chunks,
-        start=1
-    ):
-
-        thread = threading.Thread(
-
-            target=ws_worker,
-
-            args=(
-                chunk,
-                index
-            ),
-
-            daemon=True
-        )
-
-        thread.start()
-
-        time.sleep(2)
-
-
-    # --------------------------------------------------------
-    # CMC REFRESH THREAD
-    # --------------------------------------------------------
-
-    refresh_thread = threading.Thread(
-
-        target=cmc_refresh_loop,
-
-        daemon=True
-    )
-
-    refresh_thread.start()
-
-
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
-
-    while True:
-
-        time.sleep(60)
-
-        with state_lock:
-
-            ready = sum(
-
-                1
-
-                for item
-                in candles.values()
-
-                if len(item) >= 2
-            )
-
-            print(
-
-                f"STATUS | "
-                f"TRACKED={len(tracked)} | "
-                f"HISTORY_READY={ready}",
-
-                flush=True
-            )
+    # WebSocket
+    websocket_loop(symbols)
 
 
 # ============================================================
-# START
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
