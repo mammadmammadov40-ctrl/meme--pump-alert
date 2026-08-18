@@ -22,59 +22,82 @@ CMC_API_KEY = os.environ["CMC_API_KEY"]
 # ============================================================
 
 BINANCE_URL = "https://api.binance.com"
-BINANCE_WS = "wss://stream.binance.com:9443/stream?streams="
 
-# CoinMarketCap rank filter
+# IMPORTANT:
+# We connect to Binance first and then subscribe to streams
+# using a WebSocket SUBSCRIBE message.
+BINANCE_WS = "wss://stream.binance.com:9443/ws"
+
+INTERVAL = "5m"
+
+# CMC rank
 CMC_MIN_RANK = 1
 CMC_MAX_RANK = 2000
 
-# Binance candle
-INTERVAL = "5m"
-
-# CMC list refresh
+# Refresh CMC information every hour
 CMC_REFRESH_SECONDS = 3600
 
-# ------------------------------------------------------------
-# MAIN SIGNAL RULES
-# ------------------------------------------------------------
 
-# 3 x 5M total price increase
+# ============================================================
+# SIGNAL RULES
+# ============================================================
+
+# 3 x 5M price increase
 MIN_TOTAL_PRICE_CHANGE = 5.0
 
 # 3 x 5M total USDT volume
 MIN_TOTAL_VOLUME_USDT = 50_000.0
 
-# NO maximum percentage limit
+# No maximum price limit
 MAX_PRICE_CHANGE = None
 
-# ------------------------------------------------------------
+
+# ============================================================
 # LIVE RULE
-# ------------------------------------------------------------
+# ============================================================
 
 # If the latest 2 candles already satisfy:
 #
 # price >= 5%
-# volume >= 50K
+# volume >= $50,000
 #
-# signal immediately.
-#
-# No need to wait for the 3rd candle to close.
+# send signal immediately.
 LIVE_TWO_CANDLE_ENABLED = True
 
-# Number of candles kept in memory
+
+# Keep recent candles
 MAX_CANDLES = 6
 
-# Same coin won't send another signal immediately
+# Same coin cannot alert again for 30 minutes
 ALERT_COOLDOWN_SECONDS = 30 * 60
 
 
 # ============================================================
-# HTTP
+# WEBSOCKET SETTINGS
+# ============================================================
+
+# Keep the number small for reliability.
+# 458 coins will become approximately:
+#
+# WS 1 = 100
+# WS 2 = 100
+# WS 3 = 100
+# WS 4 = 100
+# WS 5 = remaining
+#
+WS_CHUNK_SIZE = 100
+
+WS_RECONNECT_SECONDS = 5
+
+
+# ============================================================
+# HTTP SESSION
 # ============================================================
 
 session = requests.Session()
+
 session.headers.update({
-    "User-Agent": "meme-pump-alert/1.0"
+    "User-Agent": "meme-pump-alert/2.0"
 })
 
 
@@ -82,13 +105,12 @@ session.headers.update({
 # DATA
 # ============================================================
 
-# Binance symbol -> information
 tracked = {}
 
-# symbol -> recent candles
-candles = defaultdict(lambda: deque(maxlen=MAX_CANDLES))
+candles = defaultdict(
+    lambda: deque(maxlen=MAX_CANDLES)
+)
 
-# symbol -> last alert timestamp
 last_alert = {}
 
 state_lock = threading.RLock()
@@ -100,7 +122,10 @@ state_lock = threading.RLock()
 
 def send_telegram(text):
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendMessage"
+    )
 
     try:
 
@@ -124,6 +149,11 @@ def send_telegram(text):
 
             return False
 
+        print(
+            "TELEGRAM: MESSAGE SENT",
+            flush=True
+        )
+
         return True
 
     except Exception as e:
@@ -135,6 +165,35 @@ def send_telegram(text):
         )
 
         return False
+
+
+# ============================================================
+# TELEGRAM TEST
+# ============================================================
+
+def telegram_startup_test():
+
+    text = (
+        "✅ MEME PUMP ALERT STARTED\n\n"
+        "Bot Telegram bağlantısı işləyir.\n"
+        "Binance canlı WebSocket bağlantıları hazırlanır."
+    )
+
+    ok = send_telegram(text)
+
+    if ok:
+
+        print(
+            "TELEGRAM TEST: OK",
+            flush=True
+        )
+
+    else:
+
+        print(
+            "TELEGRAM TEST: FAILED",
+            flush=True
+        )
 
 
 # ============================================================
@@ -154,15 +213,10 @@ def fetch_cmc_top_2000():
     }
 
     params = {
-
         "start": 1,
-
         "limit": 2000,
-
         "convert": "USD",
-
         "sort": "market_cap",
-
         "sort_dir": "desc"
     }
 
@@ -203,14 +257,11 @@ def fetch_cmc_top_2000():
             continue
 
         result[symbol] = {
-
             "rank": rank,
-
             "name": coin.get(
                 "name",
                 symbol
             ),
-
             "slug": coin.get(
                 "slug",
                 ""
@@ -281,7 +332,7 @@ def fetch_binance_spot_usdt_symbols():
         if not base or not symbol:
             continue
 
-        # Ignore leveraged token style assets
+        # Ignore leveraged tokens
         if base.endswith(
             (
                 "UP",
@@ -303,14 +354,16 @@ def fetch_binance_spot_usdt_symbols():
 
 
 # ============================================================
-# BUILD CMC + BINANCE UNIVERSE
+# BUILD TRACKED COINS
 # ============================================================
 
 def rebuild_tracked():
 
     cmc = fetch_cmc_top_2000()
 
-    binance = fetch_binance_spot_usdt_symbols()
+    binance = (
+        fetch_binance_spot_usdt_symbols()
+    )
 
     new_tracked = {}
 
@@ -369,7 +422,7 @@ def rebuild_tracked():
 
 
 # ============================================================
-# BINANCE HISTORICAL 5M CANDLES
+# HISTORICAL 5M CANDLES
 # ============================================================
 
 def fetch_klines(
@@ -399,6 +452,12 @@ def fetch_klines(
 
     if response.status_code != 200:
 
+        print(
+            f"KLINE ERROR {symbol}: "
+            f"{response.status_code}",
+            flush=True
+        )
+
         return []
 
     rows = response.json()
@@ -415,7 +474,6 @@ def fetch_klines(
             row[0]
         )
 
-        # Binance 5M candle
         closed = (
             start_time + 300000
             <= now_ms
@@ -435,8 +493,7 @@ def fetch_klines(
 
             "volume": float(row[5]),
 
-            # IMPORTANT:
-            # quote volume = USDT volume
+            # USDT quote volume
             "quote_volume": float(row[7]),
 
             "closed": closed
@@ -504,8 +561,6 @@ def bootstrap_history(symbols):
                 flush=True
             )
 
-        # Binance API-ni yükləməmək üçün
-        # yumşaq sürət
         time.sleep(0.07)
 
     print(
@@ -518,11 +573,10 @@ def bootstrap_history(symbols):
 # PRICE CALCULATION
 # ============================================================
 
-def calculate_price_change(
-    window
-):
+def calculate_price_change(window):
 
     if len(window) < 2:
+
         return 0.0
 
     first_open = window[0]["open"]
@@ -530,6 +584,7 @@ def calculate_price_change(
     last_close = window[-1]["close"]
 
     if first_open <= 0:
+
         return 0.0
 
     return (
@@ -544,9 +599,7 @@ def calculate_price_change(
 # TOTAL VOLUME
 # ============================================================
 
-def calculate_total_volume(
-    window
-):
+def calculate_total_volume(window):
 
     return sum(
         candle["quote_volume"]
@@ -558,54 +611,55 @@ def calculate_total_volume(
 # RULE CHECK
 # ============================================================
 
-def rules_match(
-    window
-):
+def rules_match(window):
 
     if len(window) < 2:
+
         return False
 
-    price_change = calculate_price_change(
-        window
+    price_change = (
+        calculate_price_change(
+            window
+        )
     )
 
-    total_volume = calculate_total_volume(
-        window
+    total_volume = (
+        calculate_total_volume(
+            window
+        )
     )
 
-    # Minimum price
     if (
         price_change
         < MIN_TOTAL_PRICE_CHANGE
     ):
+
         return False
 
-    # NO maximum limit
     if (
         MAX_PRICE_CHANGE
         is not None
         and price_change
         > MAX_PRICE_CHANGE
     ):
+
         return False
 
-    # Minimum total volume
     if (
         total_volume
         < MIN_TOTAL_VOLUME_USDT
     ):
+
         return False
 
     return True
 
 
 # ============================================================
-# FIND SIGNAL WINDOW
+# FIND SIGNAL
 # ============================================================
 
-def find_signal(
-    symbol
-):
+def find_signal(symbol):
 
     with state_lock:
 
@@ -617,10 +671,12 @@ def find_signal(
         )
 
     if len(data) < 2:
+
         return None
 
+
     # --------------------------------------------------------
-    # 1) LIVE 2-CANDLE CHECK
+    # LIVE 2 CANDLE
     # --------------------------------------------------------
 
     if LIVE_TWO_CANDLE_ENABLED:
@@ -636,15 +692,9 @@ def find_signal(
                 "LIVE 2-CANDLE"
             )
 
+
     # --------------------------------------------------------
-    # 2) ROLLING 3-CANDLE CHECK
-    #
-    # 1-2-3
-    # 2-3-4
-    # 3-4-5
-    # ...
-    #
-    # Current candle may still be OPEN.
+    # ROLLING 3 CANDLE
     # --------------------------------------------------------
 
     if len(data) >= 3:
@@ -681,7 +731,7 @@ def find_signal(
 
 def maybe_alert(
     symbol,
-    reason="live"
+    reason="LIVE"
 ):
 
     signal = find_signal(
@@ -689,6 +739,7 @@ def maybe_alert(
     )
 
     if signal is None:
+
         return
 
     window, window_type = signal
@@ -700,6 +751,7 @@ def maybe_alert(
         )
 
         if not info:
+
             return
 
         now = time.time()
@@ -709,28 +761,36 @@ def maybe_alert(
             0
         )
 
-        # Anti-spam
         if (
             now - previous
             < ALERT_COOLDOWN_SECONDS
         ):
+
             return
 
         last_alert[
             symbol
         ] = now
 
-    price_change = calculate_price_change(
-        window
+    price_change = (
+        calculate_price_change(
+            window
+        )
     )
 
-    total_volume = calculate_total_volume(
-        window
+    total_volume = (
+        calculate_total_volume(
+            window
+        )
     )
 
-    first_price = window[0]["open"]
+    first_price = (
+        window[0]["open"]
+    )
 
-    last_price = window[-1]["close"]
+    last_price = (
+        window[-1]["close"]
+    )
 
     base = info["base"]
 
@@ -739,6 +799,7 @@ def maybe_alert(
     name = info["name"]
 
     text = (
+
         "🚨 PUMP SIGNAL\n\n"
 
         f"🪙 {base}/USDT\n"
@@ -747,7 +808,8 @@ def maybe_alert(
 
         f"🏆 CMC Rank: #{rank}\n\n"
 
-        f"📈 Price: +{price_change:.2f}%\n"
+        f"📈 Price: "
+        f"+{price_change:.2f}%\n"
 
         f"💰 Total Volume: "
         f"${total_volume:,.0f}\n\n"
@@ -758,13 +820,15 @@ def maybe_alert(
         f"💵 Current: "
         f"{last_price:.8g}\n\n"
 
-        f"📊 Window: {window_type}\n"
+        f"📊 Window: "
+        f"{window_type}\n"
 
-        f"⚡ Trigger: {reason}"
+        f"⚡ Trigger: "
+        f"{reason}"
     )
 
     print(
-        "\n" + "=" * 50,
+        "\n" + "=" * 60,
         flush=True
     )
 
@@ -774,7 +838,7 @@ def maybe_alert(
     )
 
     print(
-        "=" * 50 + "\n",
+        "=" * 60 + "\n",
         flush=True
     )
 
@@ -787,9 +851,7 @@ def maybe_alert(
 # BINANCE KLINE EVENT
 # ============================================================
 
-def process_kline(
-    data
-):
+def process_kline(data):
 
     kline = data.get(
         "k",
@@ -804,11 +866,13 @@ def process_kline(
     ).upper()
 
     if not symbol:
+
         return
 
     with state_lock:
 
         if symbol not in tracked:
+
             return
 
         candle = {
@@ -837,7 +901,6 @@ def process_kline(
                 kline["v"]
             ),
 
-            # THIS IS USDT QUOTE VOLUME
             "quote_volume": float(
                 kline["q"]
             ),
@@ -851,10 +914,10 @@ def process_kline(
             symbol
         ]
 
-        # Current 5M candle update
         if (
             dq
-            and dq[-1]["start"]
+            and
+            dq[-1]["start"]
             == candle["start"]
         ):
 
@@ -866,17 +929,8 @@ def process_kline(
                 candle
             )
 
-        while len(dq) > MAX_CANDLES:
-
-            dq.popleft()
-
-    # --------------------------------------------------------
     # IMPORTANT:
-    # Check every live WebSocket update.
-    #
-    # So we DO NOT wait for the 5M candle to close.
-    # --------------------------------------------------------
-
+    # Check every live update.
     maybe_alert(
         symbol,
         "LIVE 5M UPDATE"
@@ -896,6 +950,20 @@ def ws_on_message(
         payload = json.loads(
             message
         )
+
+        # Subscription confirmation
+        if (
+            "result" in payload
+            and payload.get("id")
+        ):
+
+            print(
+                f"WS SUBSCRIBE RESPONSE: "
+                f"{payload}",
+                flush=True
+            )
+
+            return
 
         data = payload.get(
             "data",
@@ -921,6 +989,100 @@ def ws_on_message(
 
 
 # ============================================================
+# WEBSOCKET OPEN
+# ============================================================
+
+def ws_on_open(
+    ws,
+    symbols,
+    worker_id
+):
+
+    print(
+        f"WS {worker_id}: "
+        f"CONNECTED "
+        f"({len(symbols)} streams)",
+        flush=True
+    )
+
+    params = [
+
+        f"{symbol.lower()}@kline_5m"
+
+        for symbol in symbols
+    ]
+
+    subscribe_message = {
+
+        "method": "SUBSCRIBE",
+
+        "params": params,
+
+        "id": worker_id
+    }
+
+    try:
+
+        ws.send(
+            json.dumps(
+                subscribe_message
+            )
+        )
+
+        print(
+            f"WS {worker_id}: "
+            f"SUBSCRIBE SENT "
+            f"({len(params)} streams)",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            f"WS {worker_id} "
+            f"SUBSCRIBE ERROR:",
+            e,
+            flush=True
+        )
+
+
+# ============================================================
+# WEBSOCKET ERROR
+# ============================================================
+
+def ws_on_error(
+    ws,
+    error,
+    worker_id
+):
+
+    print(
+        f"WS {worker_id} ERROR:",
+        error,
+        flush=True
+    )
+
+
+# ============================================================
+# WEBSOCKET CLOSE
+# ============================================================
+
+def ws_on_close(
+    ws,
+    code,
+    message,
+    worker_id
+):
+
+    print(
+        f"WS {worker_id} CLOSED:",
+        code,
+        message,
+        flush=True
+    )
+
+
+# ============================================================
 # WEBSOCKET WORKER
 # ============================================================
 
@@ -928,16 +1090,6 @@ def ws_worker(
     symbols,
     worker_id
 ):
-
-    streams = "/".join(
-        f"{symbol.lower()}@kline_5m"
-        for symbol in symbols
-    )
-
-    url = (
-        BINANCE_WS
-        + streams
-    )
 
     while True:
 
@@ -952,49 +1104,66 @@ def ws_worker(
 
             ws = websocket.WebSocketApp(
 
-                url,
+                BINANCE_WS,
+
+                on_open=lambda ws:
+                    ws_on_open(
+                        ws,
+                        symbols,
+                        worker_id
+                    ),
 
                 on_message=lambda ws, msg:
-                    ws_on_message(msg),
+                    ws_on_message(
+                        msg
+                    ),
 
                 on_error=lambda ws, error:
-                    print(
-                        f"WS {worker_id} ERROR:",
+                    ws_on_error(
+                        ws,
                         error,
-                        flush=True
+                        worker_id
                     ),
 
                 on_close=lambda ws,
                     code,
-                    msg:
-                    print(
-                        f"WS {worker_id} CLOSED:",
+                    message:
+                    ws_on_close(
+                        ws,
                         code,
-                        msg,
-                        flush=True
+                        message,
+                        worker_id
                     )
             )
 
             ws.run_forever(
+
                 ping_interval=15,
-                ping_timeout=10
+
+                ping_timeout=10,
+
+                ping_payload="ping"
             )
 
         except Exception as e:
 
             print(
-                f"WS {worker_id} EXCEPTION:",
+                f"WS {worker_id} "
+                f"EXCEPTION:",
                 e,
                 flush=True
             )
 
         print(
             f"WS {worker_id}: "
-            "RECONNECTING IN 5 SEC",
+            f"RECONNECTING IN "
+            f"{WS_RECONNECT_SECONDS} SEC",
             flush=True
         )
 
-        time.sleep(5)
+        time.sleep(
+            WS_RECONNECT_SECONDS
+        )
 
 
 # ============================================================
@@ -1016,7 +1185,23 @@ def cmc_refresh_loop():
                 flush=True
             )
 
-            rebuild_tracked()
+            cmc = fetch_cmc_top_2000()
+
+            with state_lock:
+
+                for symbol, info in tracked.items():
+
+                    base = info["base"]
+
+                    if base in cmc:
+
+                        info["rank"] = (
+                            cmc[base]["rank"]
+                        )
+
+                        info["name"] = (
+                            cmc[base]["name"]
+                        )
 
             print(
                 "CMC REFRESH FINISHED",
@@ -1041,7 +1226,7 @@ def main():
     print(
         "\n"
         "========================================\n"
-        "      MEME PUMP ALERT STARTING\n"
+        "       MEME PUMP ALERT STARTING\n"
         "========================================",
         flush=True
     )
@@ -1080,9 +1265,22 @@ def main():
     )
 
     print(
+        f"WEBSOCKET CHUNK: "
+        f"{WS_CHUNK_SIZE}",
+        flush=True
+    )
+
+    print(
         "========================================\n",
         flush=True
     )
+
+
+    # --------------------------------------------------------
+    # TELEGRAM TEST
+    # --------------------------------------------------------
+
+    telegram_startup_test()
 
 
     # --------------------------------------------------------
@@ -1093,7 +1291,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # GET INITIAL 5M HISTORY
+    # HISTORY
     # --------------------------------------------------------
 
     bootstrap_history(
@@ -1102,19 +1300,17 @@ def main():
 
 
     # --------------------------------------------------------
-    # BINANCE MAX 1024 STREAMS / CONNECTION
-    #
-    # Use 900 to keep safety margin.
+    # SPLIT COINS INTO SMALL WEBSOCKET GROUPS
     # --------------------------------------------------------
 
-    chunk_size = 900
-
     chunks = [
-        symbols[i:i + chunk_size]
+
+        symbols[i:i + WS_CHUNK_SIZE]
+
         for i in range(
             0,
             len(symbols),
-            chunk_size
+            WS_CHUNK_SIZE
         )
     ]
 
@@ -1148,7 +1344,7 @@ def main():
 
         thread.start()
 
-        time.sleep(1)
+        time.sleep(2)
 
 
     # --------------------------------------------------------
@@ -1176,15 +1372,21 @@ def main():
         with state_lock:
 
             ready = sum(
+
                 1
-                for item in candles.values()
+
+                for item
+                in candles.values()
+
                 if len(item) >= 2
             )
 
             print(
+
                 f"STATUS | "
                 f"TRACKED={len(tracked)} | "
                 f"HISTORY_READY={ready}",
+
                 flush=True
             )
 
