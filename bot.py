@@ -12,47 +12,71 @@ CHAT_ID = os.environ["CHAT_ID"]
 
 
 # ============================================================
-# BINANCE SETTINGS
+# SETTINGS
 # ============================================================
 
 BINANCE_URL = "https://api.binance.com"
 
-# Hər 5 dəqiqədən bir
-CHECK_INTERVAL = 300
+# Təxminən hər 30 saniyədən bir yoxlayırıq.
+# Beləliklə 5 dəqiqəlik sərhədi gözləmədən
+# hərəkəti daha tez görə bilər.
+CHECK_INTERVAL = 30
 
-REQUEST_TIMEOUT = 15
+# ============================================================
+# 3 x 5M PRICE RULE
+# ============================================================
 
-REQUEST_DELAY = 0.05
+# Son 3 tamamlanmış / cari 5M şam birlikdə
+# minimum neçə faiz qalxmalıdır?
+MIN_3CANDLE_PRICE_CHANGE = 5.0
 
 
 # ============================================================
-# 3 x 5M CUMULATIVE RULES
+# 3 x 5M VOLUME RULE
 # ============================================================
 
-# Son 3 tamamlanmış 5M şamın
-# birlikdə minimum qiymət artımı
-MIN_3C_PRICE_CHANGE = 5.0
+# Son 3 x 5M şamın ümumi USDT volume-u
+# ən azı bu qədər olmalıdır.
+MIN_3CANDLE_VOLUME = 100_000
 
 
-# Son 3 tamamlanmış 5M şamın
-# birlikdə minimum volume-u
-MIN_3C_VOLUME = 100_000
-
-
-# Son 3 şamın volume-u əvvəlki
-# 3 şamın volume-undan ən azı 1.5x çox olmalıdır
+# Son 3 şamın ümumi volume-u əvvəlki
+# 3 şamın ümumi volume-undan neçə dəfə böyük olmalıdır?
 MIN_VOLUME_MULTIPLIER = 1.5
 
 
 # ============================================================
-# ALERT SETTINGS
+# EARLY SIGNAL
 # ============================================================
 
-# Eyni coin yalnız 1 dəfə alert
+# Cari hərəkətdə minimum müsbət qiymət.
+MIN_CURRENT_PRICE_CHANGE = 0.0
+
+# Bir anda həddən artıq qaçmış coinləri azaltmaq.
+MAX_3CANDLE_PRICE_CHANGE = 15.0
+
+
+# ============================================================
+# REPEAT ALERT
+# ============================================================
+
+# Eyni coin üçün yenidən siqnal verməmək.
 ONE_ALERT_PER_COIN = True
 
-# Bir scan-da maksimum alert
+# İstəsən sonradan False edə bilərsən.
+# True olduqda bot həmin coinə bir dəfə siqnal verir.
+# 20%, 50%, 100% qalxanda yenidən vermir.
+
+
+# ============================================================
+# SCAN
+# ============================================================
+
 MAX_ALERTS_PER_SCAN = 5
+
+REQUEST_TIMEOUT = 15
+
+REQUEST_DELAY = 0.03
 
 
 # ============================================================
@@ -63,13 +87,13 @@ alerted_coins = set()
 
 
 # ============================================================
-# HTTP SESSION
+# SESSION
 # ============================================================
 
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "Binance-3x5M-Momentum-Bot/1.0"
+    "User-Agent": "Binance-3x5M-Early-Momentum-Bot/1.0"
 })
 
 
@@ -81,7 +105,6 @@ def safe_float(value, default=0.0):
 
     try:
         return float(value)
-
     except Exception:
         return default
 
@@ -128,7 +151,7 @@ def send_message(text):
     except Exception as e:
 
         print(
-            "TELEGRAM CONNECTION ERROR:",
+            "TELEGRAM ERROR:",
             e
         )
 
@@ -136,7 +159,7 @@ def send_message(text):
 
 
 # ============================================================
-# BINANCE USDT SPOT SYMBOLS
+# GET BINANCE SYMBOLS
 # ============================================================
 
 def get_symbols():
@@ -163,34 +186,31 @@ def get_symbols():
             []
         ):
 
-            # Aktiv olmalıdır
             if item.get("status") != "TRADING":
                 continue
 
-            # Yalnız USDT
             if item.get("quoteAsset") != "USDT":
                 continue
 
-            # Spot trading
             if item.get(
                 "isSpotTradingAllowed",
                 True
             ) is False:
+
                 continue
 
             symbol = item.get("symbol")
 
-            if not symbol:
-                continue
+            if symbol:
 
-            symbols.append(symbol)
+                symbols.append(symbol)
 
         return symbols
 
     except Exception as e:
 
         print(
-            "BINANCE SYMBOL ERROR:",
+            "SYMBOL ERROR:",
             e
         )
 
@@ -198,10 +218,10 @@ def get_symbols():
 
 
 # ============================================================
-# GET 5M CANDLES
+# GET 5M KLINES
 # ============================================================
 
-def get_5m_candles(symbol):
+def get_5m_data(symbol):
 
     url = (
         f"{BINANCE_URL}/api/v3/klines"
@@ -211,15 +231,10 @@ def get_5m_candles(symbol):
         "symbol": symbol,
         "interval": "5m",
 
-        # Bizə 6 tamamlanmış candle lazımdır:
-        #
-        # əvvəlki 3:
-        # 1,2,3
-        #
-        # son 3:
-        # 4,5,6
-        #
-        # + hazırda açıq candle
+        # 7 candle:
+        # 3 əvvəlki
+        # 3 son candle
+        # 1 əlavə
         "limit": 7
     }
 
@@ -241,44 +256,58 @@ def get_5m_candles(symbol):
 
             return None
 
-        # ----------------------------------------------------
-        # SON AÇIQ CANDLE-ı ÇIXARIRIQ
-        # ----------------------------------------------------
 
-        completed = data[:-1]
+        # ====================================================
+        # CANDLE STRUCTURE
+        #
+        # Binance:
+        #
+        # [0] open time
+        # [1] open
+        # [2] high
+        # [3] low
+        # [4] close
+        # [5] volume
+        # [6] close time
+        # [7] quote volume
+        #
+        # Biz USDT volume üçün [7] istifadə edirik.
+        # ====================================================
 
-        if len(completed) < 6:
+        # Son bağlanmış candle
+        closed_1 = data[-2]
 
-            return None
+        # Ondan əvvəl
+        closed_2 = data[-3]
 
-        # ----------------------------------------------------
-        # SON 3 TAMAMLANMIŞ CANDLE
-        # ----------------------------------------------------
+        # Ondan əvvəl
+        closed_3 = data[-4]
 
-        current_1 = completed[-3]
-        current_2 = completed[-2]
-        current_3 = completed[-1]
-
-        # ----------------------------------------------------
-        # ONDAN ƏVVƏLKİ 3 CANDLE
-        # ----------------------------------------------------
-
-        previous_1 = completed[-6]
-        previous_2 = completed[-5]
-        previous_3 = completed[-4]
+        # Əvvəlki 3 candle
+        old_1 = data[-5]
+        old_2 = data[-6]
+        old_3 = data[-7]
 
 
         # ====================================================
-        # SON 3 CANDLE QİYMƏT
+        # SON 3 ŞAM
         # ====================================================
+
+        candles = [
+            closed_3,
+            closed_2,
+            closed_1
+        ]
+
 
         first_open = safe_float(
-            current_1[1]
+            closed_3[1]
         )
 
         last_close = safe_float(
-            current_3[4]
+            closed_1[4]
         )
+
 
         if first_open <= 0:
 
@@ -286,59 +315,49 @@ def get_5m_candles(symbol):
 
 
         # ====================================================
-        # ÜMUMİ 3 CANDLE PRICE CHANGE
-        #
-        # İlk candle OPEN
-        # →
-        # Üçüncü candle CLOSE
+        # 3 CANDLE PRICE CHANGE
         # ====================================================
 
         price_change = (
+
             (
                 last_close
                 - first_open
             )
             / first_open
+
         ) * 100
 
 
         # ====================================================
-        # SON 3 CANDLE VOLUME
-        #
-        # Ayrı-ayrılıqda yox!
-        #
-        # Hamısını toplayırıq.
+        # 3 CANDLE TOTAL VOLUME
         # ====================================================
 
-        current_volume = (
+        total_volume = sum(
 
-            safe_float(current_1[7])
+            safe_float(
+                candle[7]
+            )
 
-            +
-
-            safe_float(current_2[7])
-
-            +
-
-            safe_float(current_3[7])
+            for candle in candles
         )
 
 
         # ====================================================
-        # ƏVVƏLKİ 3 CANDLE VOLUME
+        # PREVIOUS 3 CANDLE VOLUME
         # ====================================================
 
-        previous_volume = (
+        previous_volume = sum(
 
-            safe_float(previous_1[7])
+            safe_float(
+                candle[7]
+            )
 
-            +
-
-            safe_float(previous_2[7])
-
-            +
-
-            safe_float(previous_3[7])
+            for candle in [
+                old_3,
+                old_2,
+                old_1
+            ]
         )
 
 
@@ -349,8 +368,10 @@ def get_5m_candles(symbol):
         if previous_volume > 0:
 
             volume_multiplier = (
-                current_volume
+
+                total_volume
                 / previous_volume
+
             )
 
         else:
@@ -359,49 +380,56 @@ def get_5m_candles(symbol):
 
 
         # ====================================================
-        # CANDLE VALUES
+        # CURRENT 5M CANDLE
         # ====================================================
 
-        candle_1_open = safe_float(
-            current_1[1]
+        current = data[-1]
+
+        current_open = safe_float(
+            current[1]
         )
 
-        candle_1_close = safe_float(
-            current_1[4]
+        current_close = safe_float(
+            current[4]
         )
 
-        candle_2_open = safe_float(
-            current_2[1]
+        current_volume = safe_float(
+            current[7]
         )
 
-        candle_2_close = safe_float(
-            current_2[4]
-        )
 
-        candle_3_open = safe_float(
-            current_3[1]
-        )
+        if current_open > 0:
 
-        candle_3_close = safe_float(
-            current_3[4]
-        )
+            current_price_change = (
 
+                (
+                    current_close
+                    - current_open
+                )
+                / current_open
+
+            ) * 100
+
+        else:
+
+            current_price_change = 0
+
+
+        # ====================================================
+        # RETURN
+        # ====================================================
 
         return {
 
             "symbol": symbol,
 
-            "first_open":
-                first_open,
+            "first_open": first_open,
 
-            "last_close":
-                last_close,
+            "last_close": last_close,
 
-            "price_change":
-                price_change,
+            "price_change": price_change,
 
-            "current_volume":
-                current_volume,
+            "total_volume": total_volume,
 
             "previous_volume":
                 previous_volume,
@@ -409,23 +437,11 @@ def get_5m_candles(symbol):
             "volume_multiplier":
                 volume_multiplier,
 
-            "candle_1_open":
-                candle_1_open,
+            "current_price_change":
+                current_price_change,
 
-            "candle_1_close":
-                candle_1_close,
-
-            "candle_2_open":
-                candle_2_open,
-
-            "candle_2_close":
-                candle_2_close,
-
-            "candle_3_open":
-                candle_3_open,
-
-            "candle_3_close":
-                candle_3_close
+            "current_volume":
+                current_volume
         }
 
 
@@ -442,7 +458,7 @@ def get_5m_candles(symbol):
 
 
 # ============================================================
-# SIGNAL CHECK
+# SIGNAL
 # ============================================================
 
 def is_signal(data):
@@ -455,17 +471,21 @@ def is_signal(data):
         "price_change"
     ]
 
-    current_volume = data[
-        "current_volume"
+    total_volume = data[
+        "total_volume"
     ]
 
     volume_multiplier = data[
         "volume_multiplier"
     ]
 
+    current_price_change = data[
+        "current_price_change"
+    ]
+
 
     # ========================================================
-    # ONE ALERT PER COIN
+    # ONE ALERT
     # ========================================================
 
     if ONE_ALERT_PER_COIN:
@@ -479,22 +499,40 @@ def is_signal(data):
     # 3 CANDLE PRICE
     # ========================================================
 
-    if price_change < MIN_3C_PRICE_CHANGE:
+    if price_change < MIN_3CANDLE_PRICE_CHANGE:
 
         return False
 
 
     # ========================================================
-    # 3 CANDLE TOTAL VOLUME
+    # TOO LATE
     # ========================================================
 
-    if current_volume < MIN_3C_VOLUME:
+    if price_change > MAX_3CANDLE_PRICE_CHANGE:
 
         return False
 
 
     # ========================================================
-    # VOLUME COMPARED WITH PREVIOUS 3
+    # CURRENT MOMENTUM
+    # ========================================================
+
+    if current_price_change < MIN_CURRENT_PRICE_CHANGE:
+
+        return False
+
+
+    # ========================================================
+    # TOTAL VOLUME
+    # ========================================================
+
+    if total_volume < MIN_3CANDLE_VOLUME:
+
+        return False
+
+
+    # ========================================================
+    # VOLUME MULTIPLIER
     # ========================================================
 
     if volume_multiplier < MIN_VOLUME_MULTIPLIER:
@@ -506,20 +544,19 @@ def is_signal(data):
 
 
 # ============================================================
-# SIGNAL SCORE
+# SCORE
 # ============================================================
 
 def calculate_score(data):
 
     score = 0
 
-
-    price_change = data[
+    price = data[
         "price_change"
     ]
 
-    current_volume = data[
-        "current_volume"
+    volume = data[
+        "total_volume"
     ]
 
     multiplier = data[
@@ -531,46 +568,42 @@ def calculate_score(data):
     # PRICE
     # ========================================================
 
-    if price_change >= 5:
+    if price >= 5:
+
+        score += 30
+
+    if price >= 7:
+
+        score += 10
+
+    if price >= 10:
+
+        score += 10
+
+
+    # ========================================================
+    # VOLUME
+    # ========================================================
+
+    if volume >= 100_000:
 
         score += 20
 
-    if price_change >= 7.5:
-
-        score += 10
-
-    if price_change >= 10:
+    if volume >= 250_000:
 
         score += 15
 
-    if price_change >= 15:
+    if volume >= 500_000:
+
+        score += 15
+
+    if volume >= 1_000_000:
 
         score += 15
 
 
     # ========================================================
-    # TOTAL VOLUME
-    # ========================================================
-
-    if current_volume >= 100_000:
-
-        score += 20
-
-    if current_volume >= 250_000:
-
-        score += 10
-
-    if current_volume >= 500_000:
-
-        score += 10
-
-    if current_volume >= 1_000_000:
-
-        score += 10
-
-
-    # ========================================================
-    # VOLUME MULTIPLIER
+    # MULTIPLIER
     # ========================================================
 
     if multiplier >= 1.5:
@@ -583,11 +616,11 @@ def calculate_score(data):
 
     if multiplier >= 3:
 
-        score += 15
+        score += 10
 
     if multiplier >= 5:
 
-        score += 15
+        score += 10
 
 
     return score
@@ -605,7 +638,7 @@ def scan(symbols):
     )
 
     print(
-        "🔎 BINANCE 3×5M CUMULATIVE SCAN"
+        "🔎 BINANCE 3×5M MOMENTUM SCAN"
     )
 
     print(
@@ -615,16 +648,9 @@ def scan(symbols):
 
     candidates = []
 
-    total = len(symbols)
-
-
-    # ========================================================
-    # SCAN ALL COINS
-    # ========================================================
-
     for symbol in symbols:
 
-        data = get_5m_candles(
+        data = get_5m_data(
             symbol
         )
 
@@ -648,11 +674,11 @@ def scan(symbols):
             print(
                 "🔥 CANDIDATE:",
                 symbol,
-                "| 3×5M PRICE:",
-                f"{data['price_change']:+.2f}%",
-                "| 3×5M VOLUME:",
-                f"${data['current_volume']:,.0f}",
-                "| MULTIPLIER:",
+                "| PRICE:",
+                f"{data['price_change']:.2f}%",
+                "| VOLUME:",
+                f"${data['total_volume']:,.0f}",
+                "| MULT:",
                 f"{data['volume_multiplier']:.2f}x"
             )
 
@@ -667,47 +693,40 @@ def scan(symbols):
     # ========================================================
 
     candidates.sort(
+
         key=lambda x: (
+
             x["score"],
+
             x["price_change"],
+
             x["volume_multiplier"],
-            x["current_volume"]
+
+            x["total_volume"]
+
         ),
+
         reverse=True
     )
 
 
     print()
-
     print(
-        "COINS SCANNED:",
-        total
-    )
-
-    print(
-        "STRONG CANDIDATES:",
+        "CANDIDATES:",
         len(candidates)
     )
 
-    print(
-        "ALREADY ALERTED:",
-        len(alerted_coins)
-    )
-
 
     # ========================================================
-    # SEND TELEGRAM
+    # ALERT
     # ========================================================
 
-    alerts_sent = 0
+    sent = 0
 
 
     for data in candidates:
 
-        if (
-            alerts_sent
-            >= MAX_ALERTS_PER_SCAN
-        ):
+        if sent >= MAX_ALERTS_PER_SCAN:
 
             break
 
@@ -716,12 +735,12 @@ def scan(symbols):
             "symbol"
         ]
 
-        price_change = data[
+        price = data[
             "price_change"
         ]
 
-        current_volume = data[
-            "current_volume"
+        volume = data[
+            "total_volume"
         ]
 
         previous_volume = data[
@@ -732,48 +751,54 @@ def scan(symbols):
             "volume_multiplier"
         ]
 
+        current_price = data[
+            "current_price_change"
+        ]
+
         score = data[
             "score"
         ]
 
 
         # ====================================================
-        # MESSAGE
+        # TELEGRAM
         # ====================================================
 
         message = (
 
-            "🚨 BINANCE 3×5M MOMENTUM ALERT\n\n"
+            "🚨 BINANCE EARLY MOMENTUM\n\n"
 
-            f"🪙 Coin: {symbol}\n\n"
+            f"🪙 {symbol}\n\n"
 
-            f"📈 3×5M Ümumi Price Change: "
-            f"{price_change:+.2f}%\n\n"
+            "📊 SON 3 × 5M:\n"
 
-            f"💰 3×5M Ümumi Volume: "
-            f"${current_volume:,.0f}\n"
+            f"📈 Ümumi qiymət: "
+            f"+{price:.2f}%\n"
 
-            f"📊 Əvvəlki 3×5M Volume: "
+            f"💰 Ümumi volume: "
+            f"${volume:,.0f}\n"
+
+            f"📊 Əvvəlki 3×5M volume: "
             f"${previous_volume:,.0f}\n"
 
-            f"🔥 Volume Multiplier: "
+            f"🔥 Volume artımı: "
             f"{multiplier:.2f}x\n\n"
 
-            f"⭐ Signal Score: "
-            f"{score}\n\n"
+            f"🕐 Cari 5M hərəkət: "
+            f"{current_price:+.2f}%\n\n"
 
-            "✅ ŞƏRTLƏR:\n"
+            f"⭐ Score: {score}\n\n"
 
-            "• 3 ardıcıl 5M candle\n"
+            "🎯 Şərt:\n"
 
-            "• Ümumi price change ≥ +5%\n"
+            "3 ardıcıl 5M şamın "
+            "ümumi qiymət +5%-dən yuxarıdır.\n"
 
-            "• Ümumi 3×5M volume ≥ $100K\n"
+            "3 şamın volume-u birlikdə "
+            "hesablanıb.\n\n"
 
-            "• Volume əvvəlki 3×5M-dən ≥ 1.5x\n\n"
-
-            "⚠️ Eyni coin üçün yalnız "
-            "1 dəfə alert veriləcək.\n\n"
+            "⚠️ Eyni coin üçün "
+            "təkrar alert verilmir.\n\n"
 
             f"🔗 https://www.binance.com/"
             f"en/trade/{symbol}?type=spot"
@@ -788,59 +813,18 @@ def scan(symbols):
                 symbol
             )
 
-            alerts_sent += 1
+            sent += 1
 
             print(
                 "🚨 ALERT SENT:",
-                symbol,
-                "| PRICE:",
-                f"{price_change:+.2f}%",
-                "| VOLUME:",
-                f"${current_volume:,.0f}",
-                "| MULTIPLIER:",
-                f"{multiplier:.2f}x"
+                symbol
             )
 
 
     print()
-
     print(
         "ALERTS SENT:",
-        alerts_sent
-    )
-
-
-# ============================================================
-# WAIT FOR NEXT 5M
-# ============================================================
-
-def wait_for_next_5m():
-
-    now = time.time()
-
-    next_run = (
-        ((int(now) // 300) + 1)
-        * 300
-    )
-
-    wait_seconds = (
-        next_run - now
-    )
-
-
-    if wait_seconds < 1:
-
-        wait_seconds = 1
-
-
-    print(
-        f"⏳ Next 3×5M scan in "
-        f"{int(wait_seconds)} seconds..."
-    )
-
-
-    time.sleep(
-        wait_seconds
+        sent
     )
 
 
@@ -849,42 +833,41 @@ def wait_for_next_5m():
 # ============================================================
 
 print()
-
 print(
-    "🟢 BINANCE 3×5M CUMULATIVE MOMENTUM BOT"
+    "🟢 BINANCE 3×5M EARLY MOMENTUM BOT"
 )
-
 print()
 
 print(
-    "🔵 Source: Binance Spot"
+    "Source: Binance Spot"
 )
 
 print(
-    "⏱ Scan: Every 5 minutes"
+    "Scan: every 30 seconds"
 )
 
 print(
-    "📊 Candle window: 3 completed 5M candles"
+    "3×5M minimum price:",
+    f"{MIN_3CANDLE_PRICE_CHANGE}%"
 )
 
 print(
-    "📈 Minimum 3×5M price change:",
-    f"+{MIN_3C_PRICE_CHANGE}%"
+    "3×5M minimum volume:",
+    f"${MIN_3CANDLE_VOLUME:,}"
 )
 
 print(
-    "💰 Minimum 3×5M total volume:",
-    f"${MIN_3C_VOLUME:,}"
-)
-
-print(
-    "🔥 Minimum volume multiplier:",
+    "Volume multiplier:",
     f"{MIN_VOLUME_MULTIPLIER}x"
 )
 
 print(
-    "⚠️ One alert per coin: ON"
+    "Maximum 3×5M price:",
+    f"{MAX_3CANDLE_PRICE_CHANGE}%"
+)
+
+print(
+    "One alert per coin: ON"
 )
 
 print()
@@ -896,30 +879,27 @@ print()
 
 send_message(
 
-    "🟢 BINANCE 3×5M MOMENTUM BOT STARTED\n\n"
+    "🟢 BINANCE 3×5M EARLY MOMENTUM BOT STARTED\n\n"
 
-    "🎯 Yeni sistem:\n"
-    "Son 3 ardıcıl tamamlanmış 5M candle "
-    "birlikdə hesablanır.\n\n"
+    "🎯 Məqsəd:\n"
+    "3 ardıcıl 5 dəqiqəlik şamda "
+    "toplanan momentum-u tapmaq.\n\n"
 
-    "📈 Price:\n"
-    "İlk candle OPEN → üçüncü candle CLOSE\n"
-    "Ümumi dəyişmə ≥ +5%\n\n"
+    "📈 Qiymət:\n"
+    "3×5M ümumi artım ≥ +5%\n\n"
 
     "💰 Volume:\n"
-    "Son 3 candle volume-u BİRLİKDƏ "
-    "hesablanır.\n"
-    "Minimum: $100K\n\n"
+    "3×5M volume birlikdə hesablanır.\n\n"
 
-    "🔥 Volume müqayisəsi:\n"
-    "Son 3 candle volume-u əvvəlki "
-    "3 candle volume-undan ≥ 1.5x olmalıdır.\n\n"
+    "🔥 Volume:\n"
+    "Ümumi volume əvvəlki 3×5M "
+    "volume-dan ən azı 1.5x olmalıdır.\n\n"
 
-    "⏱ Hər 5 dəqiqədə yeni 3-lük yoxlanılır.\n\n"
+    "⚡ Scan hər 30 saniyədə aparılır.\n\n"
 
-    "⚠️ Eyni coin yalnız 1 dəfə alert.\n\n"
+    "⚠️ Eyni coin üçün təkrar alert yoxdur.\n\n"
 
-    "🔵 Mənbə: Binance Spot"
+    "🔵 Binance Spot"
 )
 
 
@@ -938,7 +918,6 @@ while True:
             len(symbols)
         )
 
-
         if symbols:
 
             scan(
@@ -954,4 +933,16 @@ while True:
         )
 
 
-    wait_for_next_5m()
+    print()
+
+    print(
+        "⏳ Next scan in",
+        CHECK_INTERVAL,
+        "seconds..."
+    )
+
+    print()
+
+    time.sleep(
+        CHECK_INTERVAL
+    )
