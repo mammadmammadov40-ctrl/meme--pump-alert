@@ -12,7 +12,7 @@ CHAT_ID = os.environ["CHAT_ID"]
 
 
 # ============================================================
-# BINANCE
+# BINANCE SETTINGS
 # ============================================================
 
 BINANCE_URL = "https://api.binance.com"
@@ -22,52 +22,26 @@ CHECK_INTERVAL = 300
 
 REQUEST_TIMEOUT = 15
 
-# API sorğuları arasında kiçik fasilə
 REQUEST_DELAY = 0.05
 
 
 # ============================================================
-# VOLUME SETTINGS
+# 3 x 5M CUMULATIVE RULES
 # ============================================================
 
-# Əvvəl $50K idi.
-# Daha həssas etmək üçün $30K
-MIN_5M_VOLUME = 30_000
+# Son 3 tamamlanmış 5M şamın
+# birlikdə minimum qiymət artımı
+MIN_3C_PRICE_CHANGE = 5.0
 
-# Əvvəl 2.0x idi.
-# Daha həssas etmək üçün 1.5x
+
+# Son 3 tamamlanmış 5M şamın
+# birlikdə minimum volume-u
+MIN_3C_VOLUME = 100_000
+
+
+# Son 3 şamın volume-u əvvəlki
+# 3 şamın volume-undan ən azı 1.5x çox olmalıdır
 MIN_VOLUME_MULTIPLIER = 1.5
-
-# Əvvəl $25K idi.
-# Daha həssas etmək üçün $15K
-MIN_VOLUME_INCREASE = 15_000
-
-
-# ============================================================
-# PRICE SETTINGS
-# ============================================================
-
-# ƏSAS ŞƏRT:
-#
-# +1%  -> SIQNAL YOX
-# +2%  -> SIQNAL YOX
-# +3%  -> SIQNAL YOX
-# +4%  -> SIQNAL YOX
-# +5%  -> SIQNAL VAR
-# +10% -> SIQNAL VAR
-# +20% -> SIQNAL VAR
-#
-MIN_PRICE_CHANGE = 5.0
-
-# Maksimum qiymət limiti yoxdur.
-#
-# Yəni:
-# +5%  -> mümkündür
-# +10% -> mümkündür
-# +20% -> mümkündür
-# +30% -> mümkündür
-#
-# Sadəcə volume şərtləri də ödənməlidir.
 
 
 # ============================================================
@@ -77,7 +51,7 @@ MIN_PRICE_CHANGE = 5.0
 # Eyni coin yalnız 1 dəfə alert
 ONE_ALERT_PER_COIN = True
 
-# Bir scan zamanı maksimum alert
+# Bir scan-da maksimum alert
 MAX_ALERTS_PER_SCAN = 5
 
 
@@ -95,7 +69,7 @@ alerted_coins = set()
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "Binance-5M-Momentum-Bot/2.0"
+    "User-Agent": "Binance-3x5M-Momentum-Bot/1.0"
 })
 
 
@@ -154,7 +128,7 @@ def send_message(text):
     except Exception as e:
 
         print(
-            "TELEGRAM ERROR:",
+            "TELEGRAM CONNECTION ERROR:",
             e
         )
 
@@ -162,7 +136,7 @@ def send_message(text):
 
 
 # ============================================================
-# GET BINANCE USDT SPOT COINS
+# BINANCE USDT SPOT SYMBOLS
 # ============================================================
 
 def get_symbols():
@@ -189,7 +163,7 @@ def get_symbols():
             []
         ):
 
-            # Aktiv coin
+            # Aktiv olmalıdır
             if item.get("status") != "TRADING":
                 continue
 
@@ -197,7 +171,7 @@ def get_symbols():
             if item.get("quoteAsset") != "USDT":
                 continue
 
-            # Yalnız Spot
+            # Spot trading
             if item.get(
                 "isSpotTradingAllowed",
                 True
@@ -227,7 +201,7 @@ def get_symbols():
 # GET 5M CANDLES
 # ============================================================
 
-def get_5m_data(symbol):
+def get_5m_candles(symbol):
 
     url = (
         f"{BINANCE_URL}/api/v3/klines"
@@ -236,7 +210,17 @@ def get_5m_data(symbol):
     params = {
         "symbol": symbol,
         "interval": "5m",
-        "limit": 5
+
+        # Bizə 6 tamamlanmış candle lazımdır:
+        #
+        # əvvəlki 3:
+        # 1,2,3
+        #
+        # son 3:
+        # 4,5,6
+        #
+        # + hazırda açıq candle
+        "limit": 7
     }
 
     try:
@@ -253,100 +237,120 @@ def get_5m_data(symbol):
 
         data = response.json()
 
-        if len(data) < 5:
+        if len(data) < 7:
+
+            return None
+
+        # ----------------------------------------------------
+        # SON AÇIQ CANDLE-ı ÇIXARIRIQ
+        # ----------------------------------------------------
+
+        completed = data[:-1]
+
+        if len(completed) < 6:
+
+            return None
+
+        # ----------------------------------------------------
+        # SON 3 TAMAMLANMIŞ CANDLE
+        # ----------------------------------------------------
+
+        current_1 = completed[-3]
+        current_2 = completed[-2]
+        current_3 = completed[-1]
+
+        # ----------------------------------------------------
+        # ONDAN ƏVVƏLKİ 3 CANDLE
+        # ----------------------------------------------------
+
+        previous_1 = completed[-6]
+        previous_2 = completed[-5]
+        previous_3 = completed[-4]
+
+
+        # ====================================================
+        # SON 3 CANDLE QİYMƏT
+        # ====================================================
+
+        first_open = safe_float(
+            current_1[1]
+        )
+
+        last_close = safe_float(
+            current_3[4]
+        )
+
+        if first_open <= 0:
 
             return None
 
 
         # ====================================================
-        # SON TAMAMLANMIŞ 5M CANDLE
+        # ÜMUMİ 3 CANDLE PRICE CHANGE
+        #
+        # İlk candle OPEN
+        # →
+        # Üçüncü candle CLOSE
         # ====================================================
-
-        current = data[-2]
-
-        # Əvvəlki 3 tamamlanmış candle
-        old_1 = data[-3]
-        old_2 = data[-4]
-        old_3 = data[-5]
-
-
-        # ====================================================
-        # CURRENT CANDLE
-        # ====================================================
-
-        open_price = safe_float(
-            current[1]
-        )
-
-        high_price = safe_float(
-            current[2]
-        )
-
-        low_price = safe_float(
-            current[3]
-        )
-
-        close_price = safe_float(
-            current[4]
-        )
-
-        # Quote volume = USDT
-        current_volume = safe_float(
-            current[7]
-        )
-
-
-        # ====================================================
-        # PREVIOUS 3 VOLUMES
-        # ====================================================
-
-        volume_1 = safe_float(
-            old_1[7]
-        )
-
-        volume_2 = safe_float(
-            old_2[7]
-        )
-
-        volume_3 = safe_float(
-            old_3[7]
-        )
-
-
-        average_volume = (
-            volume_1
-            + volume_2
-            + volume_3
-        ) / 3
-
-
-        # ====================================================
-        # PRICE CHANGE
-        # ====================================================
-
-        if open_price <= 0:
-
-            return None
-
 
         price_change = (
             (
-                close_price
-                - open_price
+                last_close
+                - first_open
             )
-            / open_price
+            / first_open
         ) * 100
+
+
+        # ====================================================
+        # SON 3 CANDLE VOLUME
+        #
+        # Ayrı-ayrılıqda yox!
+        #
+        # Hamısını toplayırıq.
+        # ====================================================
+
+        current_volume = (
+
+            safe_float(current_1[7])
+
+            +
+
+            safe_float(current_2[7])
+
+            +
+
+            safe_float(current_3[7])
+        )
+
+
+        # ====================================================
+        # ƏVVƏLKİ 3 CANDLE VOLUME
+        # ====================================================
+
+        previous_volume = (
+
+            safe_float(previous_1[7])
+
+            +
+
+            safe_float(previous_2[7])
+
+            +
+
+            safe_float(previous_3[7])
+        )
 
 
         # ====================================================
         # VOLUME MULTIPLIER
         # ====================================================
 
-        if average_volume > 0:
+        if previous_volume > 0:
 
             volume_multiplier = (
                 current_volume
-                / average_volume
+                / previous_volume
             )
 
         else:
@@ -355,12 +359,31 @@ def get_5m_data(symbol):
 
 
         # ====================================================
-        # VOLUME INCREASE
+        # CANDLE VALUES
         # ====================================================
 
-        volume_increase = (
-            current_volume
-            - average_volume
+        candle_1_open = safe_float(
+            current_1[1]
+        )
+
+        candle_1_close = safe_float(
+            current_1[4]
+        )
+
+        candle_2_open = safe_float(
+            current_2[1]
+        )
+
+        candle_2_close = safe_float(
+            current_2[4]
+        )
+
+        candle_3_open = safe_float(
+            current_3[1]
+        )
+
+        candle_3_close = safe_float(
+            current_3[4]
         )
 
 
@@ -368,27 +391,41 @@ def get_5m_data(symbol):
 
             "symbol": symbol,
 
-            "open": open_price,
+            "first_open":
+                first_open,
 
-            "high": high_price,
+            "last_close":
+                last_close,
 
-            "low": low_price,
+            "price_change":
+                price_change,
 
-            "close": close_price,
+            "current_volume":
+                current_volume,
 
-            "volume": current_volume,
-
-            "average_volume":
-                average_volume,
+            "previous_volume":
+                previous_volume,
 
             "volume_multiplier":
                 volume_multiplier,
 
-            "volume_increase":
-                volume_increase,
+            "candle_1_open":
+                candle_1_open,
 
-            "price_change":
-                price_change
+            "candle_1_close":
+                candle_1_close,
+
+            "candle_2_open":
+                candle_2_open,
+
+            "candle_2_close":
+                candle_2_close,
+
+            "candle_3_open":
+                candle_3_open,
+
+            "candle_3_close":
+                candle_3_close
         }
 
 
@@ -410,20 +447,20 @@ def get_5m_data(symbol):
 
 def is_signal(data):
 
-    symbol = data["symbol"]
-
-    volume = data["volume"]
-
-    multiplier = data[
-        "volume_multiplier"
-    ]
-
-    volume_increase = data[
-        "volume_increase"
+    symbol = data[
+        "symbol"
     ]
 
     price_change = data[
         "price_change"
+    ]
+
+    current_volume = data[
+        "current_volume"
+    ]
+
+    volume_multiplier = data[
+        "volume_multiplier"
     ]
 
 
@@ -439,44 +476,31 @@ def is_signal(data):
 
 
     # ========================================================
-    # MINIMUM VOLUME
+    # 3 CANDLE PRICE
     # ========================================================
 
-    if volume < MIN_5M_VOLUME:
+    if price_change < MIN_3C_PRICE_CHANGE:
 
         return False
 
 
     # ========================================================
-    # VOLUME MULTIPLIER
+    # 3 CANDLE TOTAL VOLUME
     # ========================================================
 
-    if multiplier < MIN_VOLUME_MULTIPLIER:
+    if current_volume < MIN_3C_VOLUME:
 
         return False
 
 
     # ========================================================
-    # REAL VOLUME INCREASE
+    # VOLUME COMPARED WITH PREVIOUS 3
     # ========================================================
 
-    if volume_increase < MIN_VOLUME_INCREASE:
+    if volume_multiplier < MIN_VOLUME_MULTIPLIER:
 
         return False
 
-
-    # ========================================================
-    # PRICE +5% OR HIGHER
-    # ========================================================
-
-    if price_change < MIN_PRICE_CHANGE:
-
-        return False
-
-
-    # ========================================================
-    # SIGNAL PASSED
-    # ========================================================
 
     return True
 
@@ -489,21 +513,64 @@ def calculate_score(data):
 
     score = 0
 
-    multiplier = data[
-        "volume_multiplier"
-    ]
 
     price_change = data[
         "price_change"
     ]
 
-    volume = data[
-        "volume"
+    current_volume = data[
+        "current_volume"
+    ]
+
+    multiplier = data[
+        "volume_multiplier"
     ]
 
 
     # ========================================================
-    # VOLUME SCORE
+    # PRICE
+    # ========================================================
+
+    if price_change >= 5:
+
+        score += 20
+
+    if price_change >= 7.5:
+
+        score += 10
+
+    if price_change >= 10:
+
+        score += 15
+
+    if price_change >= 15:
+
+        score += 15
+
+
+    # ========================================================
+    # TOTAL VOLUME
+    # ========================================================
+
+    if current_volume >= 100_000:
+
+        score += 20
+
+    if current_volume >= 250_000:
+
+        score += 10
+
+    if current_volume >= 500_000:
+
+        score += 10
+
+    if current_volume >= 1_000_000:
+
+        score += 10
+
+
+    # ========================================================
+    # VOLUME MULTIPLIER
     # ========================================================
 
     if multiplier >= 1.5:
@@ -512,63 +579,13 @@ def calculate_score(data):
 
     if multiplier >= 2:
 
-        score += 20
+        score += 10
 
     if multiplier >= 3:
 
         score += 15
 
     if multiplier >= 5:
-
-        score += 20
-
-    if multiplier >= 10:
-
-        score += 20
-
-
-    # ========================================================
-    # ABSOLUTE VOLUME
-    # ========================================================
-
-    if volume >= 50_000:
-
-        score += 10
-
-    if volume >= 100_000:
-
-        score += 10
-
-    if volume >= 250_000:
-
-        score += 10
-
-    if volume >= 500_000:
-
-        score += 10
-
-    if volume >= 1_000_000:
-
-        score += 10
-
-
-    # ========================================================
-    # PRICE MOMENTUM
-    # ========================================================
-
-    if price_change >= 5:
-
-        score += 10
-
-    if price_change >= 10:
-
-        score += 10
-
-    if price_change >= 20:
-
-        score += 15
-
-    if price_change >= 30:
 
         score += 15
 
@@ -588,7 +605,7 @@ def scan(symbols):
     )
 
     print(
-        "🔎 BINANCE 5M VOLUME + PRICE SCAN"
+        "🔎 BINANCE 3×5M CUMULATIVE SCAN"
     )
 
     print(
@@ -602,15 +619,12 @@ def scan(symbols):
 
 
     # ========================================================
-    # CHECK ALL COINS
+    # SCAN ALL COINS
     # ========================================================
 
-    for index, symbol in enumerate(
-        symbols,
-        start=1
-    ):
+    for symbol in symbols:
 
-        data = get_5m_data(
+        data = get_5m_candles(
             symbol
         )
 
@@ -634,9 +648,11 @@ def scan(symbols):
             print(
                 "🔥 CANDIDATE:",
                 symbol,
-                "| PRICE:",
+                "| 3×5M PRICE:",
                 f"{data['price_change']:+.2f}%",
-                "| VOLUME:",
+                "| 3×5M VOLUME:",
+                f"${data['current_volume']:,.0f}",
+                "| MULTIPLIER:",
                 f"{data['volume_multiplier']:.2f}x"
             )
 
@@ -647,7 +663,7 @@ def scan(symbols):
 
 
     # ========================================================
-    # SORT BY SCORE
+    # SORT
     # ========================================================
 
     candidates.sort(
@@ -655,7 +671,7 @@ def scan(symbols):
             x["score"],
             x["price_change"],
             x["volume_multiplier"],
-            x["volume"]
+            x["current_volume"]
         ),
         reverse=True
     )
@@ -680,7 +696,7 @@ def scan(symbols):
 
 
     # ========================================================
-    # SEND ALERTS
+    # SEND TELEGRAM
     # ========================================================
 
     alerts_sent = 0
@@ -700,24 +716,20 @@ def scan(symbols):
             "symbol"
         ]
 
-        volume = data[
-            "volume"
+        price_change = data[
+            "price_change"
         ]
 
-        average_volume = data[
-            "average_volume"
+        current_volume = data[
+            "current_volume"
+        ]
+
+        previous_volume = data[
+            "previous_volume"
         ]
 
         multiplier = data[
             "volume_multiplier"
-        ]
-
-        volume_increase = data[
-            "volume_increase"
-        ]
-
-        price_change = data[
-            "price_change"
         ]
 
         score = data[
@@ -726,53 +738,47 @@ def scan(symbols):
 
 
         # ====================================================
-        # TELEGRAM MESSAGE
+        # MESSAGE
         # ====================================================
 
         message = (
 
-            "🚨 BINANCE 5M MOMENTUM ALERT\n\n"
+            "🚨 BINANCE 3×5M MOMENTUM ALERT\n\n"
 
             f"🪙 Coin: {symbol}\n\n"
 
-            f"📈 5M Price Change: "
+            f"📈 3×5M Ümumi Price Change: "
             f"{price_change:+.2f}%\n\n"
 
-            f"💰 5M Volume: "
-            f"${volume:,.0f}\n"
+            f"💰 3×5M Ümumi Volume: "
+            f"${current_volume:,.0f}\n"
 
-            f"📊 Previous 3×5M Average: "
-            f"${average_volume:,.0f}\n"
+            f"📊 Əvvəlki 3×5M Volume: "
+            f"${previous_volume:,.0f}\n"
 
-            f"🔥 Volume Increase: "
-            f"+${volume_increase:,.0f}\n"
-
-            f"🚀 Volume Multiplier: "
+            f"🔥 Volume Multiplier: "
             f"{multiplier:.2f}x\n\n"
 
             f"⭐ Signal Score: "
             f"{score}\n\n"
 
-            "✅ SIGNAL FILTER:\n"
-            "• Price ≥ +5%\n"
-            "• Volume ≥ $30K\n"
-            "• Volume ≥ 1.5x average\n"
-            "• Volume increase ≥ $15K\n\n"
+            "✅ ŞƏRTLƏR:\n"
 
-            "⚠️ Bu coin üçün yalnız "
-            "1 dəfə alert veriləcək.\n"
+            "• 3 ardıcıl 5M candle\n"
 
-            "Sonradan +20%, +50%, +100% "
-            "qalxsa ikinci alert gəlməyəcək.\n\n"
+            "• Ümumi price change ≥ +5%\n"
+
+            "• Ümumi 3×5M volume ≥ $100K\n"
+
+            "• Volume əvvəlki 3×5M-dən ≥ 1.5x\n\n"
+
+            "⚠️ Eyni coin üçün yalnız "
+            "1 dəfə alert veriləcək.\n\n"
 
             f"🔗 https://www.binance.com/"
             f"en/trade/{symbol}?type=spot"
         )
 
-
-        # ====================================================
-        # SEND TELEGRAM
-        # ====================================================
 
         if send_message(
             message
@@ -790,9 +796,9 @@ def scan(symbols):
                 "| PRICE:",
                 f"{price_change:+.2f}%",
                 "| VOLUME:",
-                f"{multiplier:.2f}x",
-                "| SCORE:",
-                score
+                f"${current_volume:,.0f}",
+                "| MULTIPLIER:",
+                f"{multiplier:.2f}x"
             )
 
 
@@ -828,7 +834,7 @@ def wait_for_next_5m():
 
 
     print(
-        f"⏳ Next 5M scan in "
+        f"⏳ Next 3×5M scan in "
         f"{int(wait_seconds)} seconds..."
     )
 
@@ -845,7 +851,7 @@ def wait_for_next_5m():
 print()
 
 print(
-    "🟢 BINANCE 5M VOLUME + PRICE MOMENTUM BOT"
+    "🟢 BINANCE 3×5M CUMULATIVE MOMENTUM BOT"
 )
 
 print()
@@ -855,27 +861,26 @@ print(
 )
 
 print(
-    "⏱ Scan interval: 5 minutes"
+    "⏱ Scan: Every 5 minutes"
 )
 
 print(
-    "📈 Minimum price change:",
-    f"+{MIN_PRICE_CHANGE}%"
+    "📊 Candle window: 3 completed 5M candles"
 )
 
 print(
-    "💰 Minimum 5M volume:",
-    f"${MIN_5M_VOLUME:,}"
+    "📈 Minimum 3×5M price change:",
+    f"+{MIN_3C_PRICE_CHANGE}%"
 )
 
 print(
-    "🚀 Minimum volume multiplier:",
+    "💰 Minimum 3×5M total volume:",
+    f"${MIN_3C_VOLUME:,}"
+)
+
+print(
+    "🔥 Minimum volume multiplier:",
     f"{MIN_VOLUME_MULTIPLIER}x"
-)
-
-print(
-    "🔥 Minimum volume increase:",
-    f"${MIN_VOLUME_INCREASE:,}"
 )
 
 print(
@@ -886,35 +891,33 @@ print()
 
 
 # ============================================================
-# TELEGRAM START MESSAGE
+# TELEGRAM START
 # ============================================================
 
 send_message(
 
-    "🟢 BINANCE 5M MOMENTUM BOT STARTED\n\n"
+    "🟢 BINANCE 3×5M MOMENTUM BOT STARTED\n\n"
 
-    "🎯 Məqsəd:\n"
-    "Binance Spot-da qiyməti +5% və daha çox "
-    "qalxan və eyni zamanda volume yüklənən "
-    "coinləri tapmaq.\n\n"
+    "🎯 Yeni sistem:\n"
+    "Son 3 ardıcıl tamamlanmış 5M candle "
+    "birlikdə hesablanır.\n\n"
 
-    "📊 Hər 5 dəqiqədən bir yoxlayır.\n\n"
+    "📈 Price:\n"
+    "İlk candle OPEN → üçüncü candle CLOSE\n"
+    "Ümumi dəyişmə ≥ +5%\n\n"
 
-    "🔥 Qaydalar:\n"
-    "• 5M qiymət ≥ +5%\n"
-    "• 5M volume ≥ $30K\n"
-    "• Volume ≥ 1.5x əvvəlki 3×5M orta\n"
-    "• Volume artımı ≥ $15K\n\n"
+    "💰 Volume:\n"
+    "Son 3 candle volume-u BİRLİKDƏ "
+    "hesablanır.\n"
+    "Minimum: $100K\n\n"
 
-    "❌ +1%, +2%, +3%, +4% "
-    "hərəkətlərə alert yoxdur.\n\n"
+    "🔥 Volume müqayisəsi:\n"
+    "Son 3 candle volume-u əvvəlki "
+    "3 candle volume-undan ≥ 1.5x olmalıdır.\n\n"
 
-    "✅ +5% və yuxarı hərəkət edən "
-    "coinlər yoxlanılır.\n\n"
+    "⏱ Hər 5 dəqiqədə yeni 3-lük yoxlanılır.\n\n"
 
-    "⚠️ Eyni coin yalnız 1 dəfə alert.\n"
-    "Sonradan +20%, +50%, +100% "
-    "qalxsa ikinci alert gəlməyəcək.\n\n"
+    "⚠️ Eyni coin yalnız 1 dəfə alert.\n\n"
 
     "🔵 Mənbə: Binance Spot"
 )
@@ -951,5 +954,4 @@ while True:
         )
 
 
-    # Növbəti 5M sərhədini gözlə
     wait_for_next_5m()
