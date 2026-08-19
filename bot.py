@@ -8,10 +8,43 @@ import requests
 import websocket
 
 
+# ============================================================
+# FAST MEME PUMP ALERT
+# ============================================================
+#
+# SON RAZILAŞILMIŞ MƏNTİQ
+#
+# 1) CMC Rank 1-2000
+# 2) Binance Spot USDT
+# 3) 5 dəqiqəlik şam
+# 4) Hədəf: +5%
+# 5) Volume: minimum $50,000 USDT
+#
+# 1-Cİ ŞAM:
+#   - Şam MÜTLƏQ BAĞLANMALIDIR
+#   - Open -> Close hesablanır
+#   - +5% və volume >= $50K olarsa SIGNAL
+#
+# 2-Cİ ŞAM:
+#   - 1-ci şam +5% etməyibsə
+#   - 1-ci şamın bağlanmış faizi yadda saxlanılır
+#   - 2-ci şam canlı izlənir
+#   - 2-ci şamın Open -> LIVE PRICE faizi hesablanır
+#   - 1-ci şam % + 2-ci şam % >= 5% olarsa
+#     2-ci şam BAĞLANMADAN signal
+#
+# TƏKRAR SİQNAL:
+#   - İlk signal qiyməti yadda saxlanılır
+#   - Qiymət həmin qiymətin ALTINA düşməyənə qədər
+#     yeni signal YOXDUR
+#   - Qiymət aşağı düşəndə coin yenidən aktiv olur
+#
+# ============================================================
+
+
 CMC_API_KEY = os.getenv("CMC_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/ws"
@@ -29,31 +62,61 @@ MAX_CANDLES = 10
 
 RECONNECT_SECONDS = 3
 STATUS_INTERVAL = 60
+CMC_REFRESH_SECONDS = 1800
 
+
+# ============================================================
+# GLOBAL DATA
+# ============================================================
 
 coins = {}
 cmc_ranks = {}
 
-history = defaultdict(lambda: deque(maxlen=MAX_CANDLES))
+history = defaultdict(
+    lambda: deque(maxlen=MAX_CANDLES)
+)
 
+# Hər coin üçün:
+#
+# active = yeni signal verməyə icazə var
+# signal_price = son signal qiyməti
+#
+signal_state = {}
+
+# Eyni şam pəncərəsində duplicate signal qarşısı
 alerted_windows = set()
 
 data_lock = threading.RLock()
-alert_lock = threading.Lock()
+signal_lock = threading.Lock()
 
+
+# ============================================================
+# TELEGRAM
+# ============================================================
 
 def send_telegram(text):
+
     if not TELEGRAM_BOT_TOKEN:
-        print("TELEGRAM_BOT_TOKEN MISSING", flush=True)
+        print(
+            "TELEGRAM_BOT_TOKEN MISSING",
+            flush=True,
+        )
         return False
 
     if not TELEGRAM_CHAT_ID:
-        print("TELEGRAM_CHAT_ID MISSING", flush=True)
+        print(
+            "TELEGRAM_CHAT_ID MISSING",
+            flush=True,
+        )
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
 
     try:
+
         response = requests.post(
             url,
             data={
@@ -65,7 +128,12 @@ def send_telegram(text):
         )
 
         if response.status_code == 200:
-            print("TELEGRAM SENT", flush=True)
+
+            print(
+                "TELEGRAM SENT",
+                flush=True,
+            )
+
             return True
 
         print(
@@ -74,21 +142,44 @@ def send_telegram(text):
             response.text[:500],
             flush=True,
         )
+
         return False
 
     except Exception as e:
-        print("TELEGRAM EXCEPTION:", e, flush=True)
+
+        print(
+            "TELEGRAM EXCEPTION:",
+            e,
+            flush=True,
+        )
+
         return False
 
+
+# ============================================================
+# CMC
+# ============================================================
 
 def load_cmc():
+
     if not CMC_API_KEY:
-        print("CMC_API_KEY MISSING", flush=True)
+
+        print(
+            "CMC_API_KEY MISSING",
+            flush=True,
+        )
+
         return False
 
-    print("CMC: LOADING TOP 2000...", flush=True)
+    print(
+        "CMC: LOADING TOP 2000...",
+        flush=True,
+    )
 
-    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+    url = (
+        "https://pro-api.coinmarketcap.com"
+        "/v1/cryptocurrency/listings/latest"
+    )
 
     headers = {
         "X-CMC_PRO_API_KEY": CMC_API_KEY,
@@ -100,10 +191,11 @@ def load_cmc():
         "limit": 2000,
         "convert": "USD",
         "sort": "market_cap",
-        "sort_dir": "desc",
+        "sort_dir": "asc",
     }
 
     try:
+
         response = requests.get(
             url,
             headers=headers,
@@ -113,12 +205,20 @@ def load_cmc():
 
         response.raise_for_status()
 
-        data = response.json().get("data", [])
-
         new_ranks = {}
 
-        for coin in data:
-            symbol = str(coin.get("symbol", "")).upper()
+        for coin in response.json().get(
+            "data",
+            [],
+        ):
+
+            symbol = str(
+                coin.get(
+                    "symbol",
+                    "",
+                )
+            ).upper()
+
             rank = coin.get("cmc_rank")
 
             if not symbol or rank is None:
@@ -126,11 +226,18 @@ def load_cmc():
 
             rank = int(rank)
 
-            if CMC_MIN_RANK <= rank <= CMC_MAX_RANK:
+            if (
+                CMC_MIN_RANK
+                <= rank
+                <= CMC_MAX_RANK
+            ):
+
                 if symbol not in new_ranks:
+
                     new_ranks[symbol] = rank
 
         with data_lock:
+
             cmc_ranks.clear()
             cmc_ranks.update(new_ranks)
 
@@ -143,27 +250,75 @@ def load_cmc():
         return True
 
     except Exception as e:
-        print("CMC ERROR:", e, flush=True)
+
+        print(
+            "CMC ERROR:",
+            e,
+            flush=True,
+        )
+
         return False
 
 
-def load_binance_symbols():
-    print("BINANCE: LOADING USDT SPOT...", flush=True)
+def cmc_refresh_worker():
 
-    url = f"{BINANCE_REST}/api/v3/exchangeInfo"
+    while True:
+
+        time.sleep(
+            CMC_REFRESH_SECONDS
+        )
+
+        if not load_cmc():
+            continue
+
+        with data_lock:
+
+            for symbol, info in coins.items():
+
+                rank = cmc_ranks.get(
+                    info["base"]
+                )
+
+                if rank is not None:
+                    info["rank"] = rank
+
+
+# ============================================================
+# BINANCE SPOT SYMBOLS
+# ============================================================
+
+def load_binance_symbols():
+
+    print(
+        "BINANCE: LOADING USDT SPOT...",
+        flush=True,
+    )
+
+    url = (
+        f"{BINANCE_REST}"
+        "/api/v3/exchangeInfo"
+    )
 
     try:
-        response = requests.get(url, timeout=30)
+
+        response = requests.get(
+            url,
+            timeout=30,
+        )
+
         response.raise_for_status()
 
         data = response.json()
 
-        result = {}
-
         with data_lock:
             ranks = dict(cmc_ranks)
 
-        for item in data.get("symbols", []):
+        result = {}
+
+        for item in data.get(
+            "symbols",
+            [],
+        ):
 
             if item.get("status") != "TRADING":
                 continue
@@ -171,11 +326,24 @@ def load_binance_symbols():
             if item.get("quoteAsset") != "USDT":
                 continue
 
-            if item.get("isSpotTradingAllowed") is False:
+            if item.get(
+                "isSpotTradingAllowed"
+            ) is False:
                 continue
 
-            symbol = str(item.get("symbol", "")).upper()
-            base = str(item.get("baseAsset", "")).upper()
+            symbol = str(
+                item.get(
+                    "symbol",
+                    "",
+                )
+            ).upper()
+
+            base = str(
+                item.get(
+                    "baseAsset",
+                    "",
+                )
+            ).upper()
 
             if not symbol or not base:
                 continue
@@ -185,10 +353,22 @@ def load_binance_symbols():
             if rank is None:
                 continue
 
-            if not (CMC_MIN_RANK <= rank <= CMC_MAX_RANK):
+            if not (
+                CMC_MIN_RANK
+                <= rank
+                <= CMC_MAX_RANK
+            ):
                 continue
 
-            if base.endswith(("UP", "DOWN", "BULL", "BEAR")):
+            # Leveraged tokenləri çıxar
+            if base.endswith(
+                (
+                    "UP",
+                    "DOWN",
+                    "BULL",
+                    "BEAR",
+                )
+            ):
                 continue
 
             result[symbol] = {
@@ -198,31 +378,51 @@ def load_binance_symbols():
             }
 
         with data_lock:
+
             coins.clear()
             coins.update(result)
 
+            for symbol in result:
+
+                signal_state.setdefault(
+                    symbol,
+                    {
+                        "active": True,
+                        "signal_price": None,
+                    },
+                )
+
         print(
-            f"BINANCE USDT SPOT: {len(result)}",
+            f"BINANCE USDT SPOT: "
+            f"{len(result)}",
             flush=True,
         )
 
         print(
-            f"TRACKED COINS: {len(result)}",
+            f"TRACKED COINS: "
+            f"{len(result)}",
             flush=True,
         )
 
         return list(result.keys())
 
     except Exception as e:
+
         print(
             "BINANCE SYMBOL ERROR:",
             e,
             flush=True,
         )
+
         return []
 
 
+# ============================================================
+# CANDLE HELPERS
+# ============================================================
+
 def row_to_candle(row):
+
     return {
         "open_time": int(row[0]),
         "open": float(row[1]),
@@ -237,18 +437,27 @@ def row_to_candle(row):
 
 
 def load_history(symbols):
+
     print(
-        f"BOOTSTRAP START: {len(symbols)} coins",
+        f"BOOTSTRAP START: "
+        f"{len(symbols)} coins",
         flush=True,
     )
 
     ready = 0
 
-    url = f"{BINANCE_REST}/api/v3/klines"
+    url = (
+        f"{BINANCE_REST}"
+        "/api/v3/klines"
+    )
 
-    for index, symbol in enumerate(symbols, start=1):
+    for index, symbol in enumerate(
+        symbols,
+        start=1,
+    ):
 
         try:
+
             response = requests.get(
                 url,
                 params={
@@ -265,37 +474,47 @@ def load_history(symbols):
             rows = response.json()
 
             with data_lock:
+
                 history[symbol].clear()
 
                 for row in rows:
+
                     history[symbol].append(
                         row_to_candle(row)
                     )
 
-            if len(rows) >= 2:
+            if rows:
                 ready += 1
 
             if index % 100 == 0:
+
                 print(
-                    f"BOOTSTRAP: {index}/{len(symbols)}",
+                    f"BOOTSTRAP: "
+                    f"{index}/{len(symbols)}",
                     flush=True,
                 )
 
             time.sleep(0.03)
 
         except Exception as e:
+
             print(
-                f"HISTORY ERROR {symbol}: {e}",
+                f"HISTORY ERROR "
+                f"{symbol}: {e}",
                 flush=True,
             )
 
     print(
-        f"BOOTSTRAP FINISHED HISTORY_READY={ready}",
+        f"BOOTSTRAP FINISHED "
+        f"HISTORY_READY={ready}",
         flush=True,
     )
 
 
-def update_live_candle(symbol, kline):
+def update_live_candle(
+    symbol,
+    kline,
+):
 
     candle = {
         "open_time": int(kline["t"]),
@@ -316,138 +535,580 @@ def update_live_candle(symbol, kline):
 
         candles = history[symbol]
 
-        if candles and candles[-1]["open_time"] == candle["open_time"]:
+        if (
+            candles
+            and candles[-1]["open_time"]
+            == candle["open_time"]
+        ):
+
             candles[-1] = candle
+
         else:
+
             candles.append(candle)
 
 
-def check_rolling_2(symbol):
+# ============================================================
+# PRICE CALCULATION
+# ============================================================
+
+def price_change(
+    start_price,
+    end_price,
+):
+
+    if start_price <= 0:
+        return 0.0
+
+    return (
+        (
+            end_price
+            / start_price
+        ) - 1.0
+    ) * 100.0
+
+
+def candle_closed_percent(candle):
+
+    return price_change(
+        candle["open"],
+        candle["close"],
+    )
+
+
+def candle_live_percent(candle):
+
+    return price_change(
+        candle["open"],
+        candle["close"],
+    )
+
+
+# ============================================================
+# RE-ACTIVATION
+# ============================================================
+
+def update_activation_state(
+    symbol,
+    current_price,
+):
 
     with data_lock:
-        candles = list(history.get(symbol, []))
-        info = coins.get(symbol)
+
+        state = signal_state.setdefault(
+            symbol,
+            {
+                "active": True,
+                "signal_price": None,
+            },
+        )
+
+        last_signal_price = state[
+            "signal_price"
+        ]
+
+        # Coin əvvəl signal veribsə,
+        # yalnız əvvəlki signal qiymətinin ALTINA
+        # düşəndə yenidən aktiv olur.
+
+        if (
+            not state["active"]
+            and last_signal_price is not None
+            and current_price
+            < last_signal_price
+        ):
+
+            state["active"] = True
+
+            print(
+                f"RE-ACTIVATED {symbol}: "
+                f"{current_price:.10g} < "
+                f"{last_signal_price:.10g}",
+                flush=True,
+            )
+
+
+# ============================================================
+# WINDOW ID
+# ============================================================
+
+def make_window_id(
+    symbol,
+    count,
+    candles,
+):
+
+    return (
+        f"{symbol}:"
+        f"{count}:"
+        + ":".join(
+            str(c["open_time"])
+            for c in candles
+        )
+    )
+
+
+# ============================================================
+# SIGNAL CHECK
+# ============================================================
+
+def check_signal(symbol):
+
+    """
+    SON MƏNTİQ:
+
+    1-Cİ ŞAM
+    -------------------------
+    1-ci şam BAĞLANMALIDIR.
+
+    Open -> Close hesablanır.
+
+    Əgər:
+        1-ci şam % >= 5%
+        və
+        1-ci şam volume >= $50K
+
+    SIGNAL.
+
+
+    2-Cİ ŞAM
+    -------------------------
+    Əgər 1-ci şam +5% etməyibsə:
+
+    1-ci şamın BAĞLANMIŞ faizi
+    yadda saxlanılır.
+
+    2-ci şam canlı izlənir.
+
+    2-ci şam:
+        Open -> Current Price
+
+    hesablanır.
+
+    1-ci şam % +
+    2-ci şam canlı %
+
+    >= 5% olarsa
+
+    2-ci şam BAĞLANMADAN SIGNAL.
+
+
+    TƏKRAR SIGNAL
+    -------------------------
+    İlk signal qiyməti yadda qalır.
+
+    Qiymət həmin qiymətin altına
+    düşməyənə qədər yeni signal yoxdur.
+    """
+
+    with data_lock:
+
+        candles = list(
+            history.get(
+                symbol,
+                [],
+            )
+        )
+
+        info = coins.get(
+            symbol
+        )
+
+        state = signal_state.get(
+            symbol,
+            {
+                "active": True,
+                "signal_price": None,
+            },
+        )
 
     if info is None:
         return None
 
-    if len(candles) < 2:
+    if len(candles) < 1:
         return None
 
-    # SON 2 ŞAM
-    c1 = candles[-2]
-    c2 = candles[-1]
-
-    first_open = c1["open"]
-    current_price = c2["close"]
-
-    if first_open <= 0:
+    if not state["active"]:
         return None
 
-    # 2 ŞAM ÜZRƏ ÜMUMİ QİYMƏ ARTIŞI
-    price_change = (
-        (current_price / first_open) - 1.0
-    ) * 100.0
 
-    # 2 ŞAM ÜZRƏ ÜMUMİ VOLUME
-    total_volume = (
-        c1["quote_volume"]
-        + c2["quote_volume"]
+    # ========================================================
+    # 1-Cİ ŞAM
+    # ========================================================
+
+    # Son şam canlıdırsa, bu hələ 1-ci şam
+    # kimi bağlanmış hesab edilmir.
+
+    if len(candles) >= 2:
+
+        first = candles[-2]
+        current = candles[-1]
+
+        # Əgər əvvəlki şam bağlanıbsa,
+        # onu 1-ci şam kimi yoxlayırıq.
+
+        if first["closed"]:
+
+            first_percent = (
+                candle_closed_percent(
+                    first
+                )
+            )
+
+            first_volume = (
+                first["quote_volume"]
+            )
+
+            # ------------------------------------------------
+            # 1-Cİ ŞAM ÖZÜ +5%
+            # ------------------------------------------------
+
+            if (
+                first_percent
+                >= MIN_PRICE_CHANGE
+                and
+                first_volume
+                >= MIN_TOTAL_VOLUME
+            ):
+
+                window = [first]
+
+                window_id = make_window_id(
+                    symbol,
+                    1,
+                    window,
+                )
+
+                with signal_lock:
+
+                    if (
+                        window_id
+                        in alerted_windows
+                    ):
+                        return None
+
+                    alerted_windows.add(
+                        window_id
+                    )
+
+                return {
+                    "symbol": symbol,
+                    "rank": info["rank"],
+
+                    "start_price":
+                        first["open"],
+
+                    "signal_price":
+                        first["close"],
+
+                    "price_change":
+                        first_percent,
+
+                    "first_percent":
+                        first_percent,
+
+                    "second_percent":
+                        None,
+
+                    "volume":
+                        first_volume,
+
+                    "first_volume":
+                        first_volume,
+
+                    "second_volume":
+                        0.0,
+
+                    "candles":
+                        window,
+
+                    "count": 1,
+
+                    "live": False,
+                }
+
+
+            # ------------------------------------------------
+            # 1-Cİ ŞAM + 2-Cİ ŞAM LIVE
+            # ------------------------------------------------
+
+            second_percent = (
+                candle_live_percent(
+                    current
+                )
+            )
+
+            total_percent = (
+                first_percent
+                + second_percent
+            )
+
+            total_volume = (
+                first_volume
+                + current[
+                    "quote_volume"
+                ]
+            )
+
+            if (
+                total_percent
+                >= MIN_PRICE_CHANGE
+                and
+                total_volume
+                >= MIN_TOTAL_VOLUME
+            ):
+
+                window = [
+                    first,
+                    current,
+                ]
+
+                window_id = make_window_id(
+                    symbol,
+                    2,
+                    window,
+                )
+
+                with signal_lock:
+
+                    if (
+                        window_id
+                        in alerted_windows
+                    ):
+                        return None
+
+                    alerted_windows.add(
+                        window_id
+                    )
+
+                return {
+                    "symbol": symbol,
+                    "rank": info["rank"],
+
+                    "start_price":
+                        first["open"],
+
+                    "signal_price":
+                        current["close"],
+
+                    "price_change":
+                        total_percent,
+
+                    "first_percent":
+                        first_percent,
+
+                    "second_percent":
+                        second_percent,
+
+                    "volume":
+                        total_volume,
+
+                    "first_volume":
+                        first_volume,
+
+                    "second_volume":
+                        current[
+                            "quote_volume"
+                        ],
+
+                    "candles":
+                        window,
+
+                    "count": 2,
+
+                    "live":
+                        not current["closed"],
+                }
+
+
+    return None
+
+
+# ============================================================
+# LOCK AFTER SIGNAL
+# ============================================================
+
+def lock_after_signal(
+    symbol,
+    signal_price,
+):
+
+    with data_lock:
+
+        signal_state[symbol] = {
+            "active": False,
+            "signal_price": signal_price,
+        }
+
+    print(
+        f"LOCKED {symbol} "
+        f"@ {signal_price:.10g}",
+        flush=True,
     )
 
-    # ƏSAS ŞƏRTLƏR
-    if price_change < MIN_PRICE_CHANGE:
-        return None
 
-    if total_volume < MIN_TOTAL_VOLUME:
-        return None
-
-    # Eyni 2 şam üçün təkrar siqnal göndərmə
-    window_id = (
-        f"{symbol}:"
-        f"{c1['open_time']}:"
-        f"{c2['open_time']}"
-    )
-
-    with alert_lock:
-
-        if window_id in alerted_windows:
-            return None
-
-        alerted_windows.add(window_id)
-
-    return {
-        "symbol": symbol,
-        "rank": info["rank"],
-        "price": current_price,
-        "price_change": price_change,
-        "volume": total_volume,
-        "window_id": window_id,
-        "c1": c1,
-        "c2": c2,
-    }
-
+# ============================================================
+# SEND SIGNAL
+# ============================================================
 
 def send_signal(signal):
 
-    symbol = signal["symbol"]
-    rank = signal["rank"]
-    price = signal["price"]
-    price_change = signal["price_change"]
-    total_volume = signal["volume"]
+    symbol = signal[
+        "symbol"
+    ]
 
-    c1 = signal["c1"]
-    c2 = signal["c2"]
+    signal_price = signal[
+        "signal_price"
+    ]
 
-    def candle_percent(c):
+    # ƏVVƏL lock et.
+    # Beləliklə Telegram geciksə belə
+    # eyni coin duplicate signal vermir.
 
-        if c["open"] <= 0:
-            return 0.0
+    lock_after_signal(
+        symbol,
+        signal_price,
+    )
 
-        return (
-            (c["close"] / c["open"]) - 1
-        ) * 100
+    first = signal[
+        "candles"
+    ][0]
 
-    p1 = candle_percent(c1)
-    p2 = candle_percent(c2)
+    message_lines = []
 
-    if not c2.get("closed", False):
-        live_status = (
-            "🟢 LIVE / 2-ci şam hələ bağlanmayıb"
+    message_lines.append(
+        "🚨 PUMP SIGNAL"
+    )
+
+    message_lines.append("")
+
+    message_lines.append(
+        f"🪙 {symbol}"
+    )
+
+    message_lines.append(
+        f"🏆 CMC Rank: "
+        f"#{signal['rank']}"
+    )
+
+    message_lines.append("")
+
+    # ========================================================
+    # 1-Cİ ŞAM
+    # ========================================================
+
+    message_lines.append(
+        "🕯️ 1-ci şam"
+    )
+
+    message_lines.append(
+        f"Open: "
+        f"{first['open']:.10g}"
+    )
+
+    message_lines.append(
+        f"Close: "
+        f"{first['close']:.10g}"
+    )
+
+    message_lines.append(
+        f"📈 Artım: "
+        f"{signal['first_percent']:+.2f}%"
+    )
+
+    message_lines.append(
+        f"💰 Volume: "
+        f"${signal['first_volume']:,.0f}"
+    )
+
+    # ========================================================
+    # 2-Cİ ŞAM
+    # ========================================================
+
+    if signal["count"] == 2:
+
+        second = signal[
+            "candles"
+        ][1]
+
+        message_lines.append("")
+
+        message_lines.append(
+            "🕯️ 2-ci şam LIVE"
         )
+
+        message_lines.append(
+            f"Open: "
+            f"{second['open']:.10g}"
+        )
+
+        message_lines.append(
+            f"Siqnal qiyməti: "
+            f"{second['close']:.10g}"
+        )
+
+        message_lines.append(
+            f"📈 2-ci şam artımı: "
+            f"{signal['second_percent']:+.2f}%"
+        )
+
+        message_lines.append(
+            f"💰 2-ci şam Volume: "
+            f"${signal['second_volume']:,.0f}"
+        )
+
+        message_lines.append(
+            "🟢 2-ci şam hələ bağlanmayıb"
+        )
+
     else:
-        live_status = (
-            "🔵 2-ci şam bağlanıb"
+
+        message_lines.append("")
+
+        message_lines.append(
+            "🔵 1-ci şam bağlanıb"
         )
 
-    message = (
-        "🚨 PUMP SIGNAL\n\n"
+    message_lines.append("")
 
-        f"🪙 {symbol}\n"
-        f"🏆 CMC Rank: #{rank}\n\n"
+    message_lines.append(
+        f"📊 ÜMUMİ artım: "
+        f"+{signal['price_change']:.2f}%"
+    )
 
-        f"📈 2×5M ÜMUMİ: "
-        f"+{price_change:.2f}%\n"
+    message_lines.append(
+        f"💵 ÜMUMİ Volume: "
+        f"${signal['volume']:,.0f}"
+    )
 
-        f"💰 2×5M ÜMUMİ VOLUME: "
-        f"${total_volume:,.0f}\n\n"
+    message_lines.append("")
 
-        f"🕯️ 1-ci şam: "
-        f"{p1:+.2f}%\n"
+    message_lines.append(
+        f"🔒 Siqnal/referans qiyməti: "
+        f"{signal_price:.10g}"
+    )
 
-        f"🕯️ 2-ci şam: "
-        f"{p2:+.2f}%\n\n"
+    message_lines.append(
+        "🔓 Yeni signal üçün qiymət "
+        "bu qiymətin ALTINA düşməlidir."
+    )
 
-        f"💵 Cari qiymət: "
-        f"{price:.10g}\n\n"
+    message_lines.append("")
 
-        f"{live_status}\n"
+    message_lines.append(
+        "📊 Binance Spot"
+    )
 
-        "⚡ Rolling 2×5M\n"
-        "📊 Binance Spot\n"
+    message_lines.append(
+        "⏱️ 5 dəqiqə"
+    )
 
-        "🎯 Şərt: "
-        "≥5% + ≥$50K"
+    message_lines.append(
+        "🎯 Şərt: ≥5% + ≥$50K"
+    )
+
+    message = "\n".join(
+        message_lines
     )
 
     print(
@@ -465,15 +1126,64 @@ def send_signal(signal):
         flush=True,
     )
 
-    send_telegram(message)
+    send_telegram(
+        message
+    )
 
 
-def process_signal_immediately(symbol):
+# ============================================================
+# PROCESS LIVE UPDATE
+# ============================================================
 
-    signal = check_rolling_2(symbol)
+def process_live_update(
+    symbol,
+):
+
+    with data_lock:
+
+        candles = list(
+            history.get(
+                symbol,
+                [],
+            )
+        )
+
+    if not candles:
+        return
+
+    current_price = candles[
+        -1
+    ]["close"]
+
+    # Əvvəlki signal qiymətinin altına düşübsə
+    # coin yenidən aktiv olur.
+
+    update_activation_state(
+        symbol,
+        current_price,
+    )
+
+    with data_lock:
+
+        state = signal_state.get(
+            symbol,
+            {
+                "active": True,
+                "signal_price": None,
+            },
+        )
+
+    if not state["active"]:
+        return
+
+    signal = check_signal(
+        symbol
+    )
 
     if signal is None:
         return
+
+    # Telegram request WebSocket-i bloklamasın.
 
     threading.Thread(
         target=send_signal,
@@ -482,11 +1192,20 @@ def process_signal_immediately(symbol):
     ).start()
 
 
-def websocket_message(ws, message):
+# ============================================================
+# WEBSOCKET MESSAGE
+# ============================================================
+
+def websocket_message(
+    ws,
+    message,
+):
 
     try:
 
-        payload = json.loads(message)
+        payload = json.loads(
+            message
+        )
 
         data = payload.get(
             "data",
@@ -496,13 +1215,18 @@ def websocket_message(ws, message):
         if data.get("e") != "kline":
             return
 
-        kline = data.get("k")
+        kline = data.get(
+            "k"
+        )
 
         if not kline:
             return
 
         symbol = str(
-            kline.get("s", "")
+            kline.get(
+                "s",
+                "",
+            )
         ).upper()
 
         if not symbol:
@@ -513,8 +1237,15 @@ def websocket_message(ws, message):
             kline,
         )
 
-        # HƏR CANLI UPDATE-DƏ 2 ŞAM YOXLANIR
-        process_signal_immediately(
+        # Hər canlı update-də yoxlayırıq.
+        #
+        # 1-ci şam:
+        # yalnız bağlanmış şam kimi yoxlanır.
+        #
+        # 2-ci şam:
+        # canlı qiymətlə yoxlanır.
+
+        process_live_update(
             symbol
         )
 
@@ -527,6 +1258,10 @@ def websocket_message(ws, message):
         )
 
 
+# ============================================================
+# WEBSOCKET OPEN
+# ============================================================
+
 def websocket_open(
     ws,
     worker_id,
@@ -535,13 +1270,14 @@ def websocket_open(
 
     print(
         f"WS {worker_id}: "
-        f"CONNECTED ({len(symbols)} streams)",
+        f"CONNECTED "
+        f"({len(symbols)} streams)",
         flush=True,
     )
 
     streams = [
-        f"{s.lower()}@kline_5m"
-        for s in symbols
+        f"{symbol.lower()}@kline_5m"
+        for symbol in symbols
     ]
 
     ws.send(
@@ -556,10 +1292,31 @@ def websocket_open(
 
     print(
         f"WS {worker_id}: "
-        f"LIVE 5M STREAMS ACTIVE",
+        "LIVE 5M STREAMS ACTIVE",
         flush=True,
     )
 
+
+# ============================================================
+# WEBSOCKET ERROR
+# ============================================================
+
+def websocket_error(
+    ws,
+    error,
+    worker_id,
+):
+
+    print(
+        f"WS {worker_id}: "
+        f"ERROR {error}",
+        flush=True,
+    )
+
+
+# ============================================================
+# WEBSOCKET CLOSE
+# ============================================================
 
 def websocket_close(
     ws,
@@ -570,23 +1327,16 @@ def websocket_close(
 
     print(
         f"WS {worker_id}: "
-        f"CLOSED code={code} "
+        f"CLOSED "
+        f"code={code} "
         f"message={message}",
         flush=True,
     )
 
 
-def websocket_error(
-    ws,
-    error,
-    worker_id,
-):
-
-    print(
-        f"WS {worker_id}: ERROR {error}",
-        flush=True,
-    )
-
+# ============================================================
+# WEBSOCKET WORKER
+# ============================================================
 
 def websocket_worker(
     symbols,
@@ -614,7 +1364,8 @@ def websocket_worker(
                         symbols,
                     ),
 
-                on_message=websocket_message,
+                on_message=
+                    websocket_message,
 
                 on_error=lambda ws, error:
                     websocket_error(
@@ -623,7 +1374,9 @@ def websocket_worker(
                         worker_id,
                     ),
 
-                on_close=lambda ws, code, message:
+                on_close=lambda ws,
+                    code,
+                    message:
                     websocket_close(
                         ws,
                         code,
@@ -657,7 +1410,13 @@ def websocket_worker(
         )
 
 
-def start_websockets(symbols):
+# ============================================================
+# START WEBSOCKETS
+# ============================================================
+
+def start_websockets(
+    symbols,
+):
 
     chunks = [
         symbols[i:i + WS_CHUNK_SIZE]
@@ -679,36 +1438,43 @@ def start_websockets(symbols):
         start=1,
     ):
 
-        threading.Thread(
+        thread = threading.Thread(
             target=websocket_worker,
             args=(
                 chunk,
                 worker_id,
             ),
             daemon=True,
-        ).start()
+        )
+
+        thread.start()
 
         time.sleep(1)
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
 
     print(
-        "\n========================================\n"
-        "       FAST MEME PUMP ALERT STARTING\n"
+        "\n"
+        "========================================\n"
+        "        FAST MEME PUMP ALERT\n"
         "========================================",
         flush=True,
     )
 
     print(
-        f"CMC RANK: "
-        f"{CMC_MIN_RANK}-{CMC_MAX_RANK}",
+        "MODE: CLOSED 1-CANDLE + LIVE 2-CANDLE",
         flush=True,
     )
 
     print(
-        f"ROLLING WINDOW: "
-        f"2 x {INTERVAL}",
+        f"CMC RANK: "
+        f"{CMC_MIN_RANK}-"
+        f"{CMC_MAX_RANK}",
         flush=True,
     )
 
@@ -719,28 +1485,45 @@ def main():
     )
 
     print(
-        f"MIN TOTAL USDT VOLUME: "
+        f"MIN USDT VOLUME: "
         f"${MIN_TOTAL_VOLUME:,.0f}",
         flush=True,
     )
 
     print(
-        "MAX PRICE LIMIT: NONE",
+        "1-CANDLE: OPEN -> CLOSE",
         flush=True,
     )
 
     print(
-        "LIVE 2ND CANDLE: ENABLED",
+        "2-CANDLE: "
+        "1ST CLOSED % + 2ND LIVE %",
         flush=True,
     )
 
     print(
-        "SCAN DELAY: NONE",
+        "2ND CANDLE CLOSE WAIT: NO",
         flush=True,
     )
 
     print(
-        "WEBSOCKET MODE: SUBSCRIBE",
+        "HIGH PRICE CALCULATION: NO",
+        flush=True,
+    )
+
+    print(
+        "LOW PRICE CALCULATION: NO",
+        flush=True,
+    )
+
+    print(
+        "RE-SIGNAL: "
+        "ONLY AFTER PRICE < LAST SIGNAL PRICE",
+        flush=True,
+    )
+
+    print(
+        "3-CANDLE MODE: DISABLED",
         flush=True,
     )
 
@@ -752,12 +1535,28 @@ def main():
     send_telegram(
         "✅ FAST MEME PUMP ALERT STARTED\n\n"
 
-        "Telegram bağlantısı işləyir.\n"
+        "🕯️ 1-ci şam yalnız bağlanandan "
+        "sonra hesablanır.\n"
 
-        "Rolling 2×5M LIVE scanner aktivdir.\n"
+        "📈 Open → Close ≥5% "
+        "və Volume ≥$50K.\n\n"
 
-        "2-ci şam bağlanmadan canlı yoxlanılır."
+        "🕯️ 1-ci şam alınmasa, "
+        "2-ci şam canlı izlənir.\n"
+
+        "📈 1-ci şam % + "
+        "2-ci şam canlı % ≥5% "
+        "olarsa dərhal signal.\n\n"
+
+        "🔒 İlk signal qiyməti yadda qalır.\n"
+
+        "🔓 Qiymət onun altına düşməyənə "
+        "qədər təkrar signal yoxdur."
     )
+
+    # --------------------------------------------------------
+    # CMC
+    # --------------------------------------------------------
 
     if not load_cmc():
 
@@ -767,6 +1566,10 @@ def main():
         )
 
         return
+
+    # --------------------------------------------------------
+    # BINANCE
+    # --------------------------------------------------------
 
     symbols = load_binance_symbols()
 
@@ -779,15 +1582,42 @@ def main():
 
         return
 
-    load_history(symbols)
+    # --------------------------------------------------------
+    # HISTORY
+    # --------------------------------------------------------
 
-    start_websockets(symbols)
+    load_history(
+        symbols
+    )
+
+    # --------------------------------------------------------
+    # CMC REFRESH
+    # --------------------------------------------------------
+
+    threading.Thread(
+        target=cmc_refresh_worker,
+        daemon=True,
+    ).start()
+
+    # --------------------------------------------------------
+    # WEBSOCKETS
+    # --------------------------------------------------------
+
+    start_websockets(
+        symbols
+    )
+
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
 
     while True:
 
         with data_lock:
 
-            tracked_count = len(coins)
+            tracked = len(
+                coins
+            )
 
             history_ready = sum(
                 1
@@ -797,20 +1627,27 @@ def main():
                         symbol,
                         [],
                     )
-                ) >= 2
+                ) >= 1
             )
 
-        with alert_lock:
-            alert_count = len(
-                alerted_windows
+            active = sum(
+                1
+                for symbol in coins
+                if signal_state.get(
+                    symbol,
+                    {
+                        "active": True
+                    },
+                )["active"]
             )
 
         print(
             f"STATUS | "
-            f"TRACKED={tracked_count} | "
-            f"HISTORY_READY={history_ready} | "
-            f"ROLLING=2-CANDLE LIVE | "
-            f"ALERTS={alert_count}",
+            f"TRACKED={tracked} | "
+            f"HISTORY_READY="
+            f"{history_ready} | "
+            f"ACTIVE={active} | "
+            f"MODE=CLOSED1+LIVE2",
             flush=True,
         )
 
@@ -818,6 +1655,10 @@ def main():
             STATUS_INTERVAL
         )
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     main()
