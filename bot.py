@@ -9,35 +9,49 @@ import websocket
 
 
 # ============================================================
-# FAST MEME PUMP ALERT
+# FAST MEME PUMP ALERT + 15M BREAKOUT ALERT
 # ============================================================
 #
-# ŞƏRTLƏR
-#
+# PUMP SİSTEMİ
+# ------------------------------------------------------------
 # CMC Rank: 1 - 2000
-# Binance: Spot USDT
-# Şam: 5 dəqiqə
-# Hədəf: +5%
-# Minimum volume: $50,000
+# Binance Spot USDT
+# 5 dəqiqəlik şam
 #
-# 1-Cİ ŞAM:
-#   - MÜTLƏQ BAĞLANMALIDIR
-#   - Open -> Close hesablanır
-#   - >= +5% və volume >= $50K olarsa SIGNAL
+# 1-ci şam:
+#   Open -> Close >= +5%
+#   Volume >= $50K
 #
-# 2-Cİ ŞAM:
-#   - 1-ci şam +5% etməyibsə
-#   - 1-ci şamın bağlanmış faizi saxlanılır
-#   - 2-ci şam canlı izlənir
-#   - 2-ci şam Open -> LIVE PRICE hesablanır
-#   - 1-ci % + 2-ci canlı % >= +5%
-#     olarsa 2-ci şam bağlanmadan SIGNAL
+# 2-ci şam:
+#   1-ci bağlanmış şamın % +
+#   2-ci canlı şamın %
+#   >= +5%
 #
-# TƏKRAR SIGNAL:
-#   - İlk signal qiyməti yadda saxlanılır
-#   - Qiymət həmin qiymətin ALTINA düşməyənə qədər
-#     yeni signal verilmir
-#   - Qiymət altına düşəndə coin yenidən aktiv olur
+#
+# BREAKOUT SİSTEMİ
+# ------------------------------------------------------------
+# Tamamilə ayrıca işləyir.
+#
+# Timeframe: 15 dəqiqə
+#
+# Son təsdiqlənmiş lokal təpə / müqavimət tapılır.
+#
+# Breakout:
+#
+#   Current Price >= Resistance * 1.01
+#
+# yəni müqavimətin üzərində +1%.
+#
+# Breakout üçün:
+#   - +5% lazım deyil
+#   - $50K volume lazım deyil
+#   - Pump signal lock nəzərə alınmır
+#
+# Eyni resistance üçün yalnız 1 breakout signal.
+#
+# Yeni daha yüksək resistance yaranırsa
+# və onun üzərində +1% qalxırsa,
+# həmin coin üçün yenidən breakout signal gəlir.
 #
 # ============================================================
 
@@ -49,22 +63,74 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/ws"
 
-INTERVAL = "5m"
+
+# ============================================================
+# TIMEFRAMES
+# ============================================================
+
+PUMP_INTERVAL = "5m"
+BREAKOUT_INTERVAL = "15m"
+
+
+# ============================================================
+# CMC
+# ============================================================
 
 CMC_MIN_RANK = 1
 CMC_MAX_RANK = 2000
 
+
+# ============================================================
+# PUMP CONDITIONS
+# ============================================================
+
 MIN_PRICE_CHANGE = 5.0
 MIN_TOTAL_VOLUME = 50_000.0
 
+
+# ============================================================
+# BREAKOUT CONDITIONS
+# ============================================================
+
+# Resistance-in neçə faiz üstündə qalxmalıdır?
+BREAKOUT_PERCENT = 1.0
+
+# 15M lokal təpənin təsdiqi:
+#
+# əvvəlki 15M şamın high-ından böyük
+# və sonrakı 15M şamın high-ından böyük.
+#
+# Burada 20/25 şamlıq limit YOXDUR.
+PIVOT_LEFT = 1
+PIVOT_RIGHT = 1
+
+
+# ============================================================
+# WEBSOCKET
+# ============================================================
+
 WS_CHUNK_SIZE = 100
-MAX_CANDLES = 10
 
 RECONNECT_SECONDS = 3
 STATUS_INTERVAL = 60
 
-# CMC-ni hər 30 dəqiqədən bir yenilə
 CMC_REFRESH_SECONDS = 1800
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+MAX_PUMP_CANDLES = 10
+
+# 15M üçün kifayət qədər tarix saxlanılır.
+#
+# Bu "son 20/25 şamda axtar" qaydası deyil.
+#
+# Burada məqsəd:
+# Binance-dən gələn son böyük tarix daxilində
+# son təsdiqlənmiş təpəni tapmaqdır.
+MAX_BREAKOUT_CANDLES = 1000
 
 
 # ============================================================
@@ -74,24 +140,56 @@ CMC_REFRESH_SECONDS = 1800
 coins = {}
 cmc_ranks = {}
 
-history = defaultdict(
-    lambda: deque(maxlen=MAX_CANDLES)
+
+# 5M pump history
+pump_history = defaultdict(
+    lambda: deque(
+        maxlen=MAX_PUMP_CANDLES
+    )
 )
 
-# Coin-in təkrar signal vəziyyəti
-#
-# {
-#   "active": True/False,
-#   "signal_price": float
-# }
-#
+
+# 15M breakout history
+breakout_history = defaultdict(
+    lambda: deque(
+        maxlen=MAX_BREAKOUT_CANDLES
+    )
+)
+
+
+# ============================================================
+# PUMP SIGNAL STATE
+# ============================================================
+
 signal_state = {}
 
-# Eyni şamda duplicate signal qarşısı
+
+# ============================================================
+# BREAKOUT STATE
+# ============================================================
+#
+# Hər coin üçün son işlənmiş resistance saxlanılır.
+#
+# {
+#   "resistance": float,
+#   "signal_sent": True/False,
+#   "pivot_time": int
+# }
+#
+breakout_state = {}
+
+
+# ============================================================
+# SIGNAL LOCKS
+# ============================================================
+
 alerted_windows = set()
+
+breakout_alerted_levels = set()
 
 data_lock = threading.RLock()
 signal_lock = threading.Lock()
+breakout_lock = threading.Lock()
 
 
 # ============================================================
@@ -101,17 +199,21 @@ signal_lock = threading.Lock()
 def send_telegram(text):
 
     if not TELEGRAM_BOT_TOKEN:
+
         print(
             "TELEGRAM_BOT_TOKEN MISSING",
             flush=True
         )
+
         return False
 
     if not TELEGRAM_CHAT_ID:
+
         print(
             "TELEGRAM_CHAT_ID MISSING",
             flush=True
         )
+
         return False
 
     url = (
@@ -211,10 +313,6 @@ def load_cmc():
             flush=True
         )
 
-        # ----------------------------------------------------
-        # CMC HTTP ERROR
-        # ----------------------------------------------------
-
         if response.status_code != 200:
 
             print(
@@ -226,10 +324,6 @@ def load_cmc():
             return False
 
         result = response.json()
-
-        # ----------------------------------------------------
-        # CMC STATUS ERROR
-        # ----------------------------------------------------
 
         status = result.get(
             "status",
@@ -269,10 +363,6 @@ def load_cmc():
             flush=True
         )
 
-        # ----------------------------------------------------
-        # CMC RANK MAP
-        # ----------------------------------------------------
-
         new_ranks = {}
 
         for coin in data:
@@ -306,15 +396,11 @@ def load_cmc():
             ):
                 continue
 
-            # Eyni symbol CMC-də bir neçə dəfə
-            # görünsə ilkini saxla.
             if symbol not in new_ranks:
 
-                new_ranks[symbol] = rank
-
-        # ----------------------------------------------------
-        # Əgər 0 gəlirsə ətraflı debug
-        # ----------------------------------------------------
+                new_ranks[
+                    symbol
+                ] = rank
 
         if len(new_ranks) == 0:
 
@@ -323,18 +409,6 @@ def load_cmc():
                 "AMMA RANK MAP 0 OLDU.",
                 flush=True
             )
-
-            if data:
-
-                print(
-                    "CMC FIRST COIN:",
-                    json.dumps(
-                        data[0],
-                        indent=2,
-                        ensure_ascii=False
-                    )[:3000],
-                    flush=True
-                )
 
             return False
 
@@ -352,17 +426,6 @@ def load_cmc():
             f"(RANK "
             f"{CMC_MIN_RANK}-"
             f"{CMC_MAX_RANK})",
-            flush=True
-        )
-
-        # İlk 10 coin debug üçün
-        sample = list(
-            new_ranks.items()
-        )[:10]
-
-        print(
-            "CMC SAMPLE:",
-            sample,
             flush=True
         )
 
@@ -417,8 +480,6 @@ def cmc_refresh_worker():
 
         if load_cmc():
 
-            # CMC rank dəyişdikdə Binance siyahısını
-            # da yenidən qururuq.
             load_binance_symbols()
 
 
@@ -469,12 +530,6 @@ def load_binance_symbols():
                 cmc_ranks
             )
 
-        print(
-            f"CMC RANK MAP: "
-            f"{len(ranks)}",
-            flush=True
-        )
-
         result = {}
 
         for item in data.get(
@@ -482,19 +537,16 @@ def load_binance_symbols():
             []
         ):
 
-            # Yalnız TRADING
             if item.get(
                 "status"
             ) != "TRADING":
                 continue
 
-            # Yalnız USDT
             if item.get(
                 "quoteAsset"
             ) != "USDT":
                 continue
 
-            # Yalnız Spot
             if (
                 item.get(
                     "isSpotTradingAllowed"
@@ -534,7 +586,6 @@ def load_binance_symbols():
             ):
                 continue
 
-            # Leveraged tokenlər olmasın
             if base.endswith(
                 (
                     "UP",
@@ -559,7 +610,6 @@ def load_binance_symbols():
                 result
             )
 
-            # Yeni coinlər üçün state
             for symbol in result:
 
                 if symbol not in signal_state:
@@ -569,6 +619,16 @@ def load_binance_symbols():
                     ] = {
                         "active": True,
                         "signal_price": None,
+                    }
+
+                if symbol not in breakout_state:
+
+                    breakout_state[
+                        symbol
+                    ] = {
+                        "resistance": None,
+                        "signal_sent": False,
+                        "pivot_time": None,
                     }
 
         print(
@@ -582,53 +642,6 @@ def load_binance_symbols():
             f"{len(result)}",
             flush=True
         )
-
-        if not result:
-
-            print(
-                "❌ NO TRACKED COINS",
-                flush=True
-            )
-
-            print(
-                "CMC RANKS AVAILABLE:",
-                len(ranks),
-                flush=True
-            )
-
-            # Debug üçün Binance-dən ilk bir neçə
-            # USDT symbol göstər
-            usdt_examples = []
-
-            for item in data.get(
-                "symbols",
-                []
-            ):
-
-                if (
-                    item.get("status")
-                    == "TRADING"
-                    and
-                    item.get("quoteAsset")
-                    == "USDT"
-                ):
-
-                    usdt_examples.append(
-                        item.get(
-                            "symbol"
-                        )
-                    )
-
-                    if len(
-                        usdt_examples
-                    ) >= 10:
-                        break
-
-            print(
-                "BINANCE USDT EXAMPLES:",
-                usdt_examples,
-                flush=True
-            )
 
         return list(
             result.keys()
@@ -646,7 +659,7 @@ def load_binance_symbols():
 
 
 # ============================================================
-# CANDLE
+# CANDLE CONVERSION
 # ============================================================
 
 def row_to_candle(row):
@@ -689,23 +702,23 @@ def row_to_candle(row):
 
 
 # ============================================================
-# HISTORY
+# LOAD 5M HISTORY
 # ============================================================
 
-def load_history(symbols):
+def load_pump_history(symbols):
 
     print(
-        f"BOOTSTRAP START: "
+        f"5M BOOTSTRAP START: "
         f"{len(symbols)} coins",
         flush=True
     )
-
-    ready = 0
 
     url = (
         f"{BINANCE_REST}"
         "/api/v3/klines"
     )
+
+    ready = 0
 
     for index, symbol in enumerate(
         symbols,
@@ -718,27 +731,26 @@ def load_history(symbols):
                 url,
                 params={
                     "symbol": symbol,
-                    "interval": INTERVAL,
+                    "interval": PUMP_INTERVAL,
                     "limit": 5,
                 },
                 timeout=10
             )
 
             if response.status_code != 200:
-
                 continue
 
             rows = response.json()
 
             with data_lock:
 
-                history[
+                pump_history[
                     symbol
                 ].clear()
 
                 for row in rows:
 
-                    history[
+                    pump_history[
                         symbol
                     ].append(
                         row_to_candle(
@@ -752,7 +764,7 @@ def load_history(symbols):
             if index % 100 == 0:
 
                 print(
-                    f"BOOTSTRAP: "
+                    f"5M BOOTSTRAP: "
                     f"{index}/"
                     f"{len(symbols)}",
                     flush=True
@@ -765,26 +777,116 @@ def load_history(symbols):
         except Exception as e:
 
             print(
-                f"HISTORY ERROR "
+                f"5M HISTORY ERROR "
                 f"{symbol}: "
                 f"{repr(e)}",
                 flush=True
             )
 
     print(
-        f"BOOTSTRAP FINISHED "
+        f"5M BOOTSTRAP FINISHED "
         f"HISTORY_READY={ready}",
         flush=True
     )
 
 
 # ============================================================
-# LIVE CANDLE UPDATE
+# LOAD 15M BREAKOUT HISTORY
+# ============================================================
+
+def load_breakout_history(symbols):
+
+    print(
+        f"15M BREAKOUT BOOTSTRAP START: "
+        f"{len(symbols)} coins",
+        flush=True
+    )
+
+    url = (
+        f"{BINANCE_REST}"
+        "/api/v3/klines"
+    )
+
+    ready = 0
+
+    for index, symbol in enumerate(
+        symbols,
+        start=1
+    ):
+
+        try:
+
+            response = requests.get(
+                url,
+                params={
+                    "symbol": symbol,
+                    "interval": BREAKOUT_INTERVAL,
+                    "limit": MAX_BREAKOUT_CANDLES,
+                },
+                timeout=15
+            )
+
+            if response.status_code != 200:
+                continue
+
+            rows = response.json()
+
+            with data_lock:
+
+                breakout_history[
+                    symbol
+                ].clear()
+
+                for row in rows:
+
+                    breakout_history[
+                        symbol
+                    ].append(
+                        row_to_candle(
+                            row
+                        )
+                    )
+
+            if rows:
+                ready += 1
+
+            if index % 50 == 0:
+
+                print(
+                    f"15M BREAKOUT BOOTSTRAP: "
+                    f"{index}/"
+                    f"{len(symbols)}",
+                    flush=True
+                )
+
+            time.sleep(
+                0.05
+            )
+
+        except Exception as e:
+
+            print(
+                f"15M HISTORY ERROR "
+                f"{symbol}: "
+                f"{repr(e)}",
+                flush=True
+            )
+
+    print(
+        f"15M BREAKOUT BOOTSTRAP FINISHED "
+        f"HISTORY_READY={ready}",
+        flush=True
+    )
+
+
+# ============================================================
+# UPDATE LIVE CANDLE
 # ============================================================
 
 def update_live_candle(
     symbol,
-    kline
+    kline,
+    timeframe
 ):
 
     candle = {
@@ -830,9 +932,17 @@ def update_live_candle(
         if symbol not in coins:
             return
 
-        candles = history[
-            symbol
-        ]
+        if timeframe == PUMP_INTERVAL:
+
+            candles = pump_history[
+                symbol
+            ]
+
+        else:
+
+            candles = breakout_history[
+                symbol
+            ]
 
         if (
             candles
@@ -865,7 +975,6 @@ def price_change(
 ):
 
     if start_price <= 0:
-
         return 0.0
 
     return (
@@ -898,7 +1007,7 @@ def candle_live_percent(
 
 
 # ============================================================
-# RE-ACTIVATE
+# PUMP RE-ACTIVATE
 # ============================================================
 
 def update_activation_state(
@@ -934,7 +1043,7 @@ def update_activation_state(
             ] = True
 
             print(
-                f"🔓 RE-ACTIVATED "
+                f"🔓 PUMP RE-ACTIVATED "
                 f"{symbol}: "
                 f"{current_price:.10g} < "
                 f"{last_signal_price:.10g}",
@@ -943,7 +1052,7 @@ def update_activation_state(
 
 
 # ============================================================
-# WINDOW ID
+# PUMP WINDOW
 # ============================================================
 
 def make_window_id(
@@ -966,17 +1075,17 @@ def make_window_id(
 
 
 # ============================================================
-# CHECK SIGNAL
+# PUMP SIGNAL CHECK
 # ============================================================
 
-def check_signal(
+def check_pump_signal(
     symbol
 ):
 
     with data_lock:
 
         candles = list(
-            history.get(
+            pump_history.get(
                 symbol,
                 []
             )
@@ -990,7 +1099,7 @@ def check_signal(
             symbol,
             {
                 "active": True,
-                "signal_price": None,
+                "signal_price": None
             }
         )
 
@@ -1000,25 +1109,12 @@ def check_signal(
     if not candles:
         return None
 
-    # Coin lock-dadırsa
     if not state["active"]:
         return None
 
 
     # ========================================================
-    # 1-Cİ ŞAM BAĞLANIBSA
-    # ========================================================
-
-    #
-    # Əgər son şam LIVE-dırsa:
-    #
-    # candles[-2] = 1-ci bağlanmış şam
-    # candles[-1] = 2-ci canlı şam
-    #
-    # Əgər son şam bağlanıbsa:
-    #
-    # candles[-1] = bağlanmış şam
-    #
+    # 1-Cİ + 2-Cİ ŞAM
     # ========================================================
 
     if len(candles) >= 2:
@@ -1043,8 +1139,9 @@ def check_signal(
                 first["quote_volume"]
             )
 
+
             # ------------------------------------------------
-            # 1-Cİ ŞAMDA DƏRHAL SIGNAL
+            # 1-Cİ ŞAMDA SIGNAL
             # ------------------------------------------------
 
             if (
@@ -1079,6 +1176,9 @@ def check_signal(
                     )
 
                 return {
+                    "type":
+                        "PUMP",
+
                     "symbol":
                         symbol,
 
@@ -1149,17 +1249,6 @@ def check_signal(
                 second_volume
             )
 
-            # Burada əsas şərt:
-            #
-            # 1-ci bağlanmış şam %
-            # +
-            # 2-ci canlı şam %
-            #
-            # >= 5%
-            #
-            # Volume >= $50K
-            #
-
             if (
                 total_percent
                 >= MIN_PRICE_CHANGE
@@ -1193,6 +1282,9 @@ def check_signal(
                     )
 
                 return {
+                    "type":
+                        "PUMP",
+
                     "symbol":
                         symbol,
 
@@ -1244,7 +1336,7 @@ def check_signal(
 
 
     # ========================================================
-    # YALNIZ 1 BAĞLANMIŞ ŞAM VARSA
+    # YALNIZ 1 ŞAM
     # ========================================================
 
     if len(candles) == 1:
@@ -1296,6 +1388,9 @@ def check_signal(
                 )
 
             return {
+                "type":
+                    "PUMP",
+
                 "symbol":
                     symbol,
 
@@ -1343,7 +1438,7 @@ def check_signal(
 
 
 # ============================================================
-# LOCK
+# PUMP LOCK
 # ============================================================
 
 def lock_after_signal(
@@ -1362,7 +1457,7 @@ def lock_after_signal(
         }
 
     print(
-        f"🔒 LOCKED "
+        f"🔒 PUMP LOCKED "
         f"{symbol} @ "
         f"{signal_price:.10g}",
         flush=True
@@ -1370,10 +1465,10 @@ def lock_after_signal(
 
 
 # ============================================================
-# SEND SIGNAL
+# SEND PUMP SIGNAL
 # ============================================================
 
-def send_signal(
+def send_pump_signal(
     signal
 ):
 
@@ -1384,11 +1479,6 @@ def send_signal(
     signal_price = signal[
         "signal_price"
     ]
-
-    # İlk olaraq coin-i lock edirik.
-    #
-    # Telegram geciksə belə duplicate signal
-    # çıxmayacaq.
 
     lock_after_signal(
         symbol,
@@ -1414,10 +1504,6 @@ def send_signal(
 
     message.append("")
 
-    # ========================================================
-    # 1-Cİ ŞAM
-    # ========================================================
-
     message.append(
         "🕯️ 1-ci şam"
     )
@@ -1442,10 +1528,6 @@ def send_signal(
         f"${signal['first_volume']:,.0f}"
     )
 
-
-    # ========================================================
-    # 2-Cİ ŞAM
-    # ========================================================
 
     if signal["count"] == 2:
 
@@ -1478,8 +1560,7 @@ def send_signal(
         if signal["live"]:
 
             message.append(
-                "🟢 2-ci şam hələ "
-                "bağlanmayıb"
+                "🟢 2-ci şam hələ bağlanmayıb"
             )
 
         else:
@@ -1488,10 +1569,6 @@ def send_signal(
                 "🔵 2-ci şam bağlanıb"
             )
 
-
-    # ========================================================
-    # TOTAL
-    # ========================================================
 
     message.append("")
 
@@ -1514,13 +1591,7 @@ def send_signal(
 
     message.append(
         "⛔ Bu qiymətin altına "
-        "düşməyənə qədər "
-        "yeni signal yoxdur."
-    )
-
-    message.append(
-        "🔓 Altına düşərsə coin "
-        "yenidən aktiv olacaq."
+        "düşməyənə qədər yeni pump signal yoxdur."
     )
 
     message.append("")
@@ -1564,17 +1635,467 @@ def send_signal(
 
 
 # ============================================================
-# PROCESS LIVE
+# BREAKOUT — FIND LAST CONFIRMED PEAK
+# ============================================================
+#
+# 15M qrafikdə:
+#
+#          HIGH
+#           ▲
+#          / \
+#         /   \
+#
+# Bu nöqtə lokal təpədir.
+#
+# Sadə qayda:
+#
+# peak.high > əvvəlki 15M high
+# peak.high > sonrakı 15M high
+#
 # ============================================================
 
-def process_live_update(
+def find_latest_resistance(
+    candles
+):
+
+    if len(candles) < 3:
+
+        return None
+
+    # Yalnız BAĞLANMIŞ 15M şamlar.
+    #
+    # Son canlı şam təpə kimi qəbul edilmir.
+
+    closed = [
+        c
+        for c in candles
+        if c["closed"]
+    ]
+
+    if len(closed) < 3:
+
+        return None
+
+    # Ən sondan geriyə gedirik.
+    #
+    # 20/25 candle limit yoxdur.
+    #
+    # Ən son təsdiqlənmiş lokal təpəni tapırıq.
+
+    for i in range(
+        len(closed) - 2,
+        0,
+        -1
+    ):
+
+        previous_candle = closed[
+            i - 1
+        ]
+
+        peak_candle = closed[
+            i
+        ]
+
+        next_candle = closed[
+            i + 1
+        ]
+
+        peak_high = peak_candle[
+            "high"
+        ]
+
+        if (
+            peak_high
+            > previous_candle["high"]
+            and
+            peak_high
+            > next_candle["high"]
+        ):
+
+            return {
+                "price":
+                    peak_high,
+
+                "open_time":
+                    peak_candle[
+                        "open_time"
+                    ],
+
+                "close_time":
+                    peak_candle[
+                        "close_time"
+                    ],
+            }
+
+    return None
+
+
+# ============================================================
+# BREAKOUT CHECK
+# ============================================================
+
+def check_breakout(
     symbol
 ):
 
     with data_lock:
 
         candles = list(
-            history.get(
+            breakout_history.get(
+                symbol,
+                []
+            )
+        )
+
+        info = coins.get(
+            symbol
+        )
+
+    if info is None:
+        return None
+
+    if len(candles) < 3:
+        return None
+
+
+    # --------------------------------------------------------
+    # SON MÜQAVİMƏT / TƏPƏ
+    # --------------------------------------------------------
+
+    resistance = (
+        find_latest_resistance(
+            candles
+        )
+    )
+
+    if resistance is None:
+        return None
+
+
+    resistance_price = resistance[
+        "price"
+    ]
+
+    pivot_time = resistance[
+        "open_time"
+    ]
+
+
+    # --------------------------------------------------------
+    # CURRENT PRICE
+    # --------------------------------------------------------
+
+    current_price = candles[
+        -1
+    ]["close"]
+
+
+    # --------------------------------------------------------
+    # BREAKOUT LEVEL
+    # --------------------------------------------------------
+    #
+    # Təpə = 0.6000
+    #
+    # +1%:
+    #
+    # 0.6000 * 1.01
+    # = 0.6060
+    #
+    # Qiymət 0.6060 və yuxarıdırsa
+    # breakout təsdiqlənir.
+    #
+
+    breakout_price = (
+        resistance_price
+        *
+        (
+            1.0
+            +
+            BREAKOUT_PERCENT / 100.0
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # BREAKOUT YOXDUR
+    # --------------------------------------------------------
+
+    if current_price < breakout_price:
+
+        return None
+
+
+    # --------------------------------------------------------
+    # BU RESISTANCE ÜÇÜN STATE
+    # --------------------------------------------------------
+
+    with data_lock:
+
+        state = breakout_state.setdefault(
+            symbol,
+            {
+                "resistance": None,
+                "signal_sent": False,
+                "pivot_time": None,
+            }
+        )
+
+        previous_resistance = state[
+            "resistance"
+        ]
+
+        previous_pivot_time = state[
+            "pivot_time"
+        ]
+
+
+    # --------------------------------------------------------
+    # EYNİ RESISTANCE ÜÇÜN TƏKRAR SIGNAL YOX
+    # --------------------------------------------------------
+
+    if (
+        previous_pivot_time
+        == pivot_time
+    ):
+
+        if (
+            state[
+                "signal_sent"
+            ]
+        ):
+
+            return None
+
+
+    # --------------------------------------------------------
+    # YENİ RESISTANCE
+    # --------------------------------------------------------
+
+    with data_lock:
+
+        breakout_state[
+            symbol
+        ] = {
+            "resistance":
+                resistance_price,
+
+            "signal_sent":
+                True,
+
+            "pivot_time":
+                pivot_time,
+        }
+
+
+    # --------------------------------------------------------
+    # GLOBAL DUPLICATE PROTECTION
+    # --------------------------------------------------------
+
+    level_id = (
+        f"{symbol}:"
+        f"{pivot_time}:"
+        f"{resistance_price:.12g}"
+    )
+
+    with breakout_lock:
+
+        if (
+            level_id
+            in breakout_alerted_levels
+        ):
+
+            return None
+
+        breakout_alerted_levels.add(
+            level_id
+        )
+
+
+    # --------------------------------------------------------
+    # BREAKOUT SIGNAL
+    # --------------------------------------------------------
+
+    breakout_percent = price_change(
+        resistance_price,
+        current_price
+    )
+
+    return {
+
+        "type":
+            "BREAKOUT",
+
+        "symbol":
+            symbol,
+
+        "rank":
+            info["rank"],
+
+        "resistance":
+            resistance_price,
+
+        "breakout_level":
+            breakout_price,
+
+        "current_price":
+            current_price,
+
+        "breakout_percent":
+            breakout_percent,
+
+        "pivot_time":
+            pivot_time,
+
+        "pivot_close_time":
+            resistance[
+                "close_time"
+            ],
+    }
+
+
+# ============================================================
+# SEND BREAKOUT SIGNAL
+# ============================================================
+
+def send_breakout_signal(
+    signal
+):
+
+    symbol = signal[
+        "symbol"
+    ]
+
+    resistance = signal[
+        "resistance"
+    ]
+
+    breakout_level = signal[
+        "breakout_level"
+    ]
+
+    current_price = signal[
+        "current_price"
+    ]
+
+    breakout_percent = signal[
+        "breakout_percent"
+    ]
+
+    message = []
+
+    message.append(
+        "🚀 BREAKOUT SIGNAL"
+    )
+
+    message.append("")
+
+    message.append(
+        f"🪙 {symbol}"
+    )
+
+    message.append(
+        f"🏆 CMC Rank: "
+        f"#{signal['rank']}"
+    )
+
+    message.append("")
+
+    message.append(
+        "📈 15M MÜQAVİMƏT QIRILDI"
+    )
+
+    message.append(
+        f"🔴 Son təpə: "
+        f"{resistance:.10g}"
+    )
+
+    message.append(
+        f"🟡 Breakout səviyyəsi (+1%): "
+        f"{breakout_level:.10g}"
+    )
+
+    message.append(
+        f"🟢 Cari qiymət: "
+        f"{current_price:.10g}"
+    )
+
+    message.append(
+        f"📊 Təpədən artım: "
+        f"+{breakout_percent:.2f}%"
+    )
+
+    message.append("")
+
+    message.append(
+        "🔥 BULLISH BREAKOUT"
+    )
+
+    message.append(
+        "Qiymət son 15M təpənin "
+        "üzərində +1% qalxıb."
+    )
+
+    message.append("")
+
+    message.append(
+        "⏱️ Timeframe: 15 dəqiqə"
+    )
+
+    message.append(
+        "🎯 Breakout: "
+        f"+{BREAKOUT_PERCENT:.1f}%"
+    )
+
+    message.append(
+        "📊 Binance Spot"
+    )
+
+    message.append("")
+
+    message.append(
+        "ℹ️ Bu breakout siqnalı "
+        "pump +5% / $50K şərtlərindən "
+        "müstəqildir."
+    )
+
+    text = "\n".join(
+        message
+    )
+
+    print(
+        "\n"
+        + "🚀" * 20,
+        flush=True
+    )
+
+    print(
+        text,
+        flush=True
+    )
+
+    print(
+        "🚀" * 20
+        + "\n",
+        flush=True
+    )
+
+    send_telegram(
+        text
+    )
+
+
+# ============================================================
+# PROCESS PUMP
+# ============================================================
+
+def process_pump(
+    symbol
+):
+
+    with data_lock:
+
+        candles = list(
+            pump_history.get(
                 symbol,
                 []
             )
@@ -1586,9 +2107,6 @@ def process_live_update(
     current_price = candles[
         -1
     ]["close"]
-
-    # Əvvəlki signal qiymətinin altına düşübsə
-    # unlock.
 
     update_activation_state(
         symbol,
@@ -1609,7 +2127,7 @@ def process_live_update(
     if not state["active"]:
         return
 
-    signal = check_signal(
+    signal = check_pump_signal(
         symbol
     )
 
@@ -1617,7 +2135,29 @@ def process_live_update(
         return
 
     threading.Thread(
-        target=send_signal,
+        target=send_pump_signal,
+        args=(signal,),
+        daemon=True
+    ).start()
+
+
+# ============================================================
+# PROCESS BREAKOUT
+# ============================================================
+
+def process_breakout(
+    symbol
+):
+
+    signal = check_breakout(
+        symbol
+    )
+
+    if signal is None:
+        return
+
+    threading.Thread(
+        target=send_breakout_signal,
         args=(signal,),
         daemon=True
     ).start()
@@ -1643,7 +2183,10 @@ def websocket_message(
             payload
         )
 
-        if data.get("e") != "kline":
+        if data.get(
+            "e"
+        ) != "kline":
+
             return
 
         kline = data.get(
@@ -1663,14 +2206,44 @@ def websocket_message(
         if not symbol:
             return
 
-        update_live_candle(
-            symbol,
-            kline
+        interval = str(
+            kline.get(
+                "i",
+                ""
+            )
         )
 
-        process_live_update(
-            symbol
-        )
+        # ====================================================
+        # 5M
+        # ====================================================
+
+        if interval == PUMP_INTERVAL:
+
+            update_live_candle(
+                symbol,
+                kline,
+                PUMP_INTERVAL
+            )
+
+            process_pump(
+                symbol
+            )
+
+        # ====================================================
+        # 15M
+        # ====================================================
+
+        elif interval == BREAKOUT_INTERVAL:
+
+            update_live_candle(
+                symbol,
+                kline,
+                BREAKOUT_INTERVAL
+            )
+
+            process_breakout(
+                symbol
+            )
 
     except Exception as e:
 
@@ -1698,10 +2271,23 @@ def websocket_open(
         flush=True
     )
 
-    streams = [
-        f"{symbol.lower()}@kline_5m"
-        for symbol in symbols
-    ]
+    streams = []
+
+    for symbol in symbols:
+
+        streams.append(
+            f"{symbol.lower()}@kline_5m"
+        )
+
+        streams.append(
+            f"{symbol.lower()}@kline_15m"
+        )
+
+
+    # Binance combined stream limiti nəzərə alınaraq
+    # hər worker üçün 100 coin -> 200 stream.
+    #
+    # Binance WebSocket bu strukturla işləyir.
 
     ws.send(
         json.dumps(
@@ -1720,7 +2306,7 @@ def websocket_open(
 
     print(
         f"WS {worker_id}: "
-        "LIVE 5M STREAMS ACTIVE",
+        "LIVE 5M + 15M STREAMS ACTIVE",
         flush=True
     )
 
@@ -1778,7 +2364,8 @@ def websocket_worker(
             print(
                 f"WS {worker_id}: "
                 f"CONNECTING "
-                f"({len(symbols)} streams)",
+                f"({len(symbols)} coins / "
+                f"{len(symbols) * 2} streams)",
                 flush=True
             )
 
@@ -1892,7 +2479,7 @@ def main():
     print(
         "\n"
         "========================================\n"
-        "       FAST MEME PUMP ALERT\n"
+        "   FAST MEME PUMP + BREAKOUT ALERT\n"
         "========================================",
         flush=True
     )
@@ -1905,53 +2492,43 @@ def main():
     )
 
     print(
-        f"INTERVAL: "
-        f"{INTERVAL}",
+        f"PUMP INTERVAL: "
+        f"{PUMP_INTERVAL}",
         flush=True
     )
 
     print(
-        f"MIN PRICE: "
+        f"BREAKOUT INTERVAL: "
+        f"{BREAKOUT_INTERVAL}",
+        flush=True
+    )
+
+    print(
+        f"PUMP MIN PRICE: "
         f"+{MIN_PRICE_CHANGE}%",
         flush=True
     )
 
     print(
-        f"MIN VOLUME: "
+        f"PUMP MIN VOLUME: "
         f"${MIN_TOTAL_VOLUME:,.0f}",
         flush=True
     )
 
     print(
-        "1ST CANDLE: "
-        "CLOSED OPEN -> CLOSE",
+        f"BREAKOUT: "
+        f"LAST 15M PEAK + "
+        f"{BREAKOUT_PERCENT}%",
         flush=True
     )
 
     print(
-        "2ND CANDLE: "
-        "LIVE OPEN -> CURRENT",
+        "BREAKOUT CANDLE LIMIT: NONE",
         flush=True
     )
 
     print(
-        "RE-SIGNAL: "
-        "ONLY BELOW FIRST SIGNAL PRICE",
-        flush=True
-    )
-
-    print(
-        "HIGH PRICE CALCULATION: NO",
-        flush=True
-    )
-
-    print(
-        "LOW PRICE CALCULATION: NO",
-        flush=True
-    )
-
-    print(
-        "3-CANDLE MODE: DISABLED",
+        "BREAKOUT INDEPENDENT OF PUMP CONDITIONS",
         flush=True
     )
 
@@ -1961,24 +2538,30 @@ def main():
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # TELEGRAM TEST
-    # --------------------------------------------------------
+    # ========================================================
 
     send_telegram(
-        "✅ FAST MEME PUMP ALERT STARTED\n\n"
-        "🕯️ 1-ci şam bağlanmadan "
-        "siqnal yoxdur.\n"
-        "📈 1-ci şam: Open → Close.\n"
-        "🕯️ 2-ci şam: canlı Open → Current.\n"
-        "🎯 Ümumi şərt: ≥5% + ≥$50K.\n"
-        "🔒 İlk signal qiyməti yadda qalır."
+        "✅ FAST MEME PUMP + BREAKOUT ALERT STARTED\n\n"
+
+        "🕯️ PUMP: 5M\n"
+        "🎯 Pump şərti: ≥5% + ≥$50K\n"
+        "🔒 Pump lock sistemi aktivdir.\n\n"
+
+        "📈 BREAKOUT: 15M\n"
+        "🔴 Son lokal təpə / müqavimət izlənir.\n"
+        "🚀 Təpədən +1% yuxarı qalxarsa "
+        "BREAKOUT signal.\n"
+        "♻️ Yeni müqavimət qırılarsa yenidən signal.\n"
+        "❌ 20/25 şam limiti yoxdur.\n"
+        "ℹ️ Breakout pump şərtlərindən müstəqildir."
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # CMC
-    # --------------------------------------------------------
+    # ========================================================
 
     if not load_cmc():
 
@@ -1990,9 +2573,9 @@ def main():
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # BINANCE
-    # --------------------------------------------------------
+    # ========================================================
 
     symbols = load_binance_symbols()
 
@@ -2007,18 +2590,27 @@ def main():
         return
 
 
-    # --------------------------------------------------------
-    # HISTORY
-    # --------------------------------------------------------
+    # ========================================================
+    # 5M HISTORY
+    # ========================================================
 
-    load_history(
+    load_pump_history(
         symbols
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
+    # 15M BREAKOUT HISTORY
+    # ========================================================
+
+    load_breakout_history(
+        symbols
+    )
+
+
+    # ========================================================
     # CMC REFRESH
-    # --------------------------------------------------------
+    # ========================================================
 
     threading.Thread(
         target=cmc_refresh_worker,
@@ -2026,18 +2618,18 @@ def main():
     ).start()
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # WEBSOCKETS
-    # --------------------------------------------------------
+    # ========================================================
 
     start_websockets(
         symbols
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # STATUS
-    # --------------------------------------------------------
+    # ========================================================
 
     while True:
 
@@ -2047,15 +2639,26 @@ def main():
                 coins
             )
 
-            history_ready = sum(
+            pump_ready = sum(
                 1
                 for symbol in coins
                 if len(
-                    history.get(
+                    pump_history.get(
                         symbol,
                         []
                     )
                 ) >= 1
+            )
+
+            breakout_ready = sum(
+                1
+                for symbol in coins
+                if len(
+                    breakout_history.get(
+                        symbol,
+                        []
+                    )
+                ) >= 3
             )
 
             active = sum(
@@ -2070,20 +2673,34 @@ def main():
                 )["active"]
             )
 
-            locked = tracked - active
+            locked = (
+                tracked
+                -
+                active
+            )
 
             rank_count = len(
                 cmc_ranks
+            )
+
+            breakout_count = sum(
+                1
+                for state
+                in breakout_state.values()
+                if state.get(
+                    "signal_sent"
+                )
             )
 
         print(
             f"STATUS | "
             f"CMC={rank_count} | "
             f"TRACKED={tracked} | "
-            f"HISTORY_READY="
-            f"{history_ready} | "
-            f"ACTIVE={active} | "
-            f"LOCKED={locked}",
+            f"5M_READY={pump_ready} | "
+            f"15M_READY={breakout_ready} | "
+            f"PUMP_ACTIVE={active} | "
+            f"PUMP_LOCKED={locked} | "
+            f"BREAKOUT_LEVELS={breakout_count}",
             flush=True
         )
 
@@ -2097,4 +2714,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
