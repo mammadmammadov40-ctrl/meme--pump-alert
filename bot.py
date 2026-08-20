@@ -12,23 +12,37 @@ import websocket
 # FAST MEME PUMP ALERT
 # ============================================================
 #
-# YALNIZ 5 DƏQİQƏLİK PUMP SİSTEMİ
+# CMC RANK: 1 - 2000
+# BINANCE SPOT USDT
+# TIMEFRAME: 5M
 #
-# CMC Rank: 1 - 2000
-# Binance Spot USDT
-# 5 dəqiqəlik şam
+# 1-CI ŞAM:
+#   - Bağlanmış olmalıdır
+#   - Open -> Close >= +4%
+#   - Volume >= $50K
+#   - Volume Acceleration >= 1.5x
+#   - Buy Pressure >= 60%
+#   - Body >= 60%
+#   - Upper Wick <= 30%
 #
-# 1-ci şam:
-#   Open -> Close >= +5%
-#   Volume >= $50K
+# ƏGƏR 1-Cİ ŞAM BÜTÜN ŞƏRTLƏRİ KEÇİRSƏ:
+#   -> DƏRHAL SİQNAL
 #
-# 2-ci şam:
-#   1-ci bağlanmış şamın %
-#   +
-#   2-ci canlı şamın %
-#   >= +5%
+# ƏGƏR 1-Cİ ŞAM KEÇMƏSƏ:
+#   -> 2-Cİ ŞAM LIVE İZLƏNİR
+#   -> 1-ci + 2-ci şam birlikdə:
+#        ümumi artım >= +4%
+#        ümumi volume >= $50K
+#      olduqda siqnal.
 #
-# BREAKOUT SİSTEMİ TAMAMİLƏ SİLİNİB.
+# 2-Cİ ŞAMA:
+#   - Wick/Body tətbiq olunmur
+#   - Buy Pressure ayrıca tələb olunmur
+#   - Volume Acceleration ayrıca tələb olunmur
+#
+# HƏR COIN ÜÇÜN:
+#   - Siqnaldan sonra 24 saat cooldown
+#   - Qiymətə bağlı LOCK YOXDUR
 #
 # ============================================================
 
@@ -57,11 +71,36 @@ CMC_MAX_RANK = 2000
 
 
 # ============================================================
-# PUMP CONDITIONS
+# ƏSAS PUMP ŞƏRTLƏRİ
 # ============================================================
 
-MIN_PRICE_CHANGE = 5.0
+MIN_PRICE_CHANGE = 4.0
 MIN_TOTAL_VOLUME = 50_000.0
+
+
+# ============================================================
+# ƏLAVƏ FİLTRLƏR
+# ============================================================
+
+MIN_VOLUME_ACCELERATION = 1.5
+MIN_BUY_PRESSURE = 60.0
+
+MIN_BODY_PERCENT = 60.0
+MAX_UPPER_WICK_PERCENT = 30.0
+
+
+# ============================================================
+# 24 SAAT COOLDOWN
+# ============================================================
+
+COOLDOWN_SECONDS = 24 * 60 * 60
+
+
+# ============================================================
+# VOLUME ACCELERATION
+# ============================================================
+
+VOLUME_LOOKBACK = 3
 
 
 # ============================================================
@@ -90,8 +129,6 @@ MAX_PUMP_CANDLES = 10
 coins = {}
 cmc_ranks = {}
 
-
-# 5M pump history
 pump_history = defaultdict(
     lambda: deque(
         maxlen=MAX_PUMP_CANDLES
@@ -100,10 +137,10 @@ pump_history = defaultdict(
 
 
 # ============================================================
-# PUMP SIGNAL STATE
+# 24 SAAT COOLDOWN STATE
 # ============================================================
 
-signal_state = {}
+last_signal_time = {}
 
 
 # ============================================================
@@ -281,12 +318,6 @@ def load_cmc():
             []
         )
 
-        print(
-            f"CMC RAW COINS: "
-            f"{len(data)}",
-            flush=True
-        )
-
         new_ranks = {}
 
         for coin in data:
@@ -326,11 +357,10 @@ def load_cmc():
                     symbol
                 ] = rank
 
-        if len(new_ranks) == 0:
+        if not new_ranks:
 
             print(
-                "❌ CMC DATA GƏLDİ, "
-                "AMMA RANK MAP 0 OLDU.",
+                "❌ CMC RANK MAP 0",
                 flush=True
             )
 
@@ -339,40 +369,17 @@ def load_cmc():
         with data_lock:
 
             cmc_ranks.clear()
-
             cmc_ranks.update(
                 new_ranks
             )
 
         print(
             f"✅ CMC COINS: "
-            f"{len(new_ranks)} "
-            f"(RANK "
-            f"{CMC_MIN_RANK}-"
-            f"{CMC_MAX_RANK})",
+            f"{len(new_ranks)}",
             flush=True
         )
 
         return True
-
-    except requests.exceptions.Timeout:
-
-        print(
-            "❌ CMC TIMEOUT",
-            flush=True
-        )
-
-        return False
-
-    except requests.exceptions.RequestException as e:
-
-        print(
-            "❌ CMC REQUEST ERROR:",
-            repr(e),
-            flush=True
-        )
-
-        return False
 
     except Exception as e:
 
@@ -408,7 +415,7 @@ def cmc_refresh_worker():
 
 
 # ============================================================
-# BINANCE SPOT SYMBOLS
+# BINANCE SYMBOLS
 # ============================================================
 
 def load_binance_symbols():
@@ -428,12 +435,6 @@ def load_binance_symbols():
         response = requests.get(
             url,
             timeout=30
-        )
-
-        print(
-            f"BINANCE HTTP STATUS: "
-            f"{response.status_code}",
-            flush=True
         )
 
         if response.status_code != 200:
@@ -503,20 +504,11 @@ def load_binance_symbols():
             if rank is None:
                 continue
 
-            if not (
-                CMC_MIN_RANK
-                <= rank
-                <= CMC_MAX_RANK
-            ):
-                continue
-
-            if base.endswith(
-                (
-                    "UP",
-                    "DOWN",
-                    "BULL",
-                    "BEAR",
-                )
+            if (
+                base.endswith("UP")
+                or base.endswith("DOWN")
+                or base.endswith("BULL")
+                or base.endswith("BEAR")
             ):
                 continue
 
@@ -529,30 +521,10 @@ def load_binance_symbols():
         with data_lock:
 
             coins.clear()
-
-            coins.update(
-                result
-            )
-
-            for symbol in result:
-
-                if symbol not in signal_state:
-
-                    signal_state[
-                        symbol
-                    ] = {
-                        "active": True,
-                        "signal_price": None,
-                    }
+            coins.update(result)
 
         print(
             f"✅ BINANCE USDT SPOT: "
-            f"{len(result)}",
-            flush=True
-        )
-
-        print(
-            f"✅ TRACKED COINS: "
             f"{len(result)}",
             flush=True
         )
@@ -579,44 +551,28 @@ def load_binance_symbols():
 def row_to_candle(row):
 
     return {
-        "open_time": int(
-            row[0]
-        ),
+        "open_time": int(row[0]),
+        "open": float(row[1]),
+        "high": float(row[2]),
+        "low": float(row[3]),
+        "close": float(row[4]),
+        "base_volume": float(row[5]),
+        "close_time": int(row[6]),
+        "quote_volume": float(row[7]),
 
-        "open": float(
-            row[1]
-        ),
+        # Binance kline:
+        # row[9] = taker buy base volume
+        # row[10] = taker buy quote volume
 
-        "high": float(
-            row[2]
-        ),
-
-        "low": float(
-            row[3]
-        ),
-
-        "close": float(
-            row[4]
-        ),
-
-        "base_volume": float(
-            row[5]
-        ),
-
-        "close_time": int(
-            row[6]
-        ),
-
-        "quote_volume": float(
-            row[7]
-        ),
+        "taker_buy_base_volume": float(row[9]),
+        "taker_buy_quote_volume": float(row[10]),
 
         "closed": True,
     }
 
 
 # ============================================================
-# LOAD 5M HISTORY
+# HISTORY
 # ============================================================
 
 def load_pump_history(symbols):
@@ -646,7 +602,7 @@ def load_pump_history(symbols):
                 params={
                     "symbol": symbol,
                     "interval": PUMP_INTERVAL,
-                    "limit": 5,
+                    "limit": 10,
                 },
                 timeout=10
             )
@@ -705,7 +661,7 @@ def load_pump_history(symbols):
 
 
 # ============================================================
-# UPDATE LIVE CANDLE
+# LIVE CANDLE
 # ============================================================
 
 def update_live_candle(
@@ -714,41 +670,22 @@ def update_live_candle(
 ):
 
     candle = {
-        "open_time": int(
-            kline["t"]
-        ),
+        "open_time": int(kline["t"]),
+        "open": float(kline["o"]),
+        "high": float(kline["h"]),
+        "low": float(kline["l"]),
+        "close": float(kline["c"]),
+        "base_volume": float(kline["v"]),
+        "close_time": int(kline["T"]),
+        "quote_volume": float(kline["q"]),
 
-        "open": float(
-            kline["o"]
-        ),
+        "taker_buy_base_volume":
+            float(kline["V"]),
 
-        "high": float(
-            kline["h"]
-        ),
+        "taker_buy_quote_volume":
+            float(kline["Q"]),
 
-        "low": float(
-            kline["l"]
-        ),
-
-        "close": float(
-            kline["c"]
-        ),
-
-        "base_volume": float(
-            kline["v"]
-        ),
-
-        "close_time": int(
-            kline["T"]
-        ),
-
-        "quote_volume": float(
-            kline["q"]
-        ),
-
-        "closed": bool(
-            kline["x"]
-        ),
+        "closed": bool(kline["x"]),
     }
 
     with data_lock:
@@ -763,13 +700,9 @@ def update_live_candle(
         if (
             candles
             and
-            candles[-1][
-                "open_time"
-            ]
+            candles[-1]["open_time"]
             ==
-            candle[
-                "open_time"
-            ]
+            candle["open_time"]
         ):
 
             candles[-1] = candle
@@ -782,7 +715,7 @@ def update_live_candle(
 
 
 # ============================================================
-# PERCENT
+# PRICE CHANGE
 # ============================================================
 
 def price_change(
@@ -802,19 +735,7 @@ def price_change(
     ) * 100.0
 
 
-def candle_closed_percent(
-    candle
-):
-
-    return price_change(
-        candle["open"],
-        candle["close"]
-    )
-
-
-def candle_live_percent(
-    candle
-):
+def candle_percent(candle):
 
     return price_change(
         candle["open"],
@@ -823,52 +744,197 @@ def candle_live_percent(
 
 
 # ============================================================
-# PUMP RE-ACTIVATE
+# BUY PRESSURE
 # ============================================================
 
-def update_activation_state(
-    symbol,
-    current_price
+def buy_pressure(candle):
+
+    total = candle[
+        "quote_volume"
+    ]
+
+    buy = candle[
+        "taker_buy_quote_volume"
+    ]
+
+    if total <= 0:
+        return 0.0
+
+    return (
+        buy / total
+    ) * 100.0
+
+
+# ============================================================
+# WICK / BODY
+# ============================================================
+
+def wick_body_filter(candle):
+
+    high = candle["high"]
+    low = candle["low"]
+    open_price = candle["open"]
+    close_price = candle["close"]
+
+    candle_range = (
+        high - low
+    )
+
+    if candle_range <= 0:
+
+        return {
+            "body_percent": 0.0,
+            "upper_wick_percent": 0.0,
+            "valid": False,
+        }
+
+    body = abs(
+        close_price
+        - open_price
+    )
+
+    upper_wick = (
+        high
+        - max(
+            open_price,
+            close_price
+        )
+    )
+
+    body_percent = (
+        body
+        / candle_range
+    ) * 100.0
+
+    upper_wick_percent = (
+        upper_wick
+        / candle_range
+    ) * 100.0
+
+    valid = (
+        body_percent
+        >= MIN_BODY_PERCENT
+        and
+        upper_wick_percent
+        <= MAX_UPPER_WICK_PERCENT
+    )
+
+    return {
+        "body_percent":
+            body_percent,
+
+        "upper_wick_percent":
+            upper_wick_percent,
+
+        "valid":
+            valid,
+    }
+
+
+# ============================================================
+# VOLUME ACCELERATION
+# ============================================================
+
+def volume_acceleration(
+    candles,
+    target_index
 ):
+
+    start = (
+        target_index
+        - VOLUME_LOOKBACK
+    )
+
+    if start < 0:
+        return 0.0
+
+    previous = candles[
+        start:target_index
+    ]
+
+    if len(previous) < VOLUME_LOOKBACK:
+        return 0.0
+
+    volumes = [
+        c["quote_volume"]
+        for c in previous
+        if c["closed"]
+    ]
+
+    if len(volumes) < VOLUME_LOOKBACK:
+        return 0.0
+
+    average_volume = (
+        sum(volumes)
+        / len(volumes)
+    )
+
+    if average_volume <= 0:
+        return 0.0
+
+    current_volume = (
+        candles[target_index]
+        ["quote_volume"]
+    )
+
+    return (
+        current_volume
+        / average_volume
+    )
+
+
+# ============================================================
+# 24 SAAT COOLDOWN
+# ============================================================
+
+def cooldown_active(symbol):
+
+    now = time.time()
 
     with data_lock:
 
-        state = signal_state.setdefault(
-            symbol,
-            {
-                "active": True,
-                "signal_price": None,
-            }
+        last_time = last_signal_time.get(
+            symbol
         )
 
-        last_signal_price = state[
-            "signal_price"
-        ]
+    if last_time is None:
+        return False
 
-        if (
-            not state["active"]
-            and
-            last_signal_price is not None
-            and
-            current_price
-            < last_signal_price
-        ):
+    return (
+        now - last_time
+        <
+        COOLDOWN_SECONDS
+    )
 
-            state[
-                "active"
-            ] = True
 
-            print(
-                f"🔓 PUMP RE-ACTIVATED "
-                f"{symbol}: "
-                f"{current_price:.10g} < "
-                f"{last_signal_price:.10g}",
-                flush=True
-            )
+def cooldown_remaining(symbol):
+
+    with data_lock:
+
+        last_time = last_signal_time.get(
+            symbol
+        )
+
+    if last_time is None:
+        return 0
+
+    remaining = (
+        COOLDOWN_SECONDS
+        -
+        (
+            time.time()
+            - last_time
+        )
+    )
+
+    return max(
+        0,
+        int(remaining)
+    )
 
 
 # ============================================================
-# PUMP WINDOW
+# WINDOW ID
 # ============================================================
 
 def make_window_id(
@@ -881,13 +947,124 @@ def make_window_id(
         +
         ":".join(
             str(
-                c[
-                    "open_time"
-                ]
+                c["open_time"]
             )
             for c in candles
         )
     )
+
+
+# ============================================================
+# 1-Cİ ŞAM FILTER
+# ============================================================
+
+def first_candle_quality(
+    candles,
+    first_index
+):
+
+    first = candles[
+        first_index
+    ]
+
+    if not first["closed"]:
+        return None
+
+    first_percent = (
+        candle_percent(
+            first
+        )
+    )
+
+    first_volume = (
+        first["quote_volume"]
+    )
+
+    acceleration = (
+        volume_acceleration(
+            candles,
+            first_index
+        )
+    )
+
+    pressure = (
+        buy_pressure(
+            first
+        )
+    )
+
+    wick = (
+        wick_body_filter(
+            first
+        )
+    )
+
+    price_ok = (
+        first_percent
+        >= MIN_PRICE_CHANGE
+    )
+
+    volume_ok = (
+        first_volume
+        >= MIN_TOTAL_VOLUME
+    )
+
+    acceleration_ok = (
+        acceleration
+        >= MIN_VOLUME_ACCELERATION
+    )
+
+    pressure_ok = (
+        pressure
+        >= MIN_BUY_PRESSURE
+    )
+
+    wick_ok = (
+        wick["valid"]
+    )
+
+    all_ok = (
+        price_ok
+        and
+        volume_ok
+        and
+        acceleration_ok
+        and
+        pressure_ok
+        and
+        wick_ok
+    )
+
+    return {
+        "price_ok": price_ok,
+        "volume_ok": volume_ok,
+        "acceleration_ok":
+            acceleration_ok,
+        "pressure_ok":
+            pressure_ok,
+        "wick_ok":
+            wick_ok,
+
+        "all_ok": all_ok,
+
+        "percent":
+            first_percent,
+
+        "volume":
+            first_volume,
+
+        "acceleration":
+            acceleration,
+
+        "pressure":
+            pressure,
+
+        "body_percent":
+            wick["body_percent"],
+
+        "upper_wick_percent":
+            wick["upper_wick_percent"],
+    }
 
 
 # ============================================================
@@ -911,377 +1088,302 @@ def check_pump_signal(
             symbol
         )
 
-        state = signal_state.get(
-            symbol,
-            {
-                "active": True,
-                "signal_price": None
-            }
-        )
-
     if info is None:
         return None
 
-    if not candles:
+    if cooldown_active(
+        symbol
+    ):
         return None
 
-    if not state["active"]:
+    if len(candles) < 2:
         return None
 
 
     # ========================================================
-    # 1-Cİ + 2-Cİ ŞAM
+    # SON 2 ŞAM
     # ========================================================
 
-    if len(candles) >= 2:
+    first = candles[-2]
+    second = candles[-1]
 
-        first = candles[-2]
-        second = candles[-1]
-
-        if (
-            first["closed"]
-            and
-            first["open_time"]
-            != second["open_time"]
-        ):
-
-            first_percent = (
-                candle_closed_percent(
-                    first
-                )
-            )
-
-            first_volume = (
-                first["quote_volume"]
-            )
-
-
-            # ------------------------------------------------
-            # 1-Cİ ŞAMDA SIGNAL
-            # ------------------------------------------------
-
-            if (
-                first_percent
-                >= MIN_PRICE_CHANGE
-                and
-                first_volume
-                >= MIN_TOTAL_VOLUME
-            ):
-
-                window = [
-                    first
-                ]
-
-                window_id = (
-                    make_window_id(
-                        symbol,
-                        window
-                    )
-                )
-
-                with signal_lock:
-
-                    if (
-                        window_id
-                        in alerted_windows
-                    ):
-                        return None
-
-                    alerted_windows.add(
-                        window_id
-                    )
-
-                return {
-                    "type":
-                        "PUMP",
-
-                    "symbol":
-                        symbol,
-
-                    "rank":
-                        info["rank"],
-
-                    "signal_price":
-                        first["close"],
-
-                    "first_open":
-                        first["open"],
-
-                    "first_close":
-                        first["close"],
-
-                    "first_percent":
-                        first_percent,
-
-                    "second_percent":
-                        None,
-
-                    "total_percent":
-                        first_percent,
-
-                    "first_volume":
-                        first_volume,
-
-                    "second_volume":
-                        0.0,
-
-                    "total_volume":
-                        first_volume,
-
-                    "candles":
-                        window,
-
-                    "count":
-                        1,
-
-                    "live":
-                        False,
-                }
-
-
-            # ------------------------------------------------
-            # 2-Cİ ŞAM LIVE
-            # ------------------------------------------------
-
-            second_percent = (
-                candle_live_percent(
-                    second
-                )
-            )
-
-            total_percent = (
-                first_percent
-                +
-                second_percent
-            )
-
-            second_volume = (
-                second["quote_volume"]
-            )
-
-            total_volume = (
-                first_volume
-                +
-                second_volume
-            )
-
-            if (
-                total_percent
-                >= MIN_PRICE_CHANGE
-                and
-                total_volume
-                >= MIN_TOTAL_VOLUME
-            ):
-
-                window = [
-                    first,
-                    second
-                ]
-
-                window_id = (
-                    make_window_id(
-                        symbol,
-                        window
-                    )
-                )
-
-                with signal_lock:
-
-                    if (
-                        window_id
-                        in alerted_windows
-                    ):
-                        return None
-
-                    alerted_windows.add(
-                        window_id
-                    )
-
-                return {
-                    "type":
-                        "PUMP",
-
-                    "symbol":
-                        symbol,
-
-                    "rank":
-                        info["rank"],
-
-                    "signal_price":
-                        second["close"],
-
-                    "first_open":
-                        first["open"],
-
-                    "first_close":
-                        first["close"],
-
-                    "second_open":
-                        second["open"],
-
-                    "current_price":
-                        second["close"],
-
-                    "first_percent":
-                        first_percent,
-
-                    "second_percent":
-                        second_percent,
-
-                    "total_percent":
-                        total_percent,
-
-                    "first_volume":
-                        first_volume,
-
-                    "second_volume":
-                        second_volume,
-
-                    "total_volume":
-                        total_volume,
-
-                    "candles":
-                        window,
-
-                    "count":
-                        2,
-
-                    "live":
-                        not second["closed"],
-                }
+    if not first["closed"]:
+        return None
 
 
     # ========================================================
-    # YALNIZ 1 ŞAM
+    # 1-Cİ ŞAMIN BÜTÜN FİLTRLƏRİ
     # ========================================================
 
-    if len(candles) == 1:
+    quality = first_candle_quality(
+        candles,
+        len(candles) - 2
+    )
 
-        first = candles[0]
+    if quality is None:
+        return None
 
-        if not first["closed"]:
-            return None
 
-        first_percent = (
-            candle_closed_percent(
-                first
-            )
+    # ========================================================
+    # VARİANT 1:
+    # 1-Cİ ŞAM TƏK BAŞINA BÜTÜN ŞƏRTLƏRİ ÖDƏYİR
+    # ========================================================
+
+    if quality["all_ok"]:
+
+        window = [
+            first
+        ]
+
+        window_id = make_window_id(
+            symbol,
+            window
         )
 
-        first_volume = (
-            first["quote_volume"]
-        )
+        with signal_lock:
 
-        if (
-            first_percent
-            >= MIN_PRICE_CHANGE
-            and
-            first_volume
-            >= MIN_TOTAL_VOLUME
-        ):
+            if window_id in alerted_windows:
+                return None
 
-            window = [
-                first
-            ]
-
-            window_id = (
-                make_window_id(
-                    symbol,
-                    window
-                )
+            alerted_windows.add(
+                window_id
             )
 
-            with signal_lock:
+        return {
+            "type":
+                "PUMP_1_CANDLE",
 
-                if (
-                    window_id
-                    in alerted_windows
-                ):
-                    return None
+            "symbol":
+                symbol,
 
-                alerted_windows.add(
-                    window_id
-                )
+            "rank":
+                info["rank"],
 
-            return {
-                "type":
-                    "PUMP",
+            "signal_price":
+                first["close"],
 
-                "symbol":
-                    symbol,
+            "first_open":
+                first["open"],
 
-                "rank":
-                    info["rank"],
+            "first_close":
+                first["close"],
 
-                "signal_price":
-                    first["close"],
+            "first_percent":
+                quality["percent"],
 
-                "first_open":
-                    first["open"],
+            "second_percent":
+                None,
 
-                "first_close":
-                    first["close"],
+            "total_percent":
+                quality["percent"],
 
-                "first_percent":
-                    first_percent,
+            "first_volume":
+                quality["volume"],
 
-                "second_percent":
-                    None,
+            "second_volume":
+                0.0,
 
-                "total_percent":
-                    first_percent,
+            "total_volume":
+                quality["volume"],
 
-                "first_volume":
-                    first_volume,
+            "acceleration":
+                quality["acceleration"],
 
-                "second_volume":
-                    0.0,
+            "buy_pressure":
+                quality["pressure"],
 
-                "total_volume":
-                    first_volume,
+            "body_percent":
+                quality["body_percent"],
 
-                "candles":
-                    window,
+            "upper_wick_percent":
+                quality[
+                    "upper_wick_percent"
+                ],
 
-                "count":
-                    1,
+            "count":
+                1,
 
-                "live":
-                    False,
-            }
+            "live":
+                False,
+
+            "first_quality":
+                quality,
+        }
+
+
+    # ========================================================
+    # VARİANT 2:
+    # 1-Cİ ŞAM KEÇMƏDİ
+    # 2-Cİ ŞAM LIVE
+    #
+    # 1-ci + 2-ci birlikdə:
+    #   ümumi >= +4%
+    #   ümumi volume >= $50K
+    #
+    # 2-ci şama wick/body tətbiq olunmur.
+    # ========================================================
+
+    if (
+        second["open_time"]
+        ==
+        first["open_time"]
+    ):
+        return None
+
+
+    first_percent = (
+        candle_percent(
+            first
+        )
+    )
+
+    second_percent = (
+        candle_percent(
+            second
+        )
+    )
+
+    total_percent = (
+        first_percent
+        +
+        second_percent
+    )
+
+    first_volume = (
+        first["quote_volume"]
+    )
+
+    second_volume = (
+        second["quote_volume"]
+    )
+
+    total_volume = (
+        first_volume
+        +
+        second_volume
+    )
+
+
+    if (
+        total_percent
+        >= MIN_PRICE_CHANGE
+        and
+        total_volume
+        >= MIN_TOTAL_VOLUME
+    ):
+
+        window = [
+            first,
+            second
+        ]
+
+        window_id = make_window_id(
+            symbol,
+            window
+        )
+
+        with signal_lock:
+
+            if window_id in alerted_windows:
+                return None
+
+            alerted_windows.add(
+                window_id
+            )
+
+        return {
+            "type":
+                "PUMP_2_CANDLE",
+
+            "symbol":
+                symbol,
+
+            "rank":
+                info["rank"],
+
+            "signal_price":
+                second["close"],
+
+            "first_open":
+                first["open"],
+
+            "first_close":
+                first["close"],
+
+            "second_open":
+                second["open"],
+
+            "current_price":
+                second["close"],
+
+            "first_percent":
+                first_percent,
+
+            "second_percent":
+                second_percent,
+
+            "total_percent":
+                total_percent,
+
+            "first_volume":
+                first_volume,
+
+            "second_volume":
+                second_volume,
+
+            "total_volume":
+                total_volume,
+
+            "acceleration":
+                quality["acceleration"],
+
+            "buy_pressure":
+                quality["pressure"],
+
+            "body_percent":
+                quality["body_percent"],
+
+            "upper_wick_percent":
+                quality[
+                    "upper_wick_percent"
+                ],
+
+            "count":
+                2,
+
+            "live":
+                not second["closed"],
+
+            "first_quality":
+                quality,
+        }
 
     return None
 
 
 # ============================================================
-# PUMP LOCK
+# REGISTER 24H SIGNAL
 # ============================================================
 
-def lock_after_signal(
-    symbol,
-    signal_price
+def register_signal(
+    symbol
 ):
 
     with data_lock:
 
-        signal_state[
+        last_signal_time[
             symbol
-        ] = {
-            "active": False,
-            "signal_price":
-                signal_price,
-        }
+        ] = time.time()
 
     print(
-        f"🔒 PUMP LOCKED "
-        f"{symbol} @ "
-        f"{signal_price:.10g}",
+        f"⏱️ 24H COOLDOWN: "
+        f"{symbol}",
         flush=True
     )
 
 
 # ============================================================
-# SEND PUMP SIGNAL
+# SEND SIGNAL
 # ============================================================
 
 def send_pump_signal(
@@ -1292,13 +1394,8 @@ def send_pump_signal(
         "symbol"
     ]
 
-    signal_price = signal[
-        "signal_price"
-    ]
-
-    lock_after_signal(
-        symbol,
-        signal_price
+    register_signal(
+        symbol
     )
 
     message = []
@@ -1321,7 +1418,7 @@ def send_pump_signal(
     message.append("")
 
     message.append(
-        "🕯️ 1-ci şam"
+        "🕯️ 1-Cİ ŞAM"
     )
 
     message.append(
@@ -1344,13 +1441,33 @@ def send_pump_signal(
         f"${signal['first_volume']:,.0f}"
     )
 
+    message.append(
+        f"📊 Volume Acceleration: "
+        f"{signal['acceleration']:.2f}x"
+    )
+
+    message.append(
+        f"🟢 Buy Pressure: "
+        f"{signal['buy_pressure']:.1f}%"
+    )
+
+    message.append(
+        f"🧱 Body: "
+        f"{signal['body_percent']:.1f}%"
+    )
+
+    message.append(
+        f"↗️ Upper Wick: "
+        f"{signal['upper_wick_percent']:.1f}%"
+    )
+
 
     if signal["count"] == 2:
 
         message.append("")
 
         message.append(
-            "🕯️ 2-ci şam LIVE"
+            "🕯️ 2-Cİ ŞAM LIVE"
         )
 
         message.append(
@@ -1359,7 +1476,7 @@ def send_pump_signal(
         )
 
         message.append(
-            f"Siqnal qiyməti: "
+            f"Qiymət: "
             f"{signal['current_price']:.10g}"
         )
 
@@ -1376,7 +1493,7 @@ def send_pump_signal(
         if signal["live"]:
 
             message.append(
-                "🟢 2-ci şam hələ bağlanmayıb"
+                "🟢 2-ci şam hələ LIVE-dır"
             )
 
         else:
@@ -1389,7 +1506,7 @@ def send_pump_signal(
     message.append("")
 
     message.append(
-        f"📊 ÜMUMİ: "
+        f"📊 ÜMUMİ ARTIM: "
         f"{signal['total_percent']:+.2f}%"
     )
 
@@ -1401,13 +1518,12 @@ def send_pump_signal(
     message.append("")
 
     message.append(
-        f"🔒 İlk siqnal qiyməti: "
-        f"{signal_price:.10g}"
+        "⏱️ 24 saat cooldown"
     )
 
     message.append(
-        "⛔ Bu qiymətin altına "
-        "düşməyənə qədər yeni pump signal yoxdur."
+        "❌ Bu müddətdə eyni coin "
+        "yenidən siqnal verməyəcək."
     )
 
     message.append("")
@@ -1421,7 +1537,7 @@ def send_pump_signal(
     )
 
     message.append(
-        "🎯 Şərt: ≥5% + ≥$50K"
+        "🎯 +4% / $50K"
     )
 
     text = "\n".join(
@@ -1451,46 +1567,16 @@ def send_pump_signal(
 
 
 # ============================================================
-# PROCESS PUMP
+# PROCESS
 # ============================================================
 
 def process_pump(
     symbol
 ):
 
-    with data_lock:
-
-        candles = list(
-            pump_history.get(
-                symbol,
-                []
-            )
-        )
-
-    if not candles:
-        return
-
-    current_price = candles[
-        -1
-    ]["close"]
-
-    update_activation_state(
-        symbol,
-        current_price
-    )
-
-    with data_lock:
-
-        state = signal_state.get(
-            symbol,
-            {
-                "active": True,
-                "signal_price":
-                    None
-            }
-        )
-
-    if not state["active"]:
+    if cooldown_active(
+        symbol
+    ):
         return
 
     signal = check_pump_signal(
@@ -1557,20 +1643,17 @@ def websocket_message(
             )
         )
 
-        # ====================================================
-        # YALNIZ 5M
-        # ====================================================
+        if interval != PUMP_INTERVAL:
+            return
 
-        if interval == PUMP_INTERVAL:
+        update_live_candle(
+            symbol,
+            kline
+        )
 
-            update_live_candle(
-                symbol,
-                kline
-            )
-
-            process_pump(
-                symbol
-            )
+        process_pump(
+            symbol
+        )
 
     except Exception as e:
 
@@ -1681,8 +1764,7 @@ def websocket_worker(
             print(
                 f"WS {worker_id}: "
                 f"CONNECTING "
-                f"({len(symbols)} coins / "
-                f"{len(symbols)} streams)",
+                f"({len(symbols)} coins)",
                 flush=True
             )
 
@@ -1756,7 +1838,6 @@ def start_websockets(
         symbols[
             i:i + WS_CHUNK_SIZE
         ]
-
         for i in range(
             0,
             len(symbols),
@@ -1809,25 +1890,54 @@ def main():
     )
 
     print(
-        f"PUMP INTERVAL: "
+        f"TIMEFRAME: "
         f"{PUMP_INTERVAL}",
         flush=True
     )
 
     print(
-        f"PUMP MIN PRICE: "
+        f"PRICE: "
         f"+{MIN_PRICE_CHANGE}%",
         flush=True
     )
 
     print(
-        f"PUMP MIN VOLUME: "
+        f"MIN VOLUME: "
         f"${MIN_TOTAL_VOLUME:,.0f}",
         flush=True
     )
 
     print(
-        "BREAKOUT: DISABLED / REMOVED",
+        f"VOLUME ACCELERATION: "
+        f"{MIN_VOLUME_ACCELERATION:.2f}x",
+        flush=True
+    )
+
+    print(
+        f"BUY PRESSURE: "
+        f">={MIN_BUY_PRESSURE:.0f}%",
+        flush=True
+    )
+
+    print(
+        f"BODY: "
+        f">={MIN_BODY_PERCENT:.0f}%",
+        flush=True
+    )
+
+    print(
+        f"UPPER WICK: "
+        f"<={MAX_UPPER_WICK_PERCENT:.0f}%",
+        flush=True
+    )
+
+    print(
+        "24H COOLDOWN: ACTIVE",
+        flush=True
+    )
+
+    print(
+        "PRICE LOCK: DISABLED",
         flush=True
     )
 
@@ -1843,12 +1953,16 @@ def main():
 
     send_telegram(
         "✅ FAST MEME PUMP ALERT STARTED\n\n"
-
         "🕯️ Timeframe: 5M\n"
-        "🎯 Pump şərti: ≥5% + ≥$50K\n"
-        "🔒 Pump lock sistemi aktivdir.\n\n"
-
-        "❌ BREAKOUT SİSTEMİ TAMAMİLƏ SİLİNİB."
+        "🎯 1-ci şam: +4% + $50K\n"
+        "📊 Volume Acceleration: ≥1.5x\n"
+        "🟢 Buy Pressure: ≥60%\n"
+        "🧱 Body: ≥60%\n"
+        "↗️ Upper Wick: ≤30%\n\n"
+        "🕯️ 1-ci şam keçməsə:\n"
+        "2-ci şam LIVE izlənəcək.\n"
+        "1-ci + 2-ci birlikdə +4% + $50K olarsa siqnal.\n\n"
+        "⏱️ Eyni coin üçün 24 saat cooldown."
     )
 
 
@@ -1884,7 +1998,7 @@ def main():
 
 
     # ========================================================
-    # 5M HISTORY
+    # HISTORY
     # ========================================================
 
     load_pump_history(
@@ -1931,25 +2045,15 @@ def main():
                         symbol,
                         []
                     )
-                ) >= 1
+                ) >= 2
             )
 
-            active = sum(
+            cooldown_count = sum(
                 1
                 for symbol in coins
-                if signal_state.get(
-                    symbol,
-                    {
-                        "active":
-                            True
-                    }
-                )["active"]
-            )
-
-            locked = (
-                tracked
-                -
-                active
+                if cooldown_active(
+                    symbol
+                )
             )
 
             rank_count = len(
@@ -1961,8 +2065,7 @@ def main():
             f"CMC={rank_count} | "
             f"TRACKED={tracked} | "
             f"5M_READY={pump_ready} | "
-            f"PUMP_ACTIVE={active} | "
-            f"PUMP_LOCKED={locked}",
+            f"24H_COOLDOWN={cooldown_count}",
             flush=True
         )
 
