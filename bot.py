@@ -33,9 +33,9 @@ INTERVAL = "5m"
 # HISTORY
 # ============================================================
 
-HISTORY_LIMIT = 500
+HISTORY_LIMIT = 200
 AVERAGE_VOLUME_CANDLES = 20
-RESISTANCE_LOOKBACK = 500
+RESISTANCE_LOOKBACK = 200
 
 
 # ============================================================
