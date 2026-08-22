@@ -10,16 +10,28 @@ import websocket
 
 
 # ============================================================
-# 5M MOMENTUM + REAL BREAKOUT BOT
+# 5M MOMENTUM + REAL BREAKOUT BOT v7
 # BINANCE SPOT
-# TELEGRAM ALERT
+# TELEGRAM
+#
+# 403 WEBSOCKET FIX
+# SOFT BREAKOUT
+# 200 CANDLE HISTORY
 # ============================================================
 
-BINANCE_REST = "https://api.binance.com"
-BINANCE_WS = "wss://api.binance.com:443/ws"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+BINANCE_REST = "https://api.binance.com"
+
+# 403 üçün 443 portu
+BINANCE_WS = "wss://stream.binance.com:443"
+
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN", ""
+)
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID", ""
+)
 
 INTERVAL = "5m"
 
@@ -28,26 +40,24 @@ INTERVAL = "5m"
 # HISTORY
 # ============================================================
 
-# 500 əvəzinə 200
 HISTORY_LIMIT = 200
-
 AVERAGE_VOLUME_CANDLES = 20
 RESISTANCE_LOOKBACK = 200
 
 
 # ============================================================
-# RESISTANCE
+# RESISTANCE — YUMŞALDILMIŞ
 # ============================================================
 
-MIN_RESISTANCE_AGE = 5
+MIN_RESISTANCE_AGE = 3
 
-RESISTANCE_TOLERANCE_PERCENT = 0.40
+RESISTANCE_TOLERANCE_PERCENT = 0.60
 
 MIN_TEST_DISTANCE_CANDLES = 2
 
 MIN_RESISTANCE_TESTS = 2
 
-MAX_RECENT_TEST_AGE = 30
+MAX_RECENT_TEST_AGE = 40
 
 
 # ============================================================
@@ -70,18 +80,18 @@ BOOK_CACHE_MAX_AGE = 10
 # 5M MOMENTUM
 # ============================================================
 
-MAX_CURRENT_5M_PRICE = 10.0
+MAX_CURRENT_5M_PRICE = 8.0
 
 MIN_BUY_PRESSURE = 55.0
 
 
 # ============================================================
-# SCORE
+# SCORE — YUMŞALDILMIŞ
 # ============================================================
 
-MIN_SIGNAL_SCORE = 70
+MIN_SIGNAL_SCORE = 60
 
-STRONG_SIGNAL_SCORE = 80
+STRONG_SIGNAL_SCORE = 75
 
 
 # ============================================================
@@ -92,17 +102,12 @@ VOLUME_MIN_RATIO = 1.2
 
 
 # ============================================================
-# BREAKOUT
+# BREAKOUT — YUMŞALDILMIŞ
 # ============================================================
 
-# Resistance ən azı 0.50% qırılmalıdır
-MIN_BREAKOUT_PERCENT = 0.50
+MIN_BREAKOUT_PERCENT = 0.30
 
-# Çox gec siqnal gəlməsin.
-# Resistance-dən 3%-dən çox yuxarı qalxmış coin qəbul edilmir.
-MAX_BREAKOUT_PERCENT = 3.00
-
-MIN_BREAKOUT_VOLUME_RATIO = 2.0
+MIN_BREAKOUT_VOLUME_RATIO = 1.5
 
 
 # ============================================================
@@ -129,13 +134,13 @@ TP3_PERCENT = 8.0
 # WEBSOCKET
 # ============================================================
 
-WS_CHUNK_SIZE = 100
+WS_CHUNK_SIZE = 50
 
 RECONNECT_SECONDS = 5
 
 
 # ============================================================
-# STATUS / COOLDOWN
+# STATUS
 # ============================================================
 
 STATUS_INTERVAL = 60
@@ -161,7 +166,12 @@ REST_BOOK_MIN_INTERVAL = 1.0
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "FiveMinuteMomentumBreakoutBot/7.0"
+    "User-Agent":
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
 })
 
 
@@ -224,7 +234,6 @@ def reset_stats():
     with stats_lock:
 
         for key in stats:
-
             stats[key] = 0
 
 
@@ -233,14 +242,12 @@ def inc_stat(name):
     with stats_lock:
 
         if name in stats:
-
             stats[name] += 1
 
 
 def get_stats():
 
     with stats_lock:
-
         return dict(stats)
 
 
@@ -251,26 +258,21 @@ def get_stats():
 def safe_float(value, default=0.0):
 
     try:
-
         return float(value)
 
     except Exception:
-
         return default
 
 
 def round_price(price):
 
     if price >= 1000:
-
         return round(price, 2)
 
     if price >= 1:
-
         return round(price, 4)
 
     if price >= 0.01:
-
         return round(price, 6)
 
     return round(price, 8)
@@ -279,7 +281,6 @@ def round_price(price):
 def percent_change(open_price, current_price):
 
     if open_price <= 0:
-
         return 0.0
 
     return (
@@ -296,7 +297,9 @@ def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
 
-        print("ERROR: TELEGRAM_BOT_TOKEN yoxdur.")
+        print(
+            "ERROR: TELEGRAM_BOT_TOKEN yoxdur."
+        )
 
         inc_stat("telegram_failed")
 
@@ -304,14 +307,16 @@ def send_telegram(message):
 
     if not TELEGRAM_CHAT_ID:
 
-        print("ERROR: TELEGRAM_CHAT_ID yoxdur.")
+        print(
+            "ERROR: TELEGRAM_CHAT_ID yoxdur."
+        )
 
         inc_stat("telegram_failed")
 
         return False
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
@@ -336,7 +341,9 @@ def send_telegram(message):
 
         if response.status_code == 200:
 
-            print("Telegram message sent.")
+            print(
+                "Telegram message sent."
+            )
 
             inc_stat("telegram_ok")
 
@@ -364,27 +371,44 @@ def send_telegram(message):
 
 def telegram_startup_test():
 
-    print("Testing Telegram...")
+    print(
+        "Testing Telegram..."
+    )
 
     message = (
+
         "🟢 <b>BOT STARTED</b>\n\n"
+
         "5M Momentum + Real Breakout Bot aktivdir.\n\n"
-        "📡 Kline WebSocket hazırlanır.\n"
-        "📖 BookTicker WebSocket hazırlanır.\n"
-        "🛟 REST spread fallback aktivdir.\n"
-        "📊 Debug aktivdir.\n"
-        "📚 History: 200 candles.\n"
-        "💥 Breakout: +0.50% → +3.00%.\n\n"
+
+        "📚 History: 200 candles\n"
+
+        "💥 Breakout: +0.30%\n"
+
+        "🔥 Breakout volume: 1.5x\n"
+
+        "🏆 Minimum score: 60\n"
+
+        "📡 Kline WebSocket: 443\n"
+
+        "📖 BookTicker WebSocket: 443\n"
+
+        "🛟 REST spread fallback aktivdir.\n\n"
+
         "Telegram bağlantısı test olunur ✅"
     )
 
     if send_telegram(message):
 
-        print("TELEGRAM TEST: OK")
+        print(
+            "TELEGRAM TEST: OK"
+        )
 
     else:
 
-        print("TELEGRAM TEST: FAILED")
+        print(
+            "TELEGRAM TEST: FAILED"
+        )
 
 
 # ============================================================
@@ -393,9 +417,14 @@ def telegram_startup_test():
 
 def load_exchange_info():
 
-    print("Loading Binance exchange info...")
+    print(
+        "Loading Binance exchange info..."
+    )
 
-    url = f"{BINANCE_REST}/api/v3/exchangeInfo"
+    url = (
+        f"{BINANCE_REST}"
+        "/api/v3/exchangeInfo"
+    )
 
     response = session.get(
         url,
@@ -408,13 +437,20 @@ def load_exchange_info():
 
     result = []
 
-    for item in data.get("symbols", []):
+    for item in data.get(
+        "symbols",
+        []
+    ):
 
-        if item.get("status") != "TRADING":
+        if item.get(
+            "status"
+        ) != "TRADING":
 
             continue
 
-        if item.get("quoteAsset") != "USDT":
+        if item.get(
+            "quoteAsset"
+        ) != "USDT":
 
             continue
 
@@ -455,12 +491,17 @@ def load_exchange_info():
 # 24H VOLUME
 # ============================================================
 
-def load_24h_volumes(all_symbols):
+def load_24h_volumes(
+    all_symbols
+):
 
-    print("Loading 24H ticker data...")
+    print(
+        "Loading 24H ticker data..."
+    )
 
     url = (
-        f"{BINANCE_REST}/api/v3/ticker/24hr"
+        f"{BINANCE_REST}"
+        "/api/v3/ticker/24hr"
     )
 
     response = session.get(
@@ -472,7 +513,9 @@ def load_24h_volumes(all_symbols):
 
     data = response.json()
 
-    allowed = set(all_symbols)
+    allowed = set(
+        all_symbols
+    )
 
     result = {}
 
@@ -484,11 +527,12 @@ def load_24h_volumes(all_symbols):
         ).lower()
 
         if symbol not in allowed:
-
             continue
 
         quote_volume = safe_float(
-            ticker.get("quoteVolume")
+            ticker.get(
+                "quoteVolume"
+            )
         )
 
         if (
@@ -512,19 +556,25 @@ def load_24h_volumes(all_symbols):
 # HISTORY
 # ============================================================
 
-def load_symbol_history(symbol):
+def load_symbol_history(
+    symbol
+):
 
     url = (
-        f"{BINANCE_REST}/api/v3/klines"
+        f"{BINANCE_REST}"
+        "/api/v3/klines"
     )
 
     params = {
 
-        "symbol": symbol.upper(),
+        "symbol":
+            symbol.upper(),
 
-        "interval": INTERVAL,
+        "interval":
+            INTERVAL,
 
-        "limit": HISTORY_LIMIT
+        "limit":
+            HISTORY_LIMIT
     }
 
     try:
@@ -549,29 +599,38 @@ def load_symbol_history(symbol):
 
         for k in data:
 
-            close_time = int(k[6])
+            close_time = int(
+                k[6]
+            )
 
             if close_time >= now_ms:
-
                 continue
 
             candles.append({
 
-                "open_time": int(k[0]),
+                "open_time":
+                    int(k[0]),
 
-                "open": safe_float(k[1]),
+                "open":
+                    safe_float(k[1]),
 
-                "high": safe_float(k[2]),
+                "high":
+                    safe_float(k[2]),
 
-                "low": safe_float(k[3]),
+                "low":
+                    safe_float(k[3]),
 
-                "close": safe_float(k[4]),
+                "close":
+                    safe_float(k[4]),
 
-                "volume": safe_float(k[5]),
+                "volume":
+                    safe_float(k[5]),
 
-                "quote_volume": safe_float(k[7]),
+                "quote_volume":
+                    safe_float(k[7]),
 
-                "trades": int(k[8]),
+                "trades":
+                    int(k[8]),
 
                 "taker_buy_base":
                     safe_float(k[9]),
@@ -579,7 +638,8 @@ def load_symbol_history(symbol):
                 "taker_buy_quote":
                     safe_float(k[10]),
 
-                "closed": True
+                "closed":
+                    True
             })
 
         return symbol, candles
@@ -596,7 +656,7 @@ def load_symbol_history(symbol):
 def load_all_histories():
 
     print(
-        f"Loading 5M history for "
+        "Loading 5M history for "
         f"{len(symbols)} symbols..."
     )
 
@@ -637,7 +697,7 @@ def load_all_histories():
             if completed % 50 == 0:
 
                 print(
-                    f"History: "
+                    "History:",
                     f"{completed}/"
                     f"{len(symbols)}"
                 )
@@ -652,7 +712,9 @@ def load_all_histories():
 # RESISTANCE
 # ============================================================
 
-def find_resistance(symbol):
+def find_resistance(
+    symbol
+):
 
     with data_lock:
 
@@ -664,7 +726,6 @@ def find_resistance(symbol):
         )
 
     if len(history) < 20:
-
         return None
 
     candles = history[
@@ -672,14 +733,9 @@ def find_resistance(symbol):
     ]
 
     if len(candles) < 20:
-
         return None
 
     candidates = []
-
-    # --------------------------------------------------------
-    # LOCAL HIGH PIVOTS
-    # --------------------------------------------------------
 
     for i in range(
         2,
@@ -708,11 +764,15 @@ def find_resistance(symbol):
             )
         ]
 
-        if high < max(left_highs):
+        if high < max(
+            left_highs
+        ):
 
             continue
 
-        if high < max(right_highs):
+        if high < max(
+            right_highs
+        ):
 
             continue
 
@@ -722,25 +782,31 @@ def find_resistance(symbol):
             - i
         )
 
-        if age < MIN_RESISTANCE_AGE:
+        if (
+            age
+            < MIN_RESISTANCE_AGE
+        ):
 
             continue
 
         candidates.append({
 
-            "price": high,
+            "price":
+                high,
 
-            "index": i,
+            "index":
+                i,
 
-            "age": age
+            "age":
+                age
         })
 
     if not candidates:
-
         return None
 
     candidates.sort(
-        key=lambda x: x["index"],
+        key=lambda x:
+            x["index"],
         reverse=True
     )
 
@@ -748,20 +814,21 @@ def find_resistance(symbol):
 
     best_score = -999999
 
-    current_price = candles[-1]["close"]
-
-    # --------------------------------------------------------
-    # CHECK PIVOTS
-    # --------------------------------------------------------
+    current_price = (
+        candles[-1]["close"]
+    )
 
     for candidate in candidates:
 
-        resistance = candidate["price"]
+        resistance = (
+            candidate["price"]
+        )
 
-        pivot_index = candidate["index"]
+        pivot_index = (
+            candidate["index"]
+        )
 
         if resistance <= 0:
-
             continue
 
         tolerance = (
@@ -779,7 +846,6 @@ def find_resistance(symbol):
         ):
 
             if i == pivot_index:
-
                 continue
 
             high = candles[i]["high"]
@@ -791,7 +857,8 @@ def find_resistance(symbol):
                 continue
 
             if (
-                last_test_index is not None
+                last_test_index
+                is not None
                 and
                 i - last_test_index
                 < MIN_TEST_DISTANCE_CANDLES
@@ -803,7 +870,9 @@ def find_resistance(symbol):
 
             last_test_index = i
 
-        test_count = len(tests) + 1
+        test_count = (
+            len(tests) + 1
+        )
 
         if (
             test_count
@@ -825,7 +894,6 @@ def find_resistance(symbol):
             )
 
             if age < recent_test_age:
-
                 recent_test_age = age
 
             if (
@@ -836,7 +904,6 @@ def find_resistance(symbol):
                 recent_test = True
 
         if not recent_test:
-
             continue
 
         distance_percent = abs(
@@ -880,19 +947,26 @@ def find_resistance(symbol):
             > best_score
         ):
 
-            best_score = candidate_score
+            best_score = (
+                candidate_score
+            )
 
             best_candidate = {
 
-                "price": resistance,
+                "price":
+                    resistance,
 
-                "index": pivot_index,
+                "index":
+                    pivot_index,
 
-                "age": candidate["age"],
+                "age":
+                    candidate["age"],
 
-                "tests": test_count,
+                "tests":
+                    test_count,
 
-                "strength": strength,
+                "strength":
+                    strength,
 
                 "recent_test_age":
                     recent_test_age,
@@ -905,75 +979,67 @@ def find_resistance(symbol):
 
 
 # ============================================================
-# SCORE FUNCTIONS
+# SCORE
 # ============================================================
 
-def momentum_score(price_change):
+def momentum_score(
+    price_change
+):
 
     if price_change >= 5:
-
         return 25
 
     if price_change >= 4:
-
         return 20
 
     if price_change >= 3:
-
         return 15
 
     if price_change >= 2:
-
         return 10
 
     if price_change >= 1:
-
         return 5
 
     return 0
 
 
-def volume_score(ratio):
+def volume_score(
+    ratio
+):
 
     if ratio >= 4:
-
         return 20
 
     if ratio >= 3:
-
         return 17
 
     if ratio >= 2:
-
         return 14
 
     if ratio >= 1.5:
-
         return 8
 
     if ratio >= 1.2:
-
         return 4
 
     return 0
 
 
-def buy_pressure_score(pressure):
+def buy_pressure_score(
+    pressure
+):
 
     if pressure >= 65:
-
         return 20
 
     if pressure >= 60:
-
         return 15
 
     if pressure >= 55:
-
         return 10
 
     if pressure >= 50:
-
         return 5
 
     return 0
@@ -985,25 +1051,27 @@ def breakout_score(
 ):
 
     if resistance <= 0:
-
         return 0, 0.0
 
     breakout = (
-        (price - resistance)
+        (
+            price
+            - resistance
+        )
         / resistance
     ) * 100.0
 
     if breakout >= 1.0:
-
         return 15, breakout
 
     if breakout >= 0.75:
-
         return 12, breakout
 
     if breakout >= 0.50:
-
         return 8, breakout
+
+    if breakout >= 0.30:
+        return 5, breakout
 
     return 0, breakout
 
@@ -1014,7 +1082,6 @@ def breakout_volume_score(
 ):
 
     if average_volume <= 0:
-
         return 0, 0.0
 
     ratio = (
@@ -1023,25 +1090,23 @@ def breakout_volume_score(
     )
 
     if ratio >= 4:
-
         return 10, ratio
 
     if ratio >= 3:
-
         return 8, ratio
 
     if ratio >= 2:
-
         return 6, ratio
 
     if ratio >= 1.5:
-
-        return 3, ratio
+        return 4, ratio
 
     return 0, ratio
 
 
-def candle_quality(candle):
+def candle_quality(
+    candle
+):
 
     open_price = candle["open"]
 
@@ -1115,7 +1180,7 @@ def candle_quality(candle):
 
 
 # ============================================================
-# BOOK TICKER
+# BOOK
 # ============================================================
 
 def store_book(
@@ -1128,7 +1193,6 @@ def store_book(
     global last_book_update
 
     if bid <= 0 or ask <= 0:
-
         return
 
     now = time.time()
@@ -1137,11 +1201,14 @@ def store_book(
 
         book_data[symbol] = {
 
-            "bid": bid,
+            "bid":
+                bid,
 
-            "ask": ask,
+            "ask":
+                ask,
 
-            "timestamp": now
+            "timestamp":
+                now
         }
 
         book_updates += 1
@@ -1149,7 +1216,9 @@ def store_book(
         last_book_update = now
 
 
-def get_spread(symbol):
+def get_spread(
+    symbol
+):
 
     with data_lock:
 
@@ -1173,7 +1242,10 @@ def get_spread(symbol):
 
             ask = data["ask"]
 
-            if bid > 0 and ask > 0:
+            if (
+                bid > 0
+                and ask > 0
+            ):
 
                 mid = (
                     bid + ask
@@ -1184,15 +1256,13 @@ def get_spread(symbol):
                     / mid
                 ) * 100.0
 
-    # --------------------------------------------------------
-    # REST FALLBACK
-    # --------------------------------------------------------
-
     now = time.time()
 
     last_req = (
-        rest_book_last_request
-        .get(symbol, 0)
+        rest_book_last_request.get(
+            symbol,
+            0
+        )
     )
 
     if (
@@ -1214,7 +1284,7 @@ def get_spread(symbol):
 
         url = (
             f"{BINANCE_REST}"
-            f"/api/v3/ticker/bookTicker"
+            "/api/v3/ticker/bookTicker"
         )
 
         response = session.get(
@@ -1237,14 +1307,21 @@ def get_spread(symbol):
         data = response.json()
 
         bid = safe_float(
-            data.get("bidPrice")
+            data.get(
+                "bidPrice"
+            )
         )
 
         ask = safe_float(
-            data.get("askPrice")
+            data.get(
+                "askPrice"
+            )
         )
 
-        if bid <= 0 or ask <= 0:
+        if (
+            bid <= 0
+            or ask <= 0
+        ):
 
             inc_stat(
                 "spread_missing"
@@ -1285,7 +1362,9 @@ def get_spread(symbol):
 # ANALYZE
 # ============================================================
 
-def analyze_symbol(symbol):
+def analyze_symbol(
+    symbol
+):
 
     inc_stat("checked")
 
@@ -1321,8 +1400,9 @@ def analyze_symbol(symbol):
 
         return None
 
+
     # ========================================================
-    # PRICE / MOMENTUM
+    # MOMENTUM
     # ========================================================
 
     open_price = candle["open"]
@@ -1335,7 +1415,6 @@ def analyze_symbol(symbol):
     )
 
     if price_change <= 0:
-
         return None
 
     if (
@@ -1350,10 +1429,12 @@ def analyze_symbol(symbol):
     )
 
     if momentum_points <= 0:
-
         return None
 
-    inc_stat("momentum")
+    inc_stat(
+        "momentum"
+    )
+
 
     # ========================================================
     # VOLUME
@@ -1373,7 +1454,6 @@ def analyze_symbol(symbol):
     ]
 
     if not volumes:
-
         return None
 
     average_volume = (
@@ -1386,7 +1466,6 @@ def analyze_symbol(symbol):
     )
 
     if average_volume <= 0:
-
         return None
 
     volume_ratio = (
@@ -1401,11 +1480,14 @@ def analyze_symbol(symbol):
 
         return None
 
-    inc_stat("volume")
+    inc_stat(
+        "volume"
+    )
 
     volume_points = volume_score(
         volume_ratio
     )
+
 
     # ========================================================
     # BUY PRESSURE
@@ -1416,7 +1498,6 @@ def analyze_symbol(symbol):
     )
 
     if current_volume <= 0:
-
         return None
 
     buy_pressure = (
@@ -1431,25 +1512,33 @@ def analyze_symbol(symbol):
 
         return None
 
-    inc_stat("buy_pressure")
-
-    buy_points = buy_pressure_score(
-        buy_pressure
+    inc_stat(
+        "buy_pressure"
     )
+
+    buy_points = (
+        buy_pressure_score(
+            buy_pressure
+        )
+    )
+
 
     # ========================================================
     # RESISTANCE
     # ========================================================
 
-    resistance_data = find_resistance(
-        symbol
+    resistance_data = (
+        find_resistance(
+            symbol
+        )
     )
 
     if not resistance_data:
-
         return None
 
-    inc_stat("resistance")
+    inc_stat(
+        "resistance"
+    )
 
     resistance = (
         resistance_data["price"]
@@ -1467,22 +1556,22 @@ def analyze_symbol(symbol):
         resistance_data["strength"]
     )
 
+
     # ========================================================
     # BREAKOUT
     # ========================================================
 
     if price <= resistance:
-
         return None
 
-    breakout_points, breakout_percent = (
-        breakout_score(
-            price,
-            resistance
-        )
+    (
+        breakout_points,
+        breakout_percent
+    ) = breakout_score(
+        price,
+        resistance
     )
 
-    # Minimum breakout
     if (
         breakout_percent
         < MIN_BREAKOUT_PERCENT
@@ -1490,26 +1579,10 @@ def analyze_symbol(symbol):
 
         return None
 
-    # ========================================================
-    # IMPORTANT:
-    # ÇOX GEC BREAKOUTLARI QƏBUL ETMƏ
-    #
-    # Məsələn:
-    # Resistance = 0.0503
-    # Price      = 0.0541
-    # Breakout   = +7.55%
-    #
-    # Belə siqnal artıq gecdir və rədd edilir.
-    # ========================================================
+    inc_stat(
+        "breakout"
+    )
 
-    if (
-        breakout_percent
-        > MAX_BREAKOUT_PERCENT
-    ):
-
-        return None
-
-    inc_stat("breakout")
 
     # ========================================================
     # BREAKOUT VOLUME
@@ -1530,7 +1603,10 @@ def analyze_symbol(symbol):
 
         return None
 
-    inc_stat("breakout_volume")
+    inc_stat(
+        "breakout_volume"
+    )
+
 
     # ========================================================
     # CANDLE QUALITY
@@ -1545,10 +1621,12 @@ def analyze_symbol(symbol):
     )
 
     if candle_points <= 0:
-
         return None
 
-    inc_stat("candle_quality")
+    inc_stat(
+        "candle_quality"
+    )
+
 
     # ========================================================
     # SPREAD
@@ -1559,7 +1637,6 @@ def analyze_symbol(symbol):
     )
 
     if spread is None:
-
         return None
 
     if (
@@ -1573,10 +1650,13 @@ def analyze_symbol(symbol):
 
         return None
 
-    inc_stat("spread")
+    inc_stat(
+        "spread"
+    )
+
 
     # ========================================================
-    # TOTAL SCORE
+    # SCORE
     # ========================================================
 
     total_score = (
@@ -1610,7 +1690,10 @@ def analyze_symbol(symbol):
 
         return None
 
-    inc_stat("score")
+    inc_stat(
+        "score"
+    )
+
 
     # ========================================================
     # COOLDOWN
@@ -1671,17 +1754,24 @@ def analyze_symbol(symbol):
             symbol
         ] = resistance
 
-    inc_stat("signals")
+    inc_stat(
+        "signals"
+    )
+
 
     # ========================================================
     # LEVELS
     # ========================================================
 
     status = (
+
         "🔥 STRONG BUY"
+
         if total_score
         >= STRONG_SIGNAL_SCORE
+
         else
+
         "🟢 BUY"
     )
 
@@ -1815,17 +1905,19 @@ def analyze_symbol(symbol):
 
 
 # ============================================================
-# SIGNAL MESSAGE
+# MESSAGE
 # ============================================================
 
-def format_signal(signal):
+def format_signal(
+    signal
+):
 
     symbol = signal["symbol"]
 
     return f"""
 {signal["status"]}
 
-<b>🚀 5M MOMENTUM + REAL BREAKOUT</b>
+<b>🚀 5M MOMENTUM + EARLY BREAKOUT</b>
 
 🪙 <b>{symbol}</b>
 
@@ -1879,16 +1971,16 @@ def format_signal(signal):
 <b>{signal["momentum_points"]}/25</b>
 
 🔥 Volume:
-<b>{min(signal["volume_points"], 20)}/20</b>
+<b>{min(signal["volume_points"],20)}/20</b>
 
 🟢 Buy Pressure:
 <b>{signal["buy_points"]}/20</b>
 
 💥 Breakout:
-<b>{min(signal["breakout_points"], 15)}/15</b>
+<b>{min(signal["breakout_points"],15)}/15</b>
 
 🔥 Breakout Volume:
-<b>{min(signal["breakout_volume_points"], 10)}/10</b>
+<b>{min(signal["breakout_volume_points"],10)}/10</b>
 
 🕯 Candle:
 <b>{signal["candle_points"]}/10</b>
@@ -1916,7 +2008,7 @@ def format_signal(signal):
 ━━━━━━━━━━━━━━━━━━
 
 💧 24H Volume:
-<b>${volume_24h.get(symbol.lower(), 0):,.0f}</b>
+<b>${volume_24h.get(symbol.lower(),0):,.0f}</b>
 
 ⚠️ <b>ALERT ONLY</b>
 No automatic order.
@@ -1924,7 +2016,7 @@ No automatic order.
 
 
 # ============================================================
-# KLINE
+# KLINE PROCESS
 # ============================================================
 
 def process_kline(
@@ -2010,18 +2102,16 @@ def process_kline(
 
             return
 
-    # ========================================================
-    # ANALYZE LIVE 5M CANDLE
-    # ========================================================
-
     signal = analyze_symbol(
         symbol
     )
 
     if signal:
 
-        message = format_signal(
-            signal
+        message = (
+            format_signal(
+                signal
+            )
         )
 
         print(
@@ -2039,28 +2129,55 @@ def process_kline(
 
 
 # ============================================================
-# BOOK TICKER WORKER
+# WEBSOCKET URL
 # ============================================================
 
-def book_ticker_worker(
-    symbol_chunk
+def make_ws_url(
+    symbol_chunk,
+    stream_type
 ):
 
-    streams = [
+    if stream_type == "kline":
 
-        f"{symbol}@bookTicker"
+        streams = [
 
-        for symbol in symbol_chunk
-    ]
+            f"{symbol}@kline_5m"
+
+            for symbol in symbol_chunk
+        ]
+
+    else:
+
+        streams = [
+
+            f"{symbol}@bookTicker"
+
+            for symbol in symbol_chunk
+        ]
 
     stream_string = "/".join(
         streams
     )
 
-    url = (
+    return (
         f"{BINANCE_WS}"
         f"/stream?streams="
         f"{stream_string}"
+    )
+
+
+# ============================================================
+# KLINE WEBSOCKET
+# 403 FIX
+# ============================================================
+
+def kline_websocket_worker(
+    symbol_chunk
+):
+
+    url = make_ws_url(
+        symbol_chunk,
+        "kline"
     )
 
     while running:
@@ -2068,17 +2185,156 @@ def book_ticker_worker(
         try:
 
             print(
-                f"BOOK WS connecting "
+                "KLINE WS connecting "
                 f"{len(symbol_chunk)} "
-                f"symbols..."
+                "symbols..."
             )
 
             def on_open(ws):
 
                 print(
-                    f"BOOK WS CONNECTED "
+                    "KLINE WS CONNECTED "
                     f"{len(symbol_chunk)} "
-                    f"symbols"
+                    "symbols"
+                )
+
+            def on_message(
+                ws,
+                message
+            ):
+
+                try:
+
+                    data = json.loads(
+                        message
+                    )
+
+                    payload = data.get(
+                        "data",
+                        data
+                    )
+
+                    if (
+                        payload.get("e")
+                        != "kline"
+                    ):
+
+                        return
+
+                    symbol = (
+                        payload["s"]
+                        .lower()
+                    )
+
+                    process_kline(
+                        symbol,
+                        payload["k"]
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "Kline message error:",
+                        e
+                    )
+
+            def on_error(
+                ws,
+                error
+            ):
+
+                print(
+                    "KLINE WS ERROR:",
+                    error
+                )
+
+            def on_close(
+                ws,
+                code,
+                reason
+            ):
+
+                print(
+                    "KLINE WS CLOSED:",
+                    code,
+                    reason
+                )
+
+            ws = websocket.WebSocketApp(
+
+                url,
+
+                on_open=on_open,
+
+                on_message=on_message,
+
+                on_error=on_error,
+
+                on_close=on_close
+            )
+
+            # =================================================
+            # 403 FIX:
+            # 443 PORT + BINANCE ORIGIN
+            # =================================================
+
+            ws.run_forever(
+
+                ping_interval=20,
+
+                ping_timeout=10,
+
+                origin="https://www.binance.com"
+            )
+
+        except Exception as e:
+
+            print(
+                "Kline WS exception:",
+                e
+            )
+
+        if running:
+
+            print(
+                "Kline WS reconnecting..."
+            )
+
+            time.sleep(
+                RECONNECT_SECONDS
+            )
+
+
+# ============================================================
+# BOOK WEBSOCKET
+# 403 FIX
+# ============================================================
+
+def book_ticker_worker(
+    symbol_chunk
+):
+
+    url = make_ws_url(
+        symbol_chunk,
+        "book"
+    )
+
+    while running:
+
+        try:
+
+            print(
+                "BOOK WS connecting "
+                f"{len(symbol_chunk)} "
+                "symbols..."
+            )
+
+            def on_open(ws):
+
+                print(
+                    "BOOK WS CONNECTED "
+                    f"{len(symbol_chunk)} "
+                    "symbols"
                 )
 
             def on_message(
@@ -2102,7 +2358,6 @@ def book_ticker_worker(
                     )
 
                     if not symbol:
-
                         return
 
                     symbol = (
@@ -2150,7 +2405,7 @@ def book_ticker_worker(
             ):
 
                 print(
-                    "BOOK WS error:",
+                    "BOOK WS ERROR:",
                     error
                 )
 
@@ -2161,7 +2416,7 @@ def book_ticker_worker(
             ):
 
                 print(
-                    "BOOK WS closed:",
+                    "BOOK WS CLOSED:",
                     code,
                     reason
                 )
@@ -2183,7 +2438,9 @@ def book_ticker_worker(
 
                 ping_interval=20,
 
-                ping_timeout=10
+                ping_timeout=10,
+
+                origin="https://www.binance.com"
             )
 
         except Exception as e:
@@ -2195,146 +2452,9 @@ def book_ticker_worker(
 
         if running:
 
-            time.sleep(
-                RECONNECT_SECONDS
-            )
-
-
-# ============================================================
-# KLINE WEBSOCKET
-# ============================================================
-
-def kline_websocket_worker(
-    symbol_chunk
-):
-
-    streams = [
-
-        f"{symbol}@kline_5m"
-
-        for symbol in symbol_chunk
-    ]
-
-    stream_string = "/".join(
-        streams
-    )
-
-    url = (
-        f"{BINANCE_WS}"
-        f"/stream?streams="
-        f"{stream_string}"
-    )
-
-    while running:
-
-        try:
-
             print(
-                f"KLINE WS connecting "
-                f"{len(symbol_chunk)} "
-                f"symbols..."
+                "Book WS reconnecting..."
             )
-
-            def on_open(ws):
-
-                print(
-                    f"KLINE WS CONNECTED "
-                    f"{len(symbol_chunk)} "
-                    f"symbols"
-                )
-
-            def on_message(
-                ws,
-                message
-            ):
-
-                try:
-
-                    data = json.loads(
-                        message
-                    )
-
-                    payload = data.get(
-                        "data",
-                        data
-                    )
-
-                    if (
-                        payload.get("e")
-                        != "kline"
-                    ):
-
-                        return
-
-                    symbol = (
-                        payload["s"]
-                        .lower()
-                    )
-
-                    k = payload["k"]
-
-                    process_kline(
-                        symbol,
-                        k
-                    )
-
-                except Exception as e:
-
-                    print(
-                        "Kline message error:",
-                        e
-                    )
-
-            def on_error(
-                ws,
-                error
-            ):
-
-                print(
-                    "Kline WS error:",
-                    error
-                )
-
-            def on_close(
-                ws,
-                code,
-                reason
-            ):
-
-                print(
-                    "Kline WS closed:",
-                    code,
-                    reason
-                )
-
-            ws = websocket.WebSocketApp(
-
-                url,
-
-                on_open=on_open,
-
-                on_message=on_message,
-
-                on_error=on_error,
-
-                on_close=on_close
-            )
-
-            ws.run_forever(
-
-                ping_interval=20,
-
-                ping_timeout=10
-            )
-
-        except Exception as e:
-
-            print(
-                "Kline WS exception:",
-                e
-            )
-
-        if running:
 
             time.sleep(
                 RECONNECT_SECONDS
@@ -2422,18 +2542,14 @@ def status_worker():
             updates
         )
 
-        if book_age >= 0:
-
-            print(
-                "Last book update:",
+        print(
+            "Last book update:",
+            (
                 f"{book_age:.1f}s ago"
+                if book_age >= 0
+                else "NEVER"
             )
-
-        else:
-
-            print(
-                "Last book update: NEVER"
-            )
+        )
 
         print(
             "\n----------- DEBUG 5M ---------------"
@@ -2495,7 +2611,7 @@ def status_worker():
         )
 
         print(
-            "Score >= 70:",
+            "Score >= 60:",
             current["score"]
         )
 
@@ -2582,14 +2698,14 @@ def main():
     print(
         """
 ============================================================
-       5M MOMENTUM + REAL BREAKOUT BOT v7
+          5M MOMENTUM + EARLY BREAKOUT v7
 ============================================================
 
 TIMEFRAME:
 5M
 
-SYMBOL:
-BINANCE SPOT USDT
+BINANCE:
+SPOT USDT
 
 24H VOLUME:
 >= $1,000,000
@@ -2599,11 +2715,10 @@ HISTORY:
 
 RESISTANCE:
 200 candles
-Minimum age: 5 candles
+Minimum age: 3 candles
 Minimum tests: 2
-Test distance: 2 candles
-Tolerance: 0.40%
-Recent test: 30 candles
+Tolerance: 0.60%
+Recent test: 40 candles
 
 SCORE:
 Momentum           25
@@ -2616,26 +2731,28 @@ Candle Quality     10
 TOTAL              100
 
 MIN SIGNAL:
-70
+60
 
 STRONG:
-80
+75
 
 BREAKOUT:
->= +0.50%
-<= +3.00%
+>= +0.30%
 
 BREAKOUT VOLUME:
->= 2x average
+>= 1.5x average
+
+MAX 5M PUMP:
+8%
 
 SPREAD:
 <= 0.20%
 
-BOOK:
-Per-symbol @bookTicker
+WEBSOCKET:
+PORT 443
 
-REST FALLBACK:
-ACTIVE
+CHUNK:
+50 symbols
 
 TELEGRAM:
 ACTIVE
@@ -2643,10 +2760,6 @@ ACTIVE
 ============================================================
 """
     )
-
-    # ========================================================
-    # TELEGRAM
-    # ========================================================
 
     telegram_startup_test()
 
@@ -2684,9 +2797,7 @@ ACTIVE
         )
 
         send_telegram(
-
             "🔴 <b>BOT ERROR</b>\n\n"
-
             "Heç bir Binance USDT "
             "coin filterdən keçmədi."
         )
@@ -2704,11 +2815,8 @@ ACTIVE
     # ========================================================
 
     threading.Thread(
-
         target=status_worker,
-
         daemon=True
-
     ).start()
 
     # ========================================================
@@ -2716,15 +2824,15 @@ ACTIVE
     # ========================================================
 
     threading.Thread(
-
         target=volume_refresh_worker,
-
         daemon=True
-
     ).start()
 
     # ========================================================
     # WEBSOCKET CHUNKS
+    #
+    # 100 əvəzinə 50.
+    # 403 / uzun URL problemini azaltmaq üçün.
     # ========================================================
 
     chunks = [
@@ -2744,35 +2852,27 @@ ACTIVE
     )
 
     # ========================================================
-    # START WEBSOCKETS
+    # START WS
     # ========================================================
 
     for chunk in chunks:
 
         threading.Thread(
-
             target=kline_websocket_worker,
-
             args=(chunk,),
-
             daemon=True
-
         ).start()
 
         threading.Thread(
-
             target=book_ticker_worker,
-
             args=(chunk,),
-
             daemon=True
-
         ).start()
 
-        time.sleep(0.5)
+        time.sleep(1)
 
     # ========================================================
-    # BOT STARTED
+    # STARTED
     # ========================================================
 
     print(
@@ -2792,13 +2892,19 @@ ACTIVE
 
         "📡 Kline WebSocket: ACTIVE\n"
 
-        "📖 Per-symbol BookTicker: ACTIVE\n"
+        "🔌 WebSocket port: 443\n"
+
+        "📖 BookTicker: ACTIVE\n"
 
         "🛟 REST Spread Fallback: ACTIVE\n"
 
-        "🔎 Resistance Detection: ACTIVE\n"
+        "🔎 Resistance: ACTIVE\n"
 
-        "💥 Breakout: +0.50% → +3.00%\n"
+        "💥 Breakout: +0.30%\n"
+
+        "🔥 Breakout Volume: 1.5x\n"
+
+        "🏆 Minimum Score: 60\n"
 
         "📊 Debug: ACTIVE\n\n"
 
