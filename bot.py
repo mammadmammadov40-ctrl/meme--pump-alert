@@ -1,3 +1,4 @@
+print("BOT.PY ISLEYIR", flush=True)
 import os
 import time
 import json
