@@ -1,28 +1,12 @@
-print("1 - BOT.PY ISLEYIR", flush=True)
-
 import os
-print("2 - os OK", flush=True)
-
 import time
-print("3 - time OK", flush=True)
-
 import json
-print("4 - json OK", flush=True)
-
 import threading
-print("5 - threading OK", flush=True)
-
 from collections import deque
-print("6 - collections OK", flush=True)
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
-print("7 - concurrent OK", flush=True)
 
 import requests
-print("8 - requests OK", flush=True)
-
 import websocket
-print("9 - websocket OK", flush=True)
 
 
 # ============================================================
@@ -32,7 +16,7 @@ print("9 - websocket OK", flush=True)
 # ============================================================
 
 BINANCE_REST = "https://api.binance.com"
-BINANCE_WS = "wss://stream.binance.com:9443"
+BINANCE_WS = "wss://api.binance.com:443/ws"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -44,7 +28,9 @@ INTERVAL = "5m"
 # HISTORY
 # ============================================================
 
+# 500 əvəzinə 200
 HISTORY_LIMIT = 200
+
 AVERAGE_VOLUME_CANDLES = 20
 RESISTANCE_LOOKBACK = 200
 
@@ -54,9 +40,13 @@ RESISTANCE_LOOKBACK = 200
 # ============================================================
 
 MIN_RESISTANCE_AGE = 5
+
 RESISTANCE_TOLERANCE_PERCENT = 0.40
+
 MIN_TEST_DISTANCE_CANDLES = 2
+
 MIN_RESISTANCE_TESTS = 2
+
 MAX_RECENT_TEST_AGE = 30
 
 
@@ -72,6 +62,7 @@ MIN_24H_QUOTE_VOLUME = 1_000_000
 # ============================================================
 
 MAX_SPREAD_PERCENT = 0.20
+
 BOOK_CACHE_MAX_AGE = 10
 
 
@@ -80,6 +71,7 @@ BOOK_CACHE_MAX_AGE = 10
 # ============================================================
 
 MAX_CURRENT_5M_PRICE = 10.0
+
 MIN_BUY_PRESSURE = 55.0
 
 
@@ -88,6 +80,7 @@ MIN_BUY_PRESSURE = 55.0
 # ============================================================
 
 MIN_SIGNAL_SCORE = 70
+
 STRONG_SIGNAL_SCORE = 80
 
 
@@ -102,7 +95,13 @@ VOLUME_MIN_RATIO = 1.2
 # BREAKOUT
 # ============================================================
 
+# Resistance ən azı 0.50% qırılmalıdır
 MIN_BREAKOUT_PERCENT = 0.50
+
+# Çox gec siqnal gəlməsin.
+# Resistance-dən 3%-dən çox yuxarı qalxmış coin qəbul edilmir.
+MAX_BREAKOUT_PERCENT = 3.00
+
 MIN_BREAKOUT_VOLUME_RATIO = 2.0
 
 
@@ -111,6 +110,7 @@ MIN_BREAKOUT_VOLUME_RATIO = 2.0
 # ============================================================
 
 MIN_CLOSE_POSITION = 70.0
+
 MAX_UPPER_WICK_PERCENT = 30.0
 
 
@@ -130,6 +130,7 @@ TP3_PERCENT = 8.0
 # ============================================================
 
 WS_CHUNK_SIZE = 100
+
 RECONNECT_SECONDS = 5
 
 
@@ -138,7 +139,9 @@ RECONNECT_SECONDS = 5
 # ============================================================
 
 STATUS_INTERVAL = 60
+
 SIGNAL_COOLDOWN_SECONDS = 30 * 60
+
 SAME_RESISTANCE_TOLERANCE = 0.10
 
 
@@ -147,6 +150,7 @@ SAME_RESISTANCE_TOLERANCE = 0.10
 # ============================================================
 
 REST_BOOK_TIMEOUT = 5
+
 REST_BOOK_MIN_INTERVAL = 1.0
 
 
@@ -160,24 +164,39 @@ session.headers.update({
     "User-Agent": "FiveMinuteMomentumBreakoutBot/7.0"
 })
 
+
 symbols = []
+
 volume_24h = {}
+
 candle_history = {}
+
 live_candles = {}
+
 book_data = {}
 
 last_signal_time = {}
+
 alerted_breakouts = {}
 
 running = True
 
+
 data_lock = threading.RLock()
+
 signal_lock = threading.Lock()
 
+
 book_updates = 0
+
 last_book_update = 0
 
 rest_book_last_request = {}
+
+
+# ============================================================
+# DEBUG
+# ============================================================
 
 stats_lock = threading.Lock()
 
@@ -200,24 +219,28 @@ stats = {
 }
 
 
-# ============================================================
-# DEBUG
-# ============================================================
-
 def reset_stats():
+
     with stats_lock:
+
         for key in stats:
+
             stats[key] = 0
 
 
 def inc_stat(name):
+
     with stats_lock:
+
         if name in stats:
+
             stats[name] += 1
 
 
 def get_stats():
+
     with stats_lock:
+
         return dict(stats)
 
 
@@ -226,21 +249,28 @@ def get_stats():
 # ============================================================
 
 def safe_float(value, default=0.0):
+
     try:
+
         return float(value)
+
     except Exception:
+
         return default
 
 
 def round_price(price):
 
     if price >= 1000:
+
         return round(price, 2)
 
     if price >= 1:
+
         return round(price, 4)
 
     if price >= 0.01:
+
         return round(price, 6)
 
     return round(price, 8)
@@ -249,6 +279,7 @@ def round_price(price):
 def percent_change(open_price, current_price):
 
     if open_price <= 0:
+
         return 0.0
 
     return (
@@ -264,19 +295,19 @@ def percent_change(open_price, current_price):
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
-        print(
-            "ERROR: TELEGRAM_BOT_TOKEN yoxdur.",
-            flush=True
-        )
+
+        print("ERROR: TELEGRAM_BOT_TOKEN yoxdur.")
+
         inc_stat("telegram_failed")
+
         return False
 
     if not TELEGRAM_CHAT_ID:
-        print(
-            "ERROR: TELEGRAM_CHAT_ID yoxdur.",
-            flush=True
-        )
+
+        print("ERROR: TELEGRAM_CHAT_ID yoxdur.")
+
         inc_stat("telegram_failed")
+
         return False
 
     url = (
@@ -285,9 +316,13 @@ def send_telegram(message):
     )
 
     payload = {
+
         "chat_id": TELEGRAM_CHAT_ID,
+
         "text": message,
+
         "parse_mode": "HTML",
+
         "disable_web_page_preview": True
     }
 
@@ -301,10 +336,7 @@ def send_telegram(message):
 
         if response.status_code == 200:
 
-            print(
-                "Telegram message sent.",
-                flush=True
-            )
+            print("Telegram message sent.")
 
             inc_stat("telegram_ok")
 
@@ -313,8 +345,7 @@ def send_telegram(message):
         print(
             "Telegram ERROR:",
             response.status_code,
-            response.text[:500],
-            flush=True
+            response.text[:500]
         )
 
         inc_stat("telegram_failed")
@@ -323,8 +354,7 @@ def send_telegram(message):
 
         print(
             "Telegram exception:",
-            e,
-            flush=True
+            e
         )
 
         inc_stat("telegram_failed")
@@ -334,10 +364,7 @@ def send_telegram(message):
 
 def telegram_startup_test():
 
-    print(
-        "Testing Telegram...",
-        flush=True
-    )
+    print("Testing Telegram...")
 
     message = (
         "🟢 <b>BOT STARTED</b>\n\n"
@@ -345,23 +372,19 @@ def telegram_startup_test():
         "📡 Kline WebSocket hazırlanır.\n"
         "📖 BookTicker WebSocket hazırlanır.\n"
         "🛟 REST spread fallback aktivdir.\n"
-        "📊 Debug aktivdir.\n\n"
+        "📊 Debug aktivdir.\n"
+        "📚 History: 200 candles.\n"
+        "💥 Breakout: +0.50% → +3.00%.\n\n"
         "Telegram bağlantısı test olunur ✅"
     )
 
     if send_telegram(message):
 
-        print(
-            "TELEGRAM TEST: OK",
-            flush=True
-        )
+        print("TELEGRAM TEST: OK")
 
     else:
 
-        print(
-            "TELEGRAM TEST: FAILED",
-            flush=True
-        )
+        print("TELEGRAM TEST: FAILED")
 
 
 # ============================================================
@@ -370,15 +393,9 @@ def telegram_startup_test():
 
 def load_exchange_info():
 
-    print(
-        "Loading Binance exchange info...",
-        flush=True
-    )
+    print("Loading Binance exchange info...")
 
-    url = (
-        f"{BINANCE_REST}"
-        f"/api/v3/exchangeInfo"
-    )
+    url = f"{BINANCE_REST}/api/v3/exchangeInfo"
 
     response = session.get(
         url,
@@ -394,15 +411,18 @@ def load_exchange_info():
     for item in data.get("symbols", []):
 
         if item.get("status") != "TRADING":
+
             continue
 
         if item.get("quoteAsset") != "USDT":
+
             continue
 
         if not item.get(
             "isSpotTradingAllowed",
             False
         ):
+
             continue
 
         base = item.get(
@@ -416,6 +436,7 @@ def load_exchange_info():
             or base.endswith("BULL")
             or base.endswith("BEAR")
         ):
+
             continue
 
         result.append(
@@ -424,8 +445,7 @@ def load_exchange_info():
 
     print(
         "USDT Spot symbols:",
-        len(result),
-        flush=True
+        len(result)
     )
 
     return result
@@ -437,14 +457,10 @@ def load_exchange_info():
 
 def load_24h_volumes(all_symbols):
 
-    print(
-        "Loading 24H ticker data...",
-        flush=True
-    )
+    print("Loading 24H ticker data...")
 
     url = (
-        f"{BINANCE_REST}"
-        f"/api/v3/ticker/24hr"
+        f"{BINANCE_REST}/api/v3/ticker/24hr"
     )
 
     response = session.get(
@@ -468,21 +484,25 @@ def load_24h_volumes(all_symbols):
         ).lower()
 
         if symbol not in allowed:
+
             continue
 
         quote_volume = safe_float(
             ticker.get("quoteVolume")
         )
 
-        if quote_volume < MIN_24H_QUOTE_VOLUME:
+        if (
+            quote_volume
+            < MIN_24H_QUOTE_VOLUME
+        ):
+
             continue
 
         result[symbol] = quote_volume
 
     print(
         "After 24H volume filter:",
-        len(result),
-        flush=True
+        len(result)
     )
 
     return result
@@ -495,13 +515,15 @@ def load_24h_volumes(all_symbols):
 def load_symbol_history(symbol):
 
     url = (
-        f"{BINANCE_REST}"
-        f"/api/v3/klines"
+        f"{BINANCE_REST}/api/v3/klines"
     )
 
     params = {
+
         "symbol": symbol.upper(),
+
         "interval": INTERVAL,
+
         "limit": HISTORY_LIMIT
     }
 
@@ -530,20 +552,33 @@ def load_symbol_history(symbol):
             close_time = int(k[6])
 
             if close_time >= now_ms:
+
                 continue
 
             candles.append({
 
                 "open_time": int(k[0]),
+
                 "open": safe_float(k[1]),
+
                 "high": safe_float(k[2]),
+
                 "low": safe_float(k[3]),
+
                 "close": safe_float(k[4]),
+
                 "volume": safe_float(k[5]),
+
                 "quote_volume": safe_float(k[7]),
+
                 "trades": int(k[8]),
-                "taker_buy_base": safe_float(k[9]),
-                "taker_buy_quote": safe_float(k[10]),
+
+                "taker_buy_base":
+                    safe_float(k[9]),
+
+                "taker_buy_quote":
+                    safe_float(k[10]),
+
                 "closed": True
             })
 
@@ -552,8 +587,7 @@ def load_symbol_history(symbol):
     except Exception as e:
 
         print(
-            f"History error {symbol}: {e}",
-            flush=True
+            f"History error {symbol}: {e}"
         )
 
         return symbol, None
@@ -563,8 +597,7 @@ def load_all_histories():
 
     print(
         f"Loading 5M history for "
-        f"{len(symbols)} symbols...",
-        flush=True
+        f"{len(symbols)} symbols..."
     )
 
     with ThreadPoolExecutor(
@@ -572,54 +605,46 @@ def load_all_histories():
     ) as executor:
 
         futures = [
+
             executor.submit(
                 load_symbol_history,
                 symbol
             )
+
             for symbol in symbols
         ]
 
         completed = 0
 
-        for future in as_completed(futures):
+        for future in as_completed(
+            futures
+        ):
 
-            try:
+            symbol, candles = (
+                future.result()
+            )
 
-                symbol, candles = (
-                    future.result()
-                )
+            completed += 1
 
-                completed += 1
+            if candles:
 
-                if candles:
+                with data_lock:
 
-                    with data_lock:
+                    candle_history[
+                        symbol
+                    ] = candles
 
-                        candle_history[
-                            symbol
-                        ] = candles
-
-                if completed % 50 == 0:
-
-                    print(
-                        f"History: "
-                        f"{completed}/"
-                        f"{len(symbols)}",
-                        flush=True
-                    )
-
-            except Exception as e:
+            if completed % 50 == 0:
 
                 print(
-                    "History worker error:",
-                    e,
-                    flush=True
+                    f"History: "
+                    f"{completed}/"
+                    f"{len(symbols)}"
                 )
 
     print(
         "History ready:",
-        len(candle_history),
-        flush=True
+        len(candle_history)
     )
 
 
@@ -639,6 +664,7 @@ def find_resistance(symbol):
         )
 
     if len(history) < 20:
+
         return None
 
     candles = history[
@@ -646,9 +672,14 @@ def find_resistance(symbol):
     ]
 
     if len(candles) < 20:
+
         return None
 
     candidates = []
+
+    # --------------------------------------------------------
+    # LOCAL HIGH PIVOTS
+    # --------------------------------------------------------
 
     for i in range(
         2,
@@ -658,19 +689,31 @@ def find_resistance(symbol):
         high = candles[i]["high"]
 
         left_highs = [
+
             candles[j]["high"]
-            for j in range(i - 2, i)
+
+            for j in range(
+                i - 2,
+                i
+            )
         ]
 
         right_highs = [
+
             candles[j]["high"]
-            for j in range(i + 1, i + 3)
+
+            for j in range(
+                i + 1,
+                i + 3
+            )
         ]
 
         if high < max(left_highs):
+
             continue
 
         if high < max(right_highs):
+
             continue
 
         age = (
@@ -680,15 +723,20 @@ def find_resistance(symbol):
         )
 
         if age < MIN_RESISTANCE_AGE:
+
             continue
 
         candidates.append({
+
             "price": high,
+
             "index": i,
+
             "age": age
         })
 
     if not candidates:
+
         return None
 
     candidates.sort(
@@ -697,16 +745,23 @@ def find_resistance(symbol):
     )
 
     best_candidate = None
+
     best_score = -999999
 
     current_price = candles[-1]["close"]
 
+    # --------------------------------------------------------
+    # CHECK PIVOTS
+    # --------------------------------------------------------
+
     for candidate in candidates:
 
         resistance = candidate["price"]
+
         pivot_index = candidate["index"]
 
         if resistance <= 0:
+
             continue
 
         tolerance = (
@@ -716,11 +771,15 @@ def find_resistance(symbol):
         )
 
         tests = []
+
         last_test_index = None
 
-        for i in range(len(candles)):
+        for i in range(
+            len(candles)
+        ):
 
             if i == pivot_index:
+
                 continue
 
             high = candles[i]["high"]
@@ -728,6 +787,7 @@ def find_resistance(symbol):
             if abs(
                 high - resistance
             ) > tolerance:
+
                 continue
 
             if (
@@ -736,17 +796,24 @@ def find_resistance(symbol):
                 i - last_test_index
                 < MIN_TEST_DISTANCE_CANDLES
             ):
+
                 continue
 
             tests.append(i)
+
             last_test_index = i
 
         test_count = len(tests) + 1
 
-        if test_count < MIN_RESISTANCE_TESTS:
+        if (
+            test_count
+            < MIN_RESISTANCE_TESTS
+        ):
+
             continue
 
         recent_test = False
+
         recent_test_age = 999999
 
         for test_index in tests:
@@ -758,12 +825,18 @@ def find_resistance(symbol):
             )
 
             if age < recent_test_age:
+
                 recent_test_age = age
 
-            if age <= MAX_RECENT_TEST_AGE:
+            if (
+                age
+                <= MAX_RECENT_TEST_AGE
+            ):
+
                 recent_test = True
 
         if not recent_test:
+
             continue
 
         distance_percent = abs(
@@ -802,7 +875,9 @@ def find_resistance(symbol):
 
         if (
             best_candidate is None
-            or candidate_score > best_score
+            or
+            candidate_score
+            > best_score
         ):
 
             best_score = candidate_score
@@ -810,36 +885,49 @@ def find_resistance(symbol):
             best_candidate = {
 
                 "price": resistance,
+
                 "index": pivot_index,
+
                 "age": candidate["age"],
+
                 "tests": test_count,
+
                 "strength": strength,
-                "recent_test_age": recent_test_age,
-                "distance_percent": distance_percent
+
+                "recent_test_age":
+                    recent_test_age,
+
+                "distance_percent":
+                    distance_percent
             }
 
     return best_candidate
 
 
 # ============================================================
-# SCORE
+# SCORE FUNCTIONS
 # ============================================================
 
 def momentum_score(price_change):
 
     if price_change >= 5:
+
         return 25
 
     if price_change >= 4:
+
         return 20
 
     if price_change >= 3:
+
         return 15
 
     if price_change >= 2:
+
         return 10
 
     if price_change >= 1:
+
         return 5
 
     return 0
@@ -848,18 +936,23 @@ def momentum_score(price_change):
 def volume_score(ratio):
 
     if ratio >= 4:
+
         return 20
 
     if ratio >= 3:
+
         return 17
 
     if ratio >= 2:
+
         return 14
 
     if ratio >= 1.5:
+
         return 8
 
     if ratio >= 1.2:
+
         return 4
 
     return 0
@@ -868,23 +961,31 @@ def volume_score(ratio):
 def buy_pressure_score(pressure):
 
     if pressure >= 65:
+
         return 20
 
     if pressure >= 60:
+
         return 15
 
     if pressure >= 55:
+
         return 10
 
     if pressure >= 50:
+
         return 5
 
     return 0
 
 
-def breakout_score(price, resistance):
+def breakout_score(
+    price,
+    resistance
+):
 
     if resistance <= 0:
+
         return 0, 0.0
 
     breakout = (
@@ -893,12 +994,15 @@ def breakout_score(price, resistance):
     ) * 100.0
 
     if breakout >= 1.0:
+
         return 15, breakout
 
     if breakout >= 0.75:
+
         return 12, breakout
 
     if breakout >= 0.50:
+
         return 8, breakout
 
     return 0, breakout
@@ -910,6 +1014,7 @@ def breakout_volume_score(
 ):
 
     if average_volume <= 0:
+
         return 0, 0.0
 
     ratio = (
@@ -918,15 +1023,19 @@ def breakout_volume_score(
     )
 
     if ratio >= 4:
+
         return 10, ratio
 
     if ratio >= 3:
+
         return 8, ratio
 
     if ratio >= 2:
+
         return 6, ratio
 
     if ratio >= 1.5:
+
         return 3, ratio
 
     return 0, ratio
@@ -935,14 +1044,20 @@ def breakout_volume_score(
 def candle_quality(candle):
 
     open_price = candle["open"]
+
     high = candle["high"]
+
     low = candle["low"]
+
     close = candle["close"]
 
     if high <= low:
+
         return 0, 0.0, 0.0
 
-    candle_range = high - low
+    candle_range = (
+        high - low
+    )
 
     close_position = (
         (close - low)
@@ -970,7 +1085,10 @@ def candle_quality(candle):
             upper_wick_percent
         )
 
-    if close_position < MIN_CLOSE_POSITION:
+    if (
+        close_position
+        < MIN_CLOSE_POSITION
+    ):
 
         return (
             0,
@@ -978,7 +1096,10 @@ def candle_quality(candle):
             upper_wick_percent
         )
 
-    if upper_wick_percent > MAX_UPPER_WICK_PERCENT:
+    if (
+        upper_wick_percent
+        > MAX_UPPER_WICK_PERCENT
+    ):
 
         return (
             0,
@@ -997,12 +1118,17 @@ def candle_quality(candle):
 # BOOK TICKER
 # ============================================================
 
-def store_book(symbol, bid, ask):
+def store_book(
+    symbol,
+    bid,
+    ask
+):
 
     global book_updates
     global last_book_update
 
     if bid <= 0 or ask <= 0:
+
         return
 
     now = time.time()
@@ -1010,12 +1136,16 @@ def store_book(symbol, bid, ask):
     with data_lock:
 
         book_data[symbol] = {
+
             "bid": bid,
+
             "ask": ask,
+
             "timestamp": now
         }
 
         book_updates += 1
+
         last_book_update = now
 
 
@@ -1023,7 +1153,9 @@ def get_spread(symbol):
 
     with data_lock:
 
-        data = book_data.get(symbol)
+        data = book_data.get(
+            symbol
+        )
 
     if data:
 
@@ -1032,9 +1164,13 @@ def get_spread(symbol):
             - data["timestamp"]
         )
 
-        if age <= BOOK_CACHE_MAX_AGE:
+        if (
+            age
+            <= BOOK_CACHE_MAX_AGE
+        ):
 
             bid = data["bid"]
+
             ask = data["ask"]
 
             if bid > 0 and ask > 0:
@@ -1048,6 +1184,10 @@ def get_spread(symbol):
                     / mid
                 ) * 100.0
 
+    # --------------------------------------------------------
+    # REST FALLBACK
+    # --------------------------------------------------------
+
     now = time.time()
 
     last_req = (
@@ -1060,7 +1200,9 @@ def get_spread(symbol):
         < REST_BOOK_MIN_INTERVAL
     ):
 
-        inc_stat("spread_missing")
+        inc_stat(
+            "spread_missing"
+        )
 
         return None
 
@@ -1086,7 +1228,9 @@ def get_spread(symbol):
 
         if response.status_code != 200:
 
-            inc_stat("spread_missing")
+            inc_stat(
+                "spread_missing"
+            )
 
             return None
 
@@ -1102,7 +1246,9 @@ def get_spread(symbol):
 
         if bid <= 0 or ask <= 0:
 
-            inc_stat("spread_missing")
+            inc_stat(
+                "spread_missing"
+            )
 
             return None
 
@@ -1124,11 +1270,13 @@ def get_spread(symbol):
     except Exception as e:
 
         print(
-            f"REST book error {symbol}: {e}",
-            flush=True
+            f"REST book error "
+            f"{symbol}: {e}"
         )
 
-        inc_stat("spread_missing")
+        inc_stat(
+            "spread_missing"
+        )
 
         return None
 
@@ -1143,7 +1291,9 @@ def analyze_symbol(symbol):
 
     with data_lock:
 
-        candle = live_candles.get(symbol)
+        candle = live_candles.get(
+            symbol
+        )
 
         history = list(
             candle_history.get(
@@ -1161,14 +1311,22 @@ def analyze_symbol(symbol):
         not candle
         or len(history) < 20
     ):
+
         return None
 
-    if quote_24h < MIN_24H_QUOTE_VOLUME:
+    if (
+        quote_24h
+        < MIN_24H_QUOTE_VOLUME
+    ):
+
         return None
 
-    # PRICE
+    # ========================================================
+    # PRICE / MOMENTUM
+    # ========================================================
 
     open_price = candle["open"]
+
     price = candle["close"]
 
     price_change = percent_change(
@@ -1177,9 +1335,14 @@ def analyze_symbol(symbol):
     )
 
     if price_change <= 0:
+
         return None
 
-    if price_change > MAX_CURRENT_5M_PRICE:
+    if (
+        price_change
+        > MAX_CURRENT_5M_PRICE
+    ):
+
         return None
 
     momentum_points = momentum_score(
@@ -1187,23 +1350,30 @@ def analyze_symbol(symbol):
     )
 
     if momentum_points <= 0:
+
         return None
 
     inc_stat("momentum")
 
+    # ========================================================
     # VOLUME
+    # ========================================================
 
     previous = history[
         -AVERAGE_VOLUME_CANDLES:
     ]
 
     volumes = [
+
         x["quote_volume"]
+
         for x in previous
+
         if x["quote_volume"] > 0
     ]
 
     if not volumes:
+
         return None
 
     average_volume = (
@@ -1216,6 +1386,7 @@ def analyze_symbol(symbol):
     )
 
     if average_volume <= 0:
+
         return None
 
     volume_ratio = (
@@ -1223,7 +1394,11 @@ def analyze_symbol(symbol):
         / average_volume
     )
 
-    if volume_ratio < VOLUME_MIN_RATIO:
+    if (
+        volume_ratio
+        < VOLUME_MIN_RATIO
+    ):
+
         return None
 
     inc_stat("volume")
@@ -1232,13 +1407,16 @@ def analyze_symbol(symbol):
         volume_ratio
     )
 
+    # ========================================================
     # BUY PRESSURE
+    # ========================================================
 
     taker_buy_quote = (
         candle["taker_buy_quote"]
     )
 
     if current_volume <= 0:
+
         return None
 
     buy_pressure = (
@@ -1246,7 +1424,11 @@ def analyze_symbol(symbol):
         / current_volume
     ) * 100.0
 
-    if buy_pressure < MIN_BUY_PRESSURE:
+    if (
+        buy_pressure
+        < MIN_BUY_PRESSURE
+    ):
+
         return None
 
     inc_stat("buy_pressure")
@@ -1255,13 +1437,16 @@ def analyze_symbol(symbol):
         buy_pressure
     )
 
+    # ========================================================
     # RESISTANCE
+    # ========================================================
 
     resistance_data = find_resistance(
         symbol
     )
 
     if not resistance_data:
+
         return None
 
     inc_stat("resistance")
@@ -1282,9 +1467,12 @@ def analyze_symbol(symbol):
         resistance_data["strength"]
     )
 
+    # ========================================================
     # BREAKOUT
+    # ========================================================
 
     if price <= resistance:
+
         return None
 
     breakout_points, breakout_percent = (
@@ -1294,12 +1482,38 @@ def analyze_symbol(symbol):
         )
     )
 
-    if breakout_percent < MIN_BREAKOUT_PERCENT:
+    # Minimum breakout
+    if (
+        breakout_percent
+        < MIN_BREAKOUT_PERCENT
+    ):
+
+        return None
+
+    # ========================================================
+    # IMPORTANT:
+    # ÇOX GEC BREAKOUTLARI QƏBUL ETMƏ
+    #
+    # Məsələn:
+    # Resistance = 0.0503
+    # Price      = 0.0541
+    # Breakout   = +7.55%
+    #
+    # Belə siqnal artıq gecdir və rədd edilir.
+    # ========================================================
+
+    if (
+        breakout_percent
+        > MAX_BREAKOUT_PERCENT
+    ):
+
         return None
 
     inc_stat("breakout")
 
+    # ========================================================
     # BREAKOUT VOLUME
+    # ========================================================
 
     (
         breakout_volume_points,
@@ -1309,12 +1523,18 @@ def analyze_symbol(symbol):
         average_volume
     )
 
-    if breakout_volume_ratio < MIN_BREAKOUT_VOLUME_RATIO:
+    if (
+        breakout_volume_ratio
+        < MIN_BREAKOUT_VOLUME_RATIO
+    ):
+
         return None
 
     inc_stat("breakout_volume")
 
+    # ========================================================
     # CANDLE QUALITY
+    # ========================================================
 
     (
         candle_points,
@@ -1325,26 +1545,39 @@ def analyze_symbol(symbol):
     )
 
     if candle_points <= 0:
+
         return None
 
     inc_stat("candle_quality")
 
+    # ========================================================
     # SPREAD
+    # ========================================================
 
-    spread = get_spread(symbol)
+    spread = get_spread(
+        symbol
+    )
 
     if spread is None:
+
         return None
 
-    if spread > MAX_SPREAD_PERCENT:
+    if (
+        spread
+        > MAX_SPREAD_PERCENT
+    ):
 
-        inc_stat("spread_rejected")
+        inc_stat(
+            "spread_rejected"
+        )
 
         return None
 
     inc_stat("spread")
 
-    # SCORE
+    # ========================================================
+    # TOTAL SCORE
+    # ========================================================
 
     total_score = (
 
@@ -1370,12 +1603,18 @@ def analyze_symbol(symbol):
         + candle_points
     )
 
-    if total_score < MIN_SIGNAL_SCORE:
+    if (
+        total_score
+        < MIN_SIGNAL_SCORE
+    ):
+
         return None
 
     inc_stat("score")
 
+    # ========================================================
     # COOLDOWN
+    # ========================================================
 
     now = time.time()
 
@@ -1392,6 +1631,7 @@ def analyze_symbol(symbol):
             now - last_time
             < SIGNAL_COOLDOWN_SECONDS
         ):
+
             return None
 
         previous_resistance = (
@@ -1400,7 +1640,10 @@ def analyze_symbol(symbol):
             )
         )
 
-        if previous_resistance is not None:
+        if (
+            previous_resistance
+            is not None
+        ):
 
             difference = abs(
                 resistance
@@ -1413,7 +1656,11 @@ def analyze_symbol(symbol):
                 / 100.0
             )
 
-            if difference <= tolerance:
+            if (
+                difference
+                <= tolerance
+            ):
+
                 return None
 
         last_signal_time[
@@ -1426,11 +1673,14 @@ def analyze_symbol(symbol):
 
     inc_stat("signals")
 
+    # ========================================================
     # LEVELS
+    # ========================================================
 
     status = (
         "🔥 STRONG BUY"
-        if total_score >= STRONG_SIGNAL_SCORE
+        if total_score
+        >= STRONG_SIGNAL_SCORE
         else
         "🟢 BUY"
     )
@@ -1677,7 +1927,10 @@ No automatic order.
 # KLINE
 # ============================================================
 
-def process_kline(symbol, k):
+def process_kline(
+    symbol,
+    k
+):
 
     candle = {
 
@@ -1717,7 +1970,9 @@ def process_kline(symbol, k):
 
     with data_lock:
 
-        live_candles[symbol] = candle
+        live_candles[
+            symbol
+        ] = candle
 
         if candle["closed"]:
 
@@ -1739,11 +1994,14 @@ def process_kline(symbol, k):
 
             if (
                 not history
-                or history[-1]["open_time"]
+                or
+                history[-1]["open_time"]
                 != candle["open_time"]
             ):
 
-                history.append(candle)
+                history.append(
+                    candle
+                )
 
             live_candles.pop(
                 symbol,
@@ -1751,6 +2009,10 @@ def process_kline(symbol, k):
             )
 
             return
+
+    # ========================================================
+    # ANALYZE LIVE 5M CANDLE
+    # ========================================================
 
     signal = analyze_symbol(
         symbol
@@ -1768,25 +2030,32 @@ def process_kline(symbol, k):
             + "\n"
             + message
             + "\n"
-            + "=" * 70,
-            flush=True
+            + "=" * 70
         )
 
-        send_telegram(message)
+        send_telegram(
+            message
+        )
 
 
 # ============================================================
-# BOOK TICKER WEBSOCKET
+# BOOK TICKER WORKER
 # ============================================================
 
-def book_ticker_worker(symbol_chunk):
+def book_ticker_worker(
+    symbol_chunk
+):
 
     streams = [
+
         f"{symbol}@bookTicker"
+
         for symbol in symbol_chunk
     ]
 
-    stream_string = "/".join(streams)
+    stream_string = "/".join(
+        streams
+    )
 
     url = (
         f"{BINANCE_WS}"
@@ -1800,37 +2069,51 @@ def book_ticker_worker(symbol_chunk):
 
             print(
                 f"BOOK WS connecting "
-                f"{len(symbol_chunk)} symbols...",
-                flush=True
+                f"{len(symbol_chunk)} "
+                f"symbols..."
             )
 
             def on_open(ws):
 
                 print(
                     f"BOOK WS CONNECTED "
-                    f"{len(symbol_chunk)} symbols",
-                    flush=True
+                    f"{len(symbol_chunk)} "
+                    f"symbols"
                 )
 
-            def on_message(ws, message):
+            def on_message(
+                ws,
+                message
+            ):
 
                 try:
 
-                    data = json.loads(message)
+                    data = json.loads(
+                        message
+                    )
 
                     payload = data.get(
                         "data",
                         data
                     )
 
-                    symbol = payload.get("s")
+                    symbol = payload.get(
+                        "s"
+                    )
 
                     if not symbol:
+
                         return
 
-                    symbol = symbol.lower()
+                    symbol = (
+                        symbol.lower()
+                    )
 
-                    if symbol not in volume_24h:
+                    if (
+                        symbol
+                        not in volume_24h
+                    ):
+
                         return
 
                     bid = safe_float(
@@ -1841,7 +2124,11 @@ def book_ticker_worker(symbol_chunk):
                         payload.get("a")
                     )
 
-                    if bid <= 0 or ask <= 0:
+                    if (
+                        bid <= 0
+                        or ask <= 0
+                    ):
+
                         return
 
                     store_book(
@@ -1854,25 +2141,29 @@ def book_ticker_worker(symbol_chunk):
 
                     print(
                         "Book message error:",
-                        e,
-                        flush=True
+                        e
                     )
 
-            def on_error(ws, error):
+            def on_error(
+                ws,
+                error
+            ):
 
                 print(
                     "BOOK WS error:",
-                    error,
-                    flush=True
+                    error
                 )
 
-            def on_close(ws, code, reason):
+            def on_close(
+                ws,
+                code,
+                reason
+            ):
 
                 print(
                     "BOOK WS closed:",
                     code,
-                    reason,
-                    flush=True
+                    reason
                 )
 
             ws = websocket.WebSocketApp(
@@ -1889,7 +2180,9 @@ def book_ticker_worker(symbol_chunk):
             )
 
             ws.run_forever(
+
                 ping_interval=20,
+
                 ping_timeout=10
             )
 
@@ -1897,26 +2190,34 @@ def book_ticker_worker(symbol_chunk):
 
             print(
                 "Book WS exception:",
-                e,
-                flush=True
+                e
             )
 
         if running:
-            time.sleep(RECONNECT_SECONDS)
+
+            time.sleep(
+                RECONNECT_SECONDS
+            )
 
 
 # ============================================================
 # KLINE WEBSOCKET
 # ============================================================
 
-def kline_websocket_worker(symbol_chunk):
+def kline_websocket_worker(
+    symbol_chunk
+):
 
     streams = [
+
         f"{symbol}@kline_5m"
+
         for symbol in symbol_chunk
     ]
 
-    stream_string = "/".join(streams)
+    stream_string = "/".join(
+        streams
+    )
 
     url = (
         f"{BINANCE_WS}"
@@ -1930,30 +2231,39 @@ def kline_websocket_worker(symbol_chunk):
 
             print(
                 f"KLINE WS connecting "
-                f"{len(symbol_chunk)} symbols...",
-                flush=True
+                f"{len(symbol_chunk)} "
+                f"symbols..."
             )
 
             def on_open(ws):
 
                 print(
                     f"KLINE WS CONNECTED "
-                    f"{len(symbol_chunk)} symbols",
-                    flush=True
+                    f"{len(symbol_chunk)} "
+                    f"symbols"
                 )
 
-            def on_message(ws, message):
+            def on_message(
+                ws,
+                message
+            ):
 
                 try:
 
-                    data = json.loads(message)
+                    data = json.loads(
+                        message
+                    )
 
                     payload = data.get(
                         "data",
                         data
                     )
 
-                    if payload.get("e") != "kline":
+                    if (
+                        payload.get("e")
+                        != "kline"
+                    ):
+
                         return
 
                     symbol = (
@@ -1972,25 +2282,29 @@ def kline_websocket_worker(symbol_chunk):
 
                     print(
                         "Kline message error:",
-                        e,
-                        flush=True
+                        e
                     )
 
-            def on_error(ws, error):
+            def on_error(
+                ws,
+                error
+            ):
 
                 print(
                     "Kline WS error:",
-                    error,
-                    flush=True
+                    error
                 )
 
-            def on_close(ws, code, reason):
+            def on_close(
+                ws,
+                code,
+                reason
+            ):
 
                 print(
                     "Kline WS closed:",
                     code,
-                    reason,
-                    flush=True
+                    reason
                 )
 
             ws = websocket.WebSocketApp(
@@ -2007,7 +2321,9 @@ def kline_websocket_worker(symbol_chunk):
             )
 
             ws.run_forever(
+
                 ping_interval=20,
+
                 ping_timeout=10
             )
 
@@ -2015,12 +2331,14 @@ def kline_websocket_worker(symbol_chunk):
 
             print(
                 "Kline WS exception:",
-                e,
-                flush=True
+                e
             )
 
         if running:
-            time.sleep(RECONNECT_SECONDS)
+
+            time.sleep(
+                RECONNECT_SECONDS
+            )
 
 
 # ============================================================
@@ -2039,12 +2357,29 @@ def status_worker():
 
         with data_lock:
 
-            symbol_count = len(symbols)
-            history_count = len(candle_history)
-            live_count = len(live_candles)
-            book_count = len(book_data)
-            updates = book_updates
-            last_update = last_book_update
+            symbol_count = len(
+                symbols
+            )
+
+            history_count = len(
+                candle_history
+            )
+
+            live_count = len(
+                live_candles
+            )
+
+            book_count = len(
+                book_data
+            )
+
+            updates = (
+                book_updates
+            )
+
+            last_update = (
+                last_book_update
+            )
 
         if last_update > 0:
 
@@ -2058,158 +2393,133 @@ def status_worker():
             book_age = -1
 
         print(
-            "\n================ STATUS ================\n",
-            flush=True
+            "\n"
+            "================ STATUS ================\n"
         )
 
         print(
             "Symbols:",
-            symbol_count,
-            flush=True
+            symbol_count
         )
 
         print(
             "History:",
-            history_count,
-            flush=True
+            history_count
         )
 
         print(
             "Live candles:",
-            live_count,
-            flush=True
+            live_count
         )
 
         print(
             "Book ticker:",
-            book_count,
-            flush=True
+            book_count
         )
 
         print(
             "Book updates:",
-            updates,
-            flush=True
+            updates
         )
 
         if book_age >= 0:
 
             print(
                 "Last book update:",
-                f"{book_age:.1f}s ago",
-                flush=True
+                f"{book_age:.1f}s ago"
             )
 
         else:
 
             print(
-                "Last book update: NEVER",
-                flush=True
+                "Last book update: NEVER"
             )
 
         print(
-            "\n----------- DEBUG 5M ---------------",
-            flush=True
+            "\n----------- DEBUG 5M ---------------"
         )
 
         print(
             "Checked:",
-            current["checked"],
-            flush=True
+            current["checked"]
         )
 
         print(
             "Momentum passed:",
-            current["momentum"],
-            flush=True
+            current["momentum"]
         )
 
         print(
             "Volume passed:",
-            current["volume"],
-            flush=True
+            current["volume"]
         )
 
         print(
             "Buy pressure passed:",
-            current["buy_pressure"],
-            flush=True
+            current["buy_pressure"]
         )
 
         print(
             "Resistance found:",
-            current["resistance"],
-            flush=True
+            current["resistance"]
         )
 
         print(
             "Breakout passed:",
-            current["breakout"],
-            flush=True
+            current["breakout"]
         )
 
         print(
             "Breakout volume passed:",
-            current["breakout_volume"],
-            flush=True
+            current["breakout_volume"]
         )
 
         print(
             "Candle quality passed:",
-            current["candle_quality"],
-            flush=True
+            current["candle_quality"]
         )
 
         print(
             "Spread passed:",
-            current["spread"],
-            flush=True
+            current["spread"]
         )
 
         print(
             "Spread missing:",
-            current["spread_missing"],
-            flush=True
+            current["spread_missing"]
         )
 
         print(
             "Spread rejected:",
-            current["spread_rejected"],
-            flush=True
+            current["spread_rejected"]
         )
 
         print(
             "Score >= 70:",
-            current["score"],
-            flush=True
+            current["score"]
         )
 
         print(
             "Telegram OK:",
-            current["telegram_ok"],
-            flush=True
+            current["telegram_ok"]
         )
 
         print(
             "Telegram failed:",
-            current["telegram_failed"],
-            flush=True
+            current["telegram_failed"]
         )
 
         print(
             "SIGNALS:",
-            current["signals"],
-            flush=True
+            current["signals"]
         )
 
         print(
-            "--------------------------------------",
-            flush=True
+            "--------------------------------------"
         )
 
         print(
-            "=========================================\n",
-            flush=True
+            "=========================================\n"
         )
 
         reset_stats()
@@ -2243,20 +2553,20 @@ def volume_refresh_worker():
 
             with data_lock:
 
-                volume_24h = new_volume
+                volume_24h = (
+                    new_volume
+                )
 
             print(
                 "24H volume refreshed:",
-                len(new_volume),
-                flush=True
+                len(new_volume)
             )
 
         except Exception as e:
 
             print(
                 "Volume refresh error:",
-                e,
-                flush=True
+                e
             )
 
 
@@ -2313,6 +2623,7 @@ STRONG:
 
 BREAKOUT:
 >= +0.50%
+<= +3.00%
 
 BREAKOUT VOLUME:
 >= 2x average
@@ -2330,26 +2641,26 @@ TELEGRAM:
 ACTIVE
 
 ============================================================
-""",
-        flush=True
+"""
     )
 
-    print(
-        "MAIN STARTED",
-        flush=True
-    )
-
+    # ========================================================
     # TELEGRAM
+    # ========================================================
 
     telegram_startup_test()
 
+    # ========================================================
     # SYMBOLS
+    # ========================================================
 
     all_symbols = (
         load_exchange_info()
     )
 
+    # ========================================================
     # 24H VOLUME
+    # ========================================================
 
     volume_24h = (
         load_24h_volumes(
@@ -2363,47 +2674,63 @@ ACTIVE
 
     print(
         "Final symbols:",
-        len(symbols),
-        flush=True
+        len(symbols)
     )
 
     if not symbols:
 
         print(
-            "No symbols passed filters.",
-            flush=True
+            "No symbols passed filters."
         )
 
         send_telegram(
+
             "🔴 <b>BOT ERROR</b>\n\n"
+
             "Heç bir Binance USDT "
             "coin filterdən keçmədi."
         )
 
         return
 
+    # ========================================================
     # HISTORY
+    # ========================================================
 
     load_all_histories()
 
+    # ========================================================
     # STATUS
+    # ========================================================
 
     threading.Thread(
+
         target=status_worker,
+
         daemon=True
+
     ).start()
 
+    # ========================================================
     # VOLUME REFRESH
+    # ========================================================
 
     threading.Thread(
+
         target=volume_refresh_worker,
+
         daemon=True
+
     ).start()
 
+    # ========================================================
     # WEBSOCKET CHUNKS
+    # ========================================================
 
     chunks = [
+
         symbols[i:i + WS_CHUNK_SIZE]
+
         for i in range(
             0,
             len(symbols),
@@ -2413,51 +2740,75 @@ ACTIVE
 
     print(
         "WebSocket chunks:",
-        len(chunks),
-        flush=True
+        len(chunks)
     )
 
+    # ========================================================
     # START WEBSOCKETS
+    # ========================================================
 
     for chunk in chunks:
 
         threading.Thread(
+
             target=kline_websocket_worker,
+
             args=(chunk,),
+
             daemon=True
+
         ).start()
 
         threading.Thread(
+
             target=book_ticker_worker,
+
             args=(chunk,),
+
             daemon=True
+
         ).start()
 
         time.sleep(0.5)
+
+    # ========================================================
+    # BOT STARTED
+    # ========================================================
 
     print(
         "\n"
         "==================================================\n"
         "BOT STARTED\n"
-        "==================================================\n",
-        flush=True
+        "==================================================\n"
     )
 
     send_telegram(
+
         "🟢 <b>5M BOT AKTİVDİR</b>\n\n"
+
         f"📊 Symbols: {len(symbols)}\n"
+
+        "📚 History: 200 candles\n"
+
         "📡 Kline WebSocket: ACTIVE\n"
+
         "📖 Per-symbol BookTicker: ACTIVE\n"
+
         "🛟 REST Spread Fallback: ACTIVE\n"
-        "🔎 Resistance Detection: FIXED\n"
-        "📊 History: 200 candles\n"
-        "🔎 Debug: ACTIVE\n\n"
+
+        "🔎 Resistance Detection: ACTIVE\n"
+
+        "💥 Breakout: +0.50% → +3.00%\n"
+
+        "📊 Debug: ACTIVE\n\n"
+
         "Siqnallar gözlənilir..."
     )
 
     try:
 
         while True:
+
             time.sleep(5)
 
     except KeyboardInterrupt:
@@ -2465,8 +2816,7 @@ ACTIVE
         running = False
 
         print(
-            "Bot stopped.",
-            flush=True
+            "Bot stopped."
         )
 
 
@@ -2475,10 +2825,5 @@ ACTIVE
 # ============================================================
 
 if __name__ == "__main__":
-
-    print(
-        "10 - RUN BLOCK",
-        flush=True
-    )
 
     main()
