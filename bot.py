@@ -11,7 +11,7 @@ import websocket
 
 
 # ============================================================
-# BINANCE SPOT 5M MOMENTUM + 500 CANDLE REAL BREAKOUT
+# BINANCE SPOT 5M MOMENTUM + 1440 CANDLE REAL BREAKOUT
 #
 # ALERT ONLY
 # NO AUTOMATIC ORDER
@@ -30,13 +30,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 INTERVAL = "5m"
 
+
 # ============================================================
 # HISTORY
 # ============================================================
 
-HISTORY_LIMIT = 500
+# 1440 x 5 minutes = exactly 5 days
+
+HISTORY_LIMIT = 1440
 
 AVERAGE_VOLUME_CANDLES = 20
+
 
 # ============================================================
 # 24H SPOT VOLUME
@@ -49,11 +53,21 @@ MIN_24H_QUOTE_VOLUME = 1_000_000
 # 5M MOMENTUM
 # ============================================================
 
-# Current 5M candle must be positive.
-# We reject a candle that has already moved too far.
+# Minimum +1%
 
-MIN_PRICE_CHANGE = 0.50
-MAX_CURRENT_5M_PRICE = 8.0
+MIN_PRICE_CHANGE = 1.0
+
+
+# IMPORTANT:
+# There is NO maximum momentum limit.
+#
+# +1%  -> PASS
+# +3%  -> PASS
+# +8%  -> PASS
+# +15% -> PASS
+# +30% -> PASS
+#
+# Other conditions still must pass.
 
 
 # ============================================================
@@ -65,19 +79,22 @@ MIN_BUY_PRESSURE = 55.0
 
 # ============================================================
 # REAL BREAKOUT
-# ============================================================
-
-# IMPORTANT:
 #
 # Resistance =
-# HIGHEST HIGH of the previous 500 CLOSED 5M candles.
+# HIGHEST HIGH of previous 1440 CLOSED 5M candles.
+#
+# 1440 x 5M = exactly 5 days.
 #
 # Current live candle is NOT included in resistance.
 #
-# Price must move at least +1% above resistance.
+# IMPORTANT:
+# The CURRENT 5M candle CLOSE must be at least
+# +1% ABOVE resistance.
+#
+# There is NO maximum breakout percentage.
 # ============================================================
 
-BREAKOUT_LOOKBACK = 500
+BREAKOUT_LOOKBACK = 1440
 
 MIN_BREAKOUT_PERCENT = 1.0
 
@@ -116,9 +133,8 @@ REST_BOOK_MIN_INTERVAL = 1.0
 # SIGNAL COOLDOWN
 # ============================================================
 
-# SAME COIN:
-# minimum 1 day between signals
-# ============================================================
+# Same coin:
+# minimum 24 hours between signals
 
 SIGNAL_COOLDOWN_SECONDS = 24 * 60 * 60
 
@@ -405,9 +421,9 @@ def telegram_startup_test():
 
         "🟢 <b>BINANCE SPOT BOT STARTED</b>\n\n"
 
-        "⏱ 5M Momentum\n"
-        "🏔 500 Candle Highest High Breakout\n"
-        "🚀 Breakout: +1%\n"
+        "⏱ 5M Momentum: ≥1%\n"
+        "🏔 1440 Candle / 5 Days Highest High Breakout\n"
+        "🚀 Breakout Close: ≥1% above resistance\n"
         "📊 Breakout Volume: ≥1.5x\n"
         "🟢 Buy Pressure: ≥55%\n"
         "💧 24H Volume: ≥$1M\n"
@@ -465,8 +481,6 @@ def load_exchange_info():
             ""
         )
 
-
-        # Leveraged tokens excluded
 
         if (
             base.endswith("UP")
@@ -555,7 +569,7 @@ def load_24h_volumes(all_symbols):
 
 
 # ============================================================
-# LOAD 500 CLOSED 5M CANDLES
+# LOAD 1440 CLOSED 5M CANDLES
 # ============================================================
 
 def load_symbol_history(symbol):
@@ -649,7 +663,7 @@ def load_symbol_history(symbol):
 def load_all_histories():
 
     print(
-        "Loading 500 x 5M history for "
+        "Loading 1440 x 5M history for "
         f"{len(symbols)} symbols..."
     )
 
@@ -712,10 +726,10 @@ def load_all_histories():
 # ============================================================
 # REAL RESISTANCE
 #
-# HIGHEST HIGH OF PREVIOUS 500 CLOSED CANDLES
+# HIGHEST HIGH OF PREVIOUS 1440 CLOSED CANDLES
 # ============================================================
 
-def find_500_candle_high(symbol):
+def find_1440_candle_high(symbol):
 
     with data_lock:
 
@@ -732,7 +746,7 @@ def find_500_candle_high(symbol):
         return None
 
 
-    # Exactly previous 500 closed candles
+    # Exactly previous 1440 closed candles
 
     candles = history[
         -BREAKOUT_LOOKBACK:
@@ -800,9 +814,6 @@ def momentum_score(
 
     if price_change >= 1:
         return 5
-
-    if price_change >= MIN_PRICE_CHANGE:
-        return 3
 
     return 0
 
@@ -1220,14 +1231,14 @@ def analyze_binance_symbol(
         return None
 
 
-    # Need exactly 500 closed candles
-
     if len(history) < BREAKOUT_LOOKBACK:
 
         return None
 
 
-    # 24H volume
+    # ========================================================
+    # 24H VOLUME
+    # ========================================================
 
     if (
         quote_24h
@@ -1239,6 +1250,10 @@ def analyze_binance_symbol(
 
     # ========================================================
     # 5M MOMENTUM
+    #
+    # MINIMUM +1%
+    #
+    # NO MAXIMUM
     # ========================================================
 
     open_price = candle["open"]
@@ -1255,16 +1270,6 @@ def analyze_binance_symbol(
     if (
         price_change
         < MIN_PRICE_CHANGE
-    ):
-
-        return None
-
-
-    # Do not chase a candle already too extended
-
-    if (
-        price_change
-        > MAX_CURRENT_5M_PRICE
     ):
 
         return None
@@ -1385,11 +1390,11 @@ def analyze_binance_symbol(
 
 
     # ========================================================
-    # 500 CANDLE HIGH
+    # 1440 CANDLE HIGH
     # ========================================================
 
     resistance_data = (
-        find_500_candle_high(
+        find_1440_candle_high(
             symbol
         )
     )
@@ -1407,6 +1412,11 @@ def analyze_binance_symbol(
 
     # ========================================================
     # +1% REAL BREAKOUT
+    #
+    # CURRENT 5M CANDLE CLOSE
+    # MUST BE >= 1% ABOVE RESISTANCE
+    #
+    # NO MAXIMUM BREAKOUT
     # ========================================================
 
     (
@@ -1417,9 +1427,6 @@ def analyze_binance_symbol(
         resistance
     )
 
-
-    # HARD REQUIREMENT:
-    # Minimum +1%
 
     if (
         breakout_percent
@@ -1566,8 +1573,6 @@ def analyze_binance_symbol(
             )
         )
 
-
-        # 24 H cooldown
 
         if (
             now - last_time
@@ -1764,10 +1769,10 @@ def format_signal(signal):
 
 ━━━━━━━━━━━━━━━━━━
 
-🏔 500 CANDLE HIGH:
+🏔 5-DAY HIGH:
 <b>{round_price(signal["resistance"])}</b>
 
-🚀 Breakout:
+🚀 Breakout Close:
 <b>+{signal["breakout_percent"]:.2f}%</b>
 
 🔥 Breakout Volume:
@@ -1917,8 +1922,6 @@ def process_kline(
                     symbol
                 ] = history
 
-
-            # Avoid duplicate candle
 
             if (
 
@@ -2407,7 +2410,7 @@ def status_worker():
         )
 
         print(
-            "500-candle histories:",
+            "1440-candle histories:",
             history_count
         )
 
@@ -2458,7 +2461,7 @@ def status_worker():
         )
 
         print(
-            "500H Breakout passed:",
+            "1440H Breakout passed:",
             current["breakout"]
         )
 
@@ -2600,13 +2603,20 @@ def main():
 Binance Spot USDT
 
 📚 HISTORY
-500 CLOSED 5M CANDLES
+1440 CLOSED 5M CANDLES
+
+⏳ HISTORY PERIOD
+EXACTLY 5 DAYS
 
 🏔 RESISTANCE
-Highest High of previous 500 candles
+Highest High of previous 1440 candles
 
 🚀 BREAKOUT
-Price must break resistance by +1.00%
+5M candle CLOSE must be >= +1.00%
+above the 5-day resistance
+
+📈 BREAKOUT MAXIMUM
+NO MAXIMUM
 
 📊 BREAKOUT VOLUME
 Minimum 1.5x average volume
@@ -2615,8 +2625,10 @@ Minimum 1.5x average volume
 Minimum 55%
 
 📈 5M MOMENTUM
-Minimum +0.50%
-Maximum +8.00%
+Minimum +1.00%
+
+📈 MOMENTUM MAXIMUM
+NO MAXIMUM
 
 💧 24H SPOT VOLUME
 Minimum $1,000,000
@@ -2702,7 +2714,7 @@ NO AUTOMATIC BUY
     else:
 
         # ====================================================
-        # 500 CANDLE HISTORY
+        # 1440 CANDLE HISTORY
         # ====================================================
 
         load_all_histories()
@@ -2797,13 +2809,15 @@ NO AUTOMATIC BUY
 
         "📖 BookTicker WS: ACTIVE\n"
 
-        "📚 History: 500 candles\n"
+        "📚 History: 1440 candles / 5 days\n"
 
-        "🏔 Resistance: 500-candle highest high\n"
+        "🏔 Resistance: 5-day highest high\n"
 
-        "🚀 Breakout: +1%\n"
+        "🚀 Breakout close: ≥1%\n"
 
         "📊 Breakout volume: ≥1.5x\n"
+
+        "📈 5M Momentum: ≥1%\n"
 
         "🟢 Buy pressure: ≥55%\n"
 
