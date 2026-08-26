@@ -813,7 +813,7 @@ SOLANA_COOLDOWN = 24 * 60 * 60
 
 # Minimum activity safeguards.
 SOLANA_MIN_5M_VOLUME = 100
-SOLANA_MIN_LIQUIDITY = 3_000
+SOLANA_MIN_LIQUIDITY = 7_000
 
 # Require the current snapshot to improve against the previous
 # snapshot for the same pair.
