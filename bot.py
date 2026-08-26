@@ -52,15 +52,15 @@ BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:443"
 
 INTERVAL = "5m"
-HISTORY_LIMIT = 200
+HISTORY_LIMIT = 1441
 AVERAGE_VOLUME_CANDLES = 20
-RESISTANCE_LOOKBACK = 200
+RESISTANCE_LOOKBACK = 1440
 
-MIN_RESISTANCE_AGE = 3
+MIN_RESISTANCE_AGE = 0
 RESISTANCE_TOLERANCE_PERCENT = 0.60
 MIN_TEST_DISTANCE_CANDLES = 2
-MIN_RESISTANCE_TESTS = 2
-MAX_RECENT_TEST_AGE = 40
+MIN_RESISTANCE_TESTS = 0
+MAX_RECENT_TEST_AGE = 1440
 
 MIN_24H_QUOTE_VOLUME = 1_000_000
 MAX_SPREAD_PERCENT = 0.20
@@ -73,7 +73,7 @@ MIN_SIGNAL_SCORE = 60
 STRONG_SIGNAL_SCORE = 75
 VOLUME_MIN_RATIO = 1.2
 
-MIN_BREAKOUT_PERCENT = 0.30
+MIN_BREAKOUT_PERCENT = 1.0
 MIN_BREAKOUT_VOLUME_RATIO = 1.5
 
 MIN_CLOSE_POSITION = 70.0
@@ -393,79 +393,56 @@ def get_book_cached(symbol):
 # ============================================================
 
 def ws_worker(symbols):
-    """
-    Combined mini ticker/book stream.
-    Uses chunks to keep the stream manageable.
-    """
+    """Binance WS for live price/spread with chunking and auto-reconnect."""
     if not symbols:
         return
 
-    streams = []
+    chunks = [symbols[i:i + WS_CHUNK_SIZE] for i in range(0, len(symbols), WS_CHUNK_SIZE)]
 
-    for symbol in symbols:
-        s = symbol.lower()
-        streams.append(f"{s}@bookTicker")
-        streams.append(f"{s}@ticker")
+    def run_chunk(chunk):
+        streams = []
+        for symbol in chunk:
+            s = symbol.lower()
+            streams.extend([f"{s}@bookTicker", f"{s}@ticker"])
+        url = BINANCE_WS + "/stream?streams=" + "/".join(streams)
 
-    # Binance combined stream URL
-    url = BINANCE_WS + "/stream?streams=" + "/".join(streams)
+        while not STOP_EVENT.is_set():
+            try:
+                def on_message(ws, message):
+                    try:
+                        data = json.loads(message).get("data", {})
+                        event = data.get("e")
+                        symbol = data.get("s")
+                        if not symbol:
+                            return
+                        if event == "bookTicker":
+                            update_book(symbol, data.get("b"), data.get("a"), data.get("B"), data.get("A"))
+                        elif event == "24hrTicker":
+                            with STATE_LOCK:
+                                BINANCE_LIVE[symbol] = {
+                                    "price": safe_float(data.get("c")),
+                                    "quote_volume": safe_float(data.get("q")),
+                                    "change": safe_float(data.get("P")),
+                                    "time": now_ts(),
+                                }
+                    except Exception as e:
+                        print("Binance WS message error:", e)
 
-    while not STOP_EVENT.is_set():
-        try:
-            def on_message(ws, message):
-                try:
-                    obj = json.loads(message)
-                    data = obj.get("data", {})
-                    event = data.get("e")
+                def on_error(ws, error):
+                    print("Binance WS error:", error)
 
-                    symbol = data.get("s")
-                    if not symbol:
-                        return
+                def on_close(ws, code, msg):
+                    print(f"Binance WS closed: {code} {msg} | reconnecting in {RECONNECT_SECONDS}s")
 
-                    if event == "bookTicker":
-                        update_book(
-                            symbol,
-                            data.get("b"),
-                            data.get("a"),
-                            data.get("B"),
-                            data.get("A"),
-                        )
+                ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
+                ws.run_forever(ping_interval=20, ping_timeout=10, origin="https://www.binance.com")
+            except Exception as e:
+                print("Binance WS worker error:", e)
+            if not STOP_EVENT.is_set():
+                time.sleep(RECONNECT_SECONDS)
 
-                    elif event == "24hrTicker":
-                        last = safe_float(data.get("c"))
-                        with STATE_LOCK:
-                            BINANCE_LIVE[symbol] = {
-                                "price": last,
-                                "quote_volume": safe_float(data.get("q")),
-                                "change": safe_float(data.get("P")),
-                                "time": now_ts(),
-                            }
-
-                except Exception:
-                    pass
-
-            def on_error(ws, error):
-                print("Kline/market WS error:", error)
-
-            def on_close(ws, code, msg):
-                print("Binance WS closed:", code, msg)
-
-            ws = websocket.WebSocketApp(
-                url,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close,
-            )
-
-            ws.run_forever(
-                ping_interval=20,
-                ping_timeout=10,
-            )
-
-        except Exception as e:
-            print("Binance WS worker error:", e)
-
-        time.sleep(RECONNECT_SECONDS)
+    for chunk in chunks:
+        threading.Thread(target=run_chunk, args=(chunk,), daemon=True).start()
 
 
 # ============================================================
@@ -540,56 +517,14 @@ def buy_pressure_estimate(candles):
 
 
 def find_resistance(candles):
-    if len(candles) < 20:
+    """Highest high of the previous 1440 CLOSED 5M candles.
+    The latest closed candle is excluded because it is the breakout candidate.
+    """
+    if len(candles) < RESISTANCE_LOOKBACK + 1:
         return None
-
-    data = candles[-RESISTANCE_LOOKBACK:]
-
-    # Search recent local highs.
-    candidates = []
-
-    for i in range(2, len(data) - 2):
-        h = data[i]["high"]
-
-        if (
-            h >= data[i - 1]["high"]
-            and h >= data[i - 2]["high"]
-            and h >= data[i + 1]["high"]
-            and h >= data[i + 2]["high"]
-        ):
-            candidates.append((i, h))
-
-    if not candidates:
-        return None
-
-    # Prefer the most recent meaningful resistance.
-    idx, level = candidates[-1]
-
-    tests = 0
-    last_test = -999
-
-    for i, c in enumerate(data):
-        if abs(pct_change(level, c["high"])) <= RESISTANCE_TOLERANCE_PERCENT:
-            if i - last_test >= MIN_TEST_DISTANCE_CANDLES:
-                tests += 1
-                last_test = i
-
-    age = len(data) - 1 - idx
-
-    if age < MIN_RESISTANCE_AGE:
-        return None
-
-    if tests < MIN_RESISTANCE_TESTS:
-        return None
-
-    if age > MAX_RECENT_TEST_AGE:
-        return None
-
-    return {
-        "level": level,
-        "age": age,
-        "tests": tests,
-    }
+    data = candles[-(RESISTANCE_LOOKBACK + 1):-1]
+    highest = max(data, key=lambda c: c["high"])
+    return {"level": highest["high"], "age": len(data)-1-data.index(highest), "tests": 0}
 
 
 def breakout_data(candles, resistance):
@@ -807,36 +742,26 @@ def dex_get(path, timeout=15):
 
 
 def get_solana_pairs():
+    """Broad, deduplicated Solana pair discovery via DexScreener search."""
     pairs = {}
-
-    # DexScreener search endpoints can return overlapping results.
-    for q in DEX_SEARCH_QUERIES:
+    queries = list(dict.fromkeys(DEX_SEARCH_QUERIES + [
+        "SOL", "WSOL", "USDC", "USDT", "RAY", "JUP", "BONK", "WIF",
+        "POPCAT", "MEW", "PONKE", "BOME", "SAMO", "MYRO", "MOTHER",
+        "GOAT", "AI", "MEME", "INU", "CAT", "DOG", "COIN", "TOKEN", "USD"
+    ]))
+    for q in queries:
         try:
-            data = dex_get(
-                "/latest/dex/search",
-            )
-
-            # Search endpoint requires query; retry with params.
-            r = SESSION.get(
-                DEX_BASE + "/latest/dex/search",
-                params={"q": q},
-                timeout=15,
-            )
-
+            r = SESSION.get(DEX_BASE + "/latest/dex/search", params={"q": q}, timeout=15)
             if not r.ok:
                 continue
-
             for p in r.json().get("pairs", []):
                 if p.get("chainId") != "solana":
                     continue
-
                 address = p.get("pairAddress")
                 if address:
                     pairs[address] = p
-
-        except Exception:
-            continue
-
+        except Exception as e:
+            print(f"DexScreener query error [{q}]: {e}")
     return list(pairs.values())
 
 
@@ -1071,7 +996,8 @@ def print_config():
     print("UNIFIED ALERT BOT")
     print("=" * 60)
     print("BINANCE:")
-    print("  5M momentum + breakout")
+    print("  5M momentum + 1440 closed-candle breakout")
+    print(f"  Breakout: +{MIN_BREAKOUT_PERCENT}% above previous {RESISTANCE_LOOKBACK} closed 5M candles")
     print("  Alert only")
     print()
     print("SOLANA DEXSCREENER:")
