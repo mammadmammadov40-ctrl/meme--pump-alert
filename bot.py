@@ -52,21 +52,18 @@ BINANCE_REST = "https://api.binance.com"
 BINANCE_WS = "wss://stream.binance.com:443"
 
 INTERVAL = "5m"
-HISTORY_LIMIT = 1441
+HISTORY_LIMIT = 1440
 AVERAGE_VOLUME_CANDLES = 20
 RESISTANCE_LOOKBACK = 1440
 
-MIN_RESISTANCE_AGE = 0
-RESISTANCE_TOLERANCE_PERCENT = 0.60
-MIN_TEST_DISTANCE_CANDLES = 2
-MIN_RESISTANCE_TESTS = 0
-MAX_RECENT_TEST_AGE = 1440
+# Resistance = highest high of previous 1440 CLOSED 5M candles.
+# Current live candle is never included in resistance.
 
 MIN_24H_QUOTE_VOLUME = 1_000_000
 MAX_SPREAD_PERCENT = 0.20
 BOOK_CACHE_MAX_AGE = 10
 
-MAX_CURRENT_5M_PRICE = 8.0
+MAX_CURRENT_5M_PRICE = None
 MIN_BUY_PRESSURE = 55.0
 
 MIN_SIGNAL_SCORE = 60
@@ -87,7 +84,7 @@ TP3 = 8.0
 WS_CHUNK_SIZE = 50
 RECONNECT_SECONDS = 5
 STATUS_INTERVAL = 60
-SIGNAL_COOLDOWN_SECONDS = 30 * 60
+SIGNAL_COOLDOWN_SECONDS = 24 * 60 * 60
 SAME_RESISTANCE_TOLERANCE = 0.10
 
 REST_BOOK_TIMEOUT = 5
@@ -153,6 +150,7 @@ BINANCE_BOOKS = {}
 BINANCE_LAST_SIGNAL = {}
 BINANCE_LAST_BOOK_REST = {}
 BINANCE_LAST_STATUS = 0
+BINANCE_STATUS = {}
 
 STATE_LOCK = threading.RLock()
 
@@ -393,56 +391,166 @@ def get_book_cached(symbol):
 # ============================================================
 
 def ws_worker(symbols):
-    """Binance WS for live price/spread with chunking and auto-reconnect."""
+    """
+    Stable Binance combined WebSocket.
+    Each worker handles a small chunk and reconnects automatically.
+    Streams:
+      - 5M kline
+      - bookTicker
+      - 24hrTicker
+    """
     if not symbols:
         return
 
-    chunks = [symbols[i:i + WS_CHUNK_SIZE] for i in range(0, len(symbols), WS_CHUNK_SIZE)]
+    streams = []
+    for symbol in symbols:
+        s = symbol.lower()
+        streams.append(f"{s}@kline_5m")
+        streams.append(f"{s}@bookTicker")
+        streams.append(f"{s}@ticker")
 
-    def run_chunk(chunk):
-        streams = []
-        for symbol in chunk:
-            s = symbol.lower()
-            streams.extend([f"{s}@bookTicker", f"{s}@ticker"])
-        url = BINANCE_WS + "/stream?streams=" + "/".join(streams)
+    url = BINANCE_WS + "/stream?streams=" + "/".join(streams)
 
-        while not STOP_EVENT.is_set():
-            try:
-                def on_message(ws, message):
-                    try:
-                        data = json.loads(message).get("data", {})
-                        event = data.get("e")
-                        symbol = data.get("s")
-                        if not symbol:
-                            return
-                        if event == "bookTicker":
-                            update_book(symbol, data.get("b"), data.get("a"), data.get("B"), data.get("A"))
-                        elif event == "24hrTicker":
-                            with STATE_LOCK:
-                                BINANCE_LIVE[symbol] = {
-                                    "price": safe_float(data.get("c")),
-                                    "quote_volume": safe_float(data.get("q")),
-                                    "change": safe_float(data.get("P")),
-                                    "time": now_ts(),
-                                }
-                    except Exception as e:
-                        print("Binance WS message error:", e)
+    while not STOP_EVENT.is_set():
+        try:
+            def on_message(ws, message):
+                try:
+                    obj = json.loads(message)
+                    data = obj.get("data", {})
+                    event = data.get("e")
+                    symbol = data.get("s")
+                    if not symbol:
+                        return
 
-                def on_error(ws, error):
-                    print("Binance WS error:", error)
+                    symbol = symbol.upper()
 
-                def on_close(ws, code, msg):
-                    print(f"Binance WS closed: {code} {msg} | reconnecting in {RECONNECT_SECONDS}s")
+                    if event == "bookTicker":
+                        update_book(
+                            symbol,
+                            data.get("b"),
+                            data.get("a"),
+                            data.get("B"),
+                            data.get("A"),
+                        )
 
-                ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
-                ws.run_forever(ping_interval=20, ping_timeout=10, origin="https://www.binance.com")
-            except Exception as e:
-                print("Binance WS worker error:", e)
-            if not STOP_EVENT.is_set():
-                time.sleep(RECONNECT_SECONDS)
+                    elif event == "24hrTicker":
+                        with STATE_LOCK:
+                            BINANCE_LIVE.setdefault(symbol, {})
+                            BINANCE_LIVE[symbol].update({
+                                "price": safe_float(data.get("c")),
+                                "quote_volume": safe_float(data.get("q")),
+                                "change": safe_float(data.get("P")),
+                                "time": now_ts(),
+                            })
 
-    for chunk in chunks:
-        threading.Thread(target=run_chunk, args=(chunk,), daemon=True).start()
+                    elif event == "kline":
+                        k = data.get("k") or {}
+                        candle = {
+                            "open_time": int(k.get("t", 0)),
+                            "open": safe_float(k.get("o")),
+                            "high": safe_float(k.get("h")),
+                            "low": safe_float(k.get("l")),
+                            "close": safe_float(k.get("c")),
+                            "volume": safe_float(k.get("v")),
+                            "quote_volume": safe_float(k.get("q")),
+                            "taker_buy_quote": safe_float(k.get("Q")),
+                            "closed": bool(k.get("x")),
+                            "close_time": int(k.get("T", 0)),
+                        }
+
+                        with STATE_LOCK:
+                            BINANCE_LIVE.setdefault(symbol, {})
+                            BINANCE_LIVE[symbol]["candle"] = candle
+
+                            if candle["closed"]:
+                                hist = BINANCE_HISTORY.get(symbol)
+                                if hist is None:
+                                    hist = deque(maxlen=HISTORY_LIMIT)
+                                    BINANCE_HISTORY[symbol] = hist
+
+                                if not hist or hist[-1]["open_time"] != candle["open_time"]:
+                                    hist.append(candle)
+
+                                BINANCE_LIVE[symbol].pop("candle", None)
+
+                except Exception:
+                    pass
+
+            def on_error(ws, error):
+                print("Binance WS error:", error)
+
+            def on_close(ws, code, msg):
+                print("Binance WS closed:", code, msg)
+                print(f"Binance WS reconnecting in {RECONNECT_SECONDS}s...")
+
+            ws = websocket.WebSocketApp(
+                url,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10,
+                origin="https://www.binance.com",
+            )
+
+        except Exception as e:
+            print("Binance WS worker error:", e)
+
+        if not STOP_EVENT.is_set():
+            time.sleep(RECONNECT_SECONDS)
+
+
+def load_binance_histories(symbols):
+    """
+    Load 1440 CLOSED 5M candles at startup.
+    """
+    print(f"Loading {HISTORY_LIMIT} closed 5M candles for {len(symbols)} symbols...")
+
+    def one(symbol):
+        try:
+            klines = get_klines(symbol, HISTORY_LIMIT)
+            candles = []
+            now_ms = int(time.time() * 1000)
+
+            for k in klines:
+                close_time = int(k[6])
+                if close_time >= now_ms:
+                    continue
+
+                candles.append({
+                    "open_time": int(k[0]),
+                    "open": safe_float(k[1]),
+                    "high": safe_float(k[2]),
+                    "low": safe_float(k[3]),
+                    "close": safe_float(k[4]),
+                    "volume": safe_float(k[5]),
+                    "quote_volume": safe_float(k[7]),
+                    "taker_buy_quote": safe_float(k[10]),
+                    "closed": True,
+                    "close_time": close_time,
+                })
+
+            return symbol, deque(candles[-HISTORY_LIMIT:], maxlen=HISTORY_LIMIT)
+        except Exception as e:
+            print(f"History error {symbol}: {e}")
+            return symbol, None
+
+    loaded = 0
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        futures = [ex.submit(one, s) for s in symbols]
+        for f in as_completed(futures):
+            symbol, candles = f.result()
+            loaded += 1
+            if candles and len(candles) >= RESISTANCE_LOOKBACK:
+                with STATE_LOCK:
+                    BINANCE_HISTORY[symbol] = candles
+            if loaded % 50 == 0:
+                print(f"History: {loaded}/{len(symbols)}")
+
+    print("1440-candle histories ready:", len(BINANCE_HISTORY))
 
 
 # ============================================================
@@ -473,85 +581,80 @@ def prepare_history(symbol, klines):
     return candles
 
 
-def momentum_5m(candles):
-    if len(candles) < 2:
+def momentum_5m(candle):
+    if not candle:
+        return 0.0
+    return pct_change(candle["open"], candle["close"])
+
+
+def volume_ratio(history, candle):
+    if len(history) < AVERAGE_VOLUME_CANDLES:
         return 0.0
 
-    prev = candles[-2]["close"]
-    last = candles[-1]["close"]
-
-    return pct_change(prev, last)
-
-
-def volume_ratio(candles):
-    if len(candles) < AVERAGE_VOLUME_CANDLES + 1:
+    vals = [
+        c["quote_volume"]
+        for c in list(history)[-AVERAGE_VOLUME_CANDLES:]
+        if c["quote_volume"] > 0
+    ]
+    if not vals:
         return 0.0
 
-    avg = sum(
-        c["volume"]
-        for c in candles[-AVERAGE_VOLUME_CANDLES-1:-1]
-    ) / AVERAGE_VOLUME_CANDLES
+    avg = sum(vals) / len(vals)
+    return candle["quote_volume"] / avg if avg > 0 else 0.0
 
-    if avg <= 0:
+
+def buy_pressure_estimate(candle):
+    if not candle:
         return 0.0
 
-    return candles[-1]["volume"] / avg
+    # Binance kline provides taker-buy quote volume.
+    total = candle["quote_volume"]
+    buy = candle.get("taker_buy_quote", 0.0)
 
+    if total > 0 and buy > 0:
+        return (buy / total) * 100.0
 
-def buy_pressure_estimate(candles):
-    """
-    Candle-based approximation when trade-side data is not available.
-    Close position is used as buying pressure proxy.
-    """
-    if not candles:
-        return 0.0
-
-    c = candles[-1]
-    rng = c["high"] - c["low"]
-
+    rng = candle["high"] - candle["low"]
     if rng <= 0:
         return 50.0
 
-    position = (c["close"] - c["low"]) / rng * 100.0
-    return position
+    return ((candle["close"] - candle["low"]) / rng) * 100.0
 
 
-def find_resistance(candles):
-    """Highest high of the previous 1440 CLOSED 5M candles.
-    The latest closed candle is excluded because it is the breakout candidate.
+def find_resistance(history):
     """
-    if len(candles) < RESISTANCE_LOOKBACK + 1:
+    Highest HIGH of the previous 1440 CLOSED 5M candles.
+    The current live candle is excluded.
+    """
+    if len(history) < RESISTANCE_LOOKBACK:
         return None
-    data = candles[-(RESISTANCE_LOOKBACK + 1):-1]
+
+    data = list(history)[-RESISTANCE_LOOKBACK:]
     highest = max(data, key=lambda c: c["high"])
-    return {"level": highest["high"], "age": len(data)-1-data.index(highest), "tests": 0}
+
+    return {
+        "level": highest["high"],
+        "age": len(data) - 1 - data.index(highest),
+        "tests": None,
+    }
 
 
-def breakout_data(candles, resistance):
-    if not resistance or len(candles) < 2:
+def breakout_data(history, current, resistance):
+    if not resistance or not current or len(history) < RESISTANCE_LOOKBACK:
         return None
 
     level = resistance["level"]
-    last = candles[-1]
+    breakout_pct = pct_change(level, current["close"])
 
-    breakout_pct = pct_change(level, last["close"])
+    vr = volume_ratio(history, current)
 
-    avg_vol = 0.0
-    if len(candles) >= AVERAGE_VOLUME_CANDLES + 1:
-        avg_vol = sum(
-            c["volume"]
-            for c in candles[-AVERAGE_VOLUME_CANDLES-1:-1]
-        ) / AVERAGE_VOLUME_CANDLES
-
-    vr = last["volume"] / avg_vol if avg_vol > 0 else 0.0
-
-    rng = last["high"] - last["low"]
+    rng = current["high"] - current["low"]
     close_position = (
-        ((last["close"] - last["low"]) / rng) * 100.0
+        ((current["close"] - current["low"]) / rng) * 100.0
         if rng > 0 else 0.0
     )
 
-    upper_wick = last["high"] - max(last["open"], last["close"])
+    upper_wick = current["high"] - max(current["open"], current["close"])
     upper_wick_pct = (
         upper_wick / rng * 100.0
         if rng > 0 else 100.0
@@ -573,60 +676,88 @@ def breakout_data(candles, resistance):
     }
 
 
-def analyze_binance(symbol):
+def analyze_binance(symbol, status):
     try:
-        klines = get_klines(symbol)
-        candles = prepare_history(symbol, klines)
+        with STATE_LOCK:
+            history = BINANCE_HISTORY.get(symbol)
+            live = dict(BINANCE_LIVE.get(symbol, {}))
 
-        if len(candles) < 30:
+        if not history or len(history) < RESISTANCE_LOOKBACK:
             return None
 
-        ticker = get_24h(symbol)
-        qvol = safe_float(ticker.get("quoteVolume"))
+        status["history"] += 1
+
+        qvol = safe_float(live.get("quote_volume"))
+        if qvol <= 0:
+            ticker = get_24h(symbol)
+            qvol = safe_float(ticker.get("quoteVolume"))
 
         if qvol < MIN_24H_QUOTE_VOLUME:
             return None
+        status["24h"] += 1
 
-        live = BINANCE_LIVE.get(symbol, {})
-        price = live.get("price") or candles[-1]["close"]
+        candle = live.get("candle")
+        if not candle:
+            # Use latest closed candle only if no live kline exists.
+            candle = list(history)[-1]
 
-        momentum = momentum_5m(candles)
-        vr = volume_ratio(candles)
-        buy_pressure = buy_pressure_estimate(candles)
+        momentum = momentum_5m(candle)
 
-        if momentum <= 0:
+        if momentum < MIN_PRICE_CHANGE:
+            return None
+        status["momentum"] += 1
+
+        if MAX_CURRENT_5M_PRICE is not None and momentum > MAX_CURRENT_5M_PRICE:
             return None
 
-        if momentum > MAX_CURRENT_5M_PRICE:
-            return None
-
+        vr = volume_ratio(history, candle)
         if vr < VOLUME_MIN_RATIO:
             return None
+        status["volume"] += 1
 
+        buy_pressure = buy_pressure_estimate(candle)
         if buy_pressure < MIN_BUY_PRESSURE:
             return None
+        status["buy"] += 1
 
         book = get_book_cached(symbol)
-
         if not book:
             return None
 
         spread = book.get("spread", 999)
-
         if spread > MAX_SPREAD_PERCENT:
             return None
+        status["spread"] += 1
 
-        resistance = find_resistance(candles)
-        br = breakout_data(candles, resistance)
-
-        if not br or not br["valid"]:
+        resistance = find_resistance(history)
+        if not resistance:
             return None
+        status["resistance"] += 1
+
+        br = breakout_data(history, candle, resistance)
+
+        # HARD REQUIREMENT: +1% above the highest high
+        # of the previous 1440 CLOSED 5M candles.
+        if br["breakout_pct"] < MIN_BREAKOUT_PERCENT:
+            return None
+        status["breakout"] += 1
+
+        if br["volume_ratio"] < MIN_BREAKOUT_VOLUME_RATIO:
+            return None
+        status["breakout_volume"] += 1
+
+        if br["close_position"] < MIN_CLOSE_POSITION:
+            return None
+        if br["upper_wick_pct"] > MAX_UPPER_WICK_PERCENT:
+            return None
+        status["candle"] += 1
 
         score = 0
-
         if momentum >= 1:
             score += 15
         if momentum >= 2:
+            score += 10
+        if momentum >= 3:
             score += 10
         if vr >= 1.2:
             score += 10
@@ -636,7 +767,7 @@ def analyze_binance(symbol):
             score += 10
         if buy_pressure >= 70:
             score += 5
-        if br["breakout_pct"] >= 0.30:
+        if br["breakout_pct"] >= 1.0:
             score += 10
         if br["volume_ratio"] >= 1.5:
             score += 10
@@ -647,8 +778,7 @@ def analyze_binance(symbol):
 
         if score < MIN_SIGNAL_SCORE:
             return None
-
-        strength = "🚀 STRONG BUY" if score >= STRONG_SIGNAL_SCORE else "🔥 BUY"
+        status["score"] += 1
 
         key = symbol
         now = now_ts()
@@ -662,14 +792,18 @@ def analyze_binance(symbol):
         with STATE_LOCK:
             BINANCE_LAST_SIGNAL[key] = now
 
+        price = candle["close"]
+        strength = "🚀 STRONG BUY" if score >= STRONG_SIGNAL_SCORE else "🔥 BUY"
+
         return (
             f"{strength}\n"
-            f"🟡 BINANCE 5M BREAKOUT\n\n"
+            f"🟡 BINANCE 5M REAL BREAKOUT\n\n"
             f"🪙 {symbol}\n"
             f"💰 Price: {price:g}\n"
             f"📈 5M Momentum: {momentum:+.2f}%\n"
             f"📊 Volume ratio: {vr:.2f}x\n"
             f"🟢 Buy pressure: {buy_pressure:.1f}%\n"
+            f"🏔 1440 Candle High: {resistance['level']:g}\n"
             f"🚀 Breakout: {br['breakout_pct']:+.2f}%\n"
             f"📊 Breakout volume: {br['volume_ratio']:.2f}x\n"
             f"🕯 Close position: {br['close_position']:.1f}%\n"
@@ -679,6 +813,7 @@ def analyze_binance(symbol):
             f"🎯 TP1: +{TP1}%\n"
             f"🎯 TP2: +{TP2}%\n"
             f"🎯 TP3: +{TP3}%\n\n"
+            f"🕐 Cooldown: 24H\n"
             f"⚠️ ALERT ONLY\n"
             f"NO AUTOMATIC ORDER"
         )
@@ -692,18 +827,30 @@ def level_stop(resistance):
 
 
 def binance_scan_loop():
-    global BINANCE_LAST_STATUS
-
     while not STOP_EVENT.is_set():
         try:
             symbols = list(BINANCE_SYMBOLS)
+
+            status = {
+                "history": 0,
+                "24h": 0,
+                "momentum": 0,
+                "volume": 0,
+                "buy": 0,
+                "spread": 0,
+                "resistance": 0,
+                "breakout": 0,
+                "breakout_volume": 0,
+                "candle": 0,
+                "score": 0,
+            }
 
             checked = 0
             signals = 0
 
             with ThreadPoolExecutor(max_workers=BINANCE_MAX_WORKERS) as ex:
                 futures = {
-                    ex.submit(analyze_binance, s): s
+                    ex.submit(analyze_binance, s, status): s
                     for s in symbols
                 }
 
@@ -718,8 +865,21 @@ def binance_scan_loop():
                         pass
 
             print(
-                f"BINANCE STATUS | Symbols: {len(symbols)} "
-                f"| Checked: {checked} | Signals: {signals}"
+                "BINANCE STATUS | "
+                f"Symbols: {len(symbols)} | "
+                f"Checked: {checked} | "
+                f"1440 History: {status['history']} | "
+                f"24H Volume: {status['24h']} | "
+                f"Momentum: {status['momentum']} | "
+                f"Volume: {status['volume']} | "
+                f"Buy Pressure: {status['buy']} | "
+                f"Spread: {status['spread']} | "
+                f"1440 Resistance: {status['resistance']} | "
+                f"Breakout +1%: {status['breakout']} | "
+                f"Breakout Volume: {status['breakout_volume']} | "
+                f"Candle: {status['candle']} | "
+                f"Score: {status['score']} | "
+                f"Signals: {signals}"
             )
 
         except Exception as e:
@@ -742,26 +902,36 @@ def dex_get(path, timeout=15):
 
 
 def get_solana_pairs():
-    """Broad, deduplicated Solana pair discovery via DexScreener search."""
     pairs = {}
-    queries = list(dict.fromkeys(DEX_SEARCH_QUERIES + [
-        "SOL", "WSOL", "USDC", "USDT", "RAY", "JUP", "BONK", "WIF",
-        "POPCAT", "MEW", "PONKE", "BOME", "SAMO", "MYRO", "MOTHER",
-        "GOAT", "AI", "MEME", "INU", "CAT", "DOG", "COIN", "TOKEN", "USD"
-    ]))
-    for q in queries:
+
+    # DexScreener search endpoints can return overlapping results.
+    for q in DEX_SEARCH_QUERIES:
         try:
-            r = SESSION.get(DEX_BASE + "/latest/dex/search", params={"q": q}, timeout=15)
+            data = dex_get(
+                "/latest/dex/search",
+            )
+
+            # Search endpoint requires query; retry with params.
+            r = SESSION.get(
+                DEX_BASE + "/latest/dex/search",
+                params={"q": q},
+                timeout=15,
+            )
+
             if not r.ok:
                 continue
+
             for p in r.json().get("pairs", []):
                 if p.get("chainId") != "solana":
                     continue
+
                 address = p.get("pairAddress")
                 if address:
                     pairs[address] = p
-        except Exception as e:
-            print(f"DexScreener query error [{q}]: {e}")
+
+        except Exception:
+            continue
+
     return list(pairs.values())
 
 
@@ -803,7 +973,7 @@ def get_5m_stats(pair):
     }
 
 
-def solana_analyze(pair):
+def solana_analyze(pair, status):
     try:
         address = pair.get("pairAddress")
         if not address:
@@ -815,51 +985,39 @@ def solana_analyze(pair):
         age = pair_age_days(pair)
         if age is None or age <= SOLANA_MIN_AGE_DAYS:
             return None
+        status["age"] += 1
 
-        mcap = safe_float(
-            pair.get("marketCap") or pair.get("fdv")
-        )
-
+        mcap = safe_float(pair.get("marketCap") or pair.get("fdv"))
         if mcap < SOLANA_MIN_MCAP or mcap > SOLANA_MAX_MCAP:
             return None
+        status["mcap"] += 1
 
-        liquidity_obj = pair.get("liquidity") or {}
-        liquidity = safe_float(liquidity_obj.get("usd"))
-
+        liquidity = safe_float((pair.get("liquidity") or {}).get("usd"))
         if liquidity < SOLANA_MIN_LIQUIDITY:
             return None
+        status["liquidity"] += 1
 
         stats = get_5m_stats(pair)
-
         momentum = stats["momentum"]
         volume = stats["volume"]
         buys = stats["buys"]
         sells = stats["sells"]
 
-        if momentum < SOLANA_MIN_MOMENTUM:
+        if momentum < SOLANA_MIN_MOMENTUM or momentum > SOLANA_MAX_MOMENTUM:
             return None
-
-        if momentum > SOLANA_MAX_MOMENTUM:
-            return None
+        status["momentum"] += 1
 
         if volume < SOLANA_MIN_5M_VOLUME:
             return None
+        status["volume"] += 1
 
         if SOLANA_REQUIRE_BUYS_GT_SELLS and buys <= sells:
             return None
+        status["buys"] += 1
 
         previous = SOLANA_PREVIOUS.get(address)
 
-        # Momentum increasing remains mandatory.
-        if previous is not None:
-            if momentum <= previous["momentum"]:
-                return None
-
-            if volume <= previous["volume"]:
-                return None
-
-        else:
-            # First observation is stored, but does not alert.
+        if previous is None:
             SOLANA_PREVIOUS[address] = {
                 "momentum": momentum,
                 "volume": volume,
@@ -870,20 +1028,30 @@ def solana_analyze(pair):
             }
             return None
 
-        # IMPORTANT:
-        # Liquidity increase is NOT mandatory.
-        # Buys increase is NOT mandatory.
-        #
-        # We intentionally do not reject the token here based on either.
+        if momentum <= previous["momentum"]:
+            return None
+        status["momentum_increase"] += 1
 
+        if volume <= previous["volume"]:
+            return None
+        status["volume_increase"] += 1
+
+        # Liquidity increase and buys increase are intentionally NOT required.
         now = now_ts()
         last_alert = SOLANA_ALERTED.get(address, 0)
 
         if now - last_alert < SOLANA_COOLDOWN:
+            SOLANA_PREVIOUS[address] = {
+                "momentum": momentum,
+                "volume": volume,
+                "liquidity": liquidity,
+                "buys": buys,
+                "sells": sells,
+                "time": now,
+            }
             return None
 
         SOLANA_ALERTED[address] = now
-
         SOLANA_PREVIOUS[address] = {
             "momentum": momentum,
             "volume": volume,
@@ -893,9 +1061,9 @@ def solana_analyze(pair):
             "time": now,
         }
 
-        url = pair.get("url") or (
-            f"https://dexscreener.com/solana/{address}"
-        )
+        status["signals"] += 1
+
+        url = pair.get("url") or f"https://dexscreener.com/solana/{address}"
 
         return (
             f"🚀 SOLANA MOMENTUM\n\n"
@@ -907,7 +1075,10 @@ def solana_analyze(pair):
             f"📊 5M Volume: ${volume:,.0f}\n"
             f"🟢 5M Buys: {buys}\n"
             f"🔴 5M Sells: {sells}\n"
-            f"⚖️ Buys > Sells: YES\n\n"
+            f"⚖️ Buys > Sells: YES\n"
+            f"📈 Momentum increasing: YES\n"
+            f"📊 Volume increasing: YES\n"
+            f"🕐 Cooldown: 24H\n\n"
             f"🔗 {url}\n\n"
             f"⚠️ ALERT ONLY\n"
             f"NO AUTOMATIC ORDER"
@@ -922,63 +1093,35 @@ def solana_scan_loop():
         try:
             pairs = get_solana_pairs()
 
-            passed_age = 0
-            passed_mcap = 0
-            passed_liq = 0
-            passed_momentum = 0
-            passed_volume = 0
-            passed_buys = 0
-            signals = 0
+            status = {
+                "age": 0,
+                "mcap": 0,
+                "liquidity": 0,
+                "momentum": 0,
+                "volume": 0,
+                "buys": 0,
+                "momentum_increase": 0,
+                "volume_increase": 0,
+                "signals": 0,
+            }
 
             for pair in pairs:
-                age = pair_age_days(pair)
-
-                if age is not None and age > SOLANA_MIN_AGE_DAYS:
-                    passed_age += 1
-
-                mcap = safe_float(
-                    pair.get("marketCap") or pair.get("fdv")
-                )
-                if SOLANA_MIN_MCAP <= mcap <= SOLANA_MAX_MCAP:
-                    passed_mcap += 1
-
-                liq = safe_float(
-                    (pair.get("liquidity") or {}).get("usd")
-                )
-                if liq >= SOLANA_MIN_LIQUIDITY:
-                    passed_liq += 1
-
-                stats = get_5m_stats(pair)
-
-                if (
-                    SOLANA_MIN_MOMENTUM
-                    <= stats["momentum"]
-                    <= SOLANA_MAX_MOMENTUM
-                ):
-                    passed_momentum += 1
-
-                if stats["volume"] >= SOLANA_MIN_5M_VOLUME:
-                    passed_volume += 1
-
-                if stats["buys"] > stats["sells"]:
-                    passed_buys += 1
-
-                result = solana_analyze(pair)
-
+                result = solana_analyze(pair, status)
                 if result:
-                    signals += 1
                     send_alert(result)
 
             print(
                 "SOLANA DEXSCREENER | "
                 f"Pairs: {len(pairs)} | "
-                f"Age passed: {passed_age} | "
-                f"MCap passed: {passed_mcap} | "
-                f"Momentum passed: {passed_momentum} | "
-                f"Volume passed: {passed_volume} | "
-                f"Liquidity passed: {passed_liq} | "
-                f"Buys passed: {passed_buys} | "
-                f"Signals: {signals}"
+                f"Age: {status['age']} | "
+                f"MCap: {status['mcap']} | "
+                f"Liquidity: {status['liquidity']} | "
+                f"Momentum: {status['momentum']} | "
+                f"Volume: {status['volume']} | "
+                f"Buys>Sells: {status['buys']} | "
+                f"Momentum Increase: {status['momentum_increase']} | "
+                f"Volume Increase: {status['volume_increase']} | "
+                f"Signals: {status['signals']}"
             )
 
         except Exception as e:
@@ -996,8 +1139,14 @@ def print_config():
     print("UNIFIED ALERT BOT")
     print("=" * 60)
     print("BINANCE:")
-    print("  5M momentum + 1440 closed-candle breakout")
-    print(f"  Breakout: +{MIN_BREAKOUT_PERCENT}% above previous {RESISTANCE_LOOKBACK} closed 5M candles")
+    print("  5M momentum + 1440-candle real breakout")
+    print("  1440 CLOSED 5M candles")
+    print("  Breakout: >= +1% above 1440 highest high")
+    print("  Breakout volume: >= 1.5x")
+    print("  Buy pressure: >= 55%")
+    print("  24H volume: >= $1M")
+    print("  Spread: <= 0.20%")
+    print("  Same coin cooldown: 24H")
     print("  Alert only")
     print()
     print("SOLANA DEXSCREENER:")
@@ -1030,13 +1179,19 @@ def main():
 
     load_binance_symbols()
 
-    # Binance WS
+    # Load 1440 CLOSED 5M candles before scanning.
     if BINANCE_SYMBOLS:
-        threading.Thread(
-            target=ws_worker,
-            args=(BINANCE_SYMBOLS,),
-            daemon=True,
-        ).start()
+        load_binance_histories(BINANCE_SYMBOLS)
+
+        # Split WebSocket streams into small chunks for stability.
+        for i in range(0, len(BINANCE_SYMBOLS), WS_CHUNK_SIZE):
+            chunk = BINANCE_SYMBOLS[i:i + WS_CHUNK_SIZE]
+            threading.Thread(
+                target=ws_worker,
+                args=(chunk,),
+                daemon=True,
+            ).start()
+            time.sleep(0.5)
 
     # Binance scanner
     threading.Thread(
