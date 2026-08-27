@@ -184,34 +184,51 @@ def pct_change(old, new):
 # TELEGRAM
 # ============================================================
 
+def telegram_send_now(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("TELEGRAM ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+        "parse_mode": "HTML",
+    }
+
+    try:
+        r = SESSION.post(url, json=payload, timeout=15)
+        print(f"TELEGRAM HTTP: {r.status_code}")
+        if r.ok:
+            print("TELEGRAM OK")
+            return True
+        print("TELEGRAM ERROR BODY:", r.text[:1000])
+    except Exception as e:
+        print("TELEGRAM EXCEPTION:", repr(e))
+    return False
+
+
 def telegram_worker():
     while not STOP_EVENT.is_set():
         try:
             msg = TELEGRAM_QUEUE.get(timeout=1)
         except Empty:
             continue
-
         try:
-            if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-                print("Telegram credentials are missing")
-                continue
-
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg,
-                "disable_web_page_preview": True,
-            }
-
-            r = SESSION.post(url, json=payload, timeout=15)
-            if not r.ok:
-                print("Telegram error:", r.status_code, r.text[:300])
-
-        except Exception as e:
-            print("Telegram worker error:", e)
-
+            telegram_send_now(msg)
         finally:
             TELEGRAM_QUEUE.task_done()
+
+
+def telegram_startup_test():
+    telegram_send_now(
+        "🟢 <b>UNIFIED ALERT BOT TEST</b>\n\n"
+        "Binance + Solana DexScreener aktivdir.\n"
+        "Telegram bağlantısı işləyir.\n\n"
+        "⚠️ ALERT ONLY\n"
+        "No automatic order."
+    )
 
 
 def send_alert(text):
@@ -904,14 +921,8 @@ def dex_get(path, timeout=15):
 def get_solana_pairs():
     pairs = {}
 
-    # DexScreener search endpoints can return overlapping results.
     for q in DEX_SEARCH_QUERIES:
         try:
-            data = dex_get(
-                "/latest/dex/search",
-            )
-
-            # Search endpoint requires query; retry with params.
             r = SESSION.get(
                 DEX_BASE + "/latest/dex/search",
                 params={"q": q},
@@ -919,18 +930,19 @@ def get_solana_pairs():
             )
 
             if not r.ok:
+                print(f"DexScreener HTTP {r.status_code} for q={q}: {r.text[:200]}")
                 continue
 
-            for p in r.json().get("pairs", []):
+            data = r.json()
+            for p in data.get("pairs", []):
                 if p.get("chainId") != "solana":
                     continue
-
                 address = p.get("pairAddress")
                 if address:
                     pairs[address] = p
 
-        except Exception:
-            continue
+        except Exception as e:
+            print(f"DexScreener error q={q}: {repr(e)}")
 
     return list(pairs.values())
 
@@ -1176,6 +1188,9 @@ def main():
         target=telegram_worker,
         daemon=True,
     ).start()
+
+    # Immediate Telegram connectivity test.
+    telegram_startup_test()
 
     load_binance_symbols()
 
