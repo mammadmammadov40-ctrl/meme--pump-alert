@@ -106,8 +106,8 @@ SOLANA_MIN_AGE_DAYS = 20
 SOLANA_MIN_MCAP = 7_000
 SOLANA_MAX_MCAP = 100_000
 
-SOLANA_MIN_MOMENTUM = 1.0
-SOLANA_MAX_MOMENTUM = 50.0
+SOLANA_MIN_MOMENTUM = None
+SOLANA_MAX_MOMENTUM = None
 
 SOLANA_MIN_LIQUIDITY = 7_000
 
@@ -121,7 +121,7 @@ SOLANA_REQUIRE_LIQUIDITY_INCREASE = False
 SOLANA_REQUIRE_BUYS_INCREASE = False
 
 # Buys > sells IS mandatory
-SOLANA_REQUIRE_BUYS_GT_SELLS = True
+SOLANA_REQUIRE_BUYS_GT_SELLS = False
 
 SOLANA_COOLDOWN = 24 * 60 * 60
 
@@ -1015,16 +1015,16 @@ def solana_analyze(pair, status):
         buys = stats["buys"]
         sells = stats["sells"]
 
-        if momentum < SOLANA_MIN_MOMENTUM or momentum > SOLANA_MAX_MOMENTUM:
-            return None
+        # Momentum filter REMOVED.
+        # We keep the 5M momentum value only for information.
         status["momentum"] += 1
 
+        # 5M volume remains mandatory.
         if volume < SOLANA_MIN_5M_VOLUME:
             return None
         status["volume"] += 1
 
-        if SOLANA_REQUIRE_BUYS_GT_SELLS and buys <= sells:
-            return None
+        # Buys > Sells is NOT mandatory.
         status["buys"] += 1
 
         previous = SOLANA_PREVIOUS.get(address)
@@ -1040,12 +1040,10 @@ def solana_analyze(pair, status):
             }
             return None
 
-        if momentum <= previous["momentum"]:
-            return None
+        # Momentum increase is NOT required.
         status["momentum_increase"] += 1
 
-        if volume <= previous["volume"]:
-            return None
+        # Volume increase is NOT required; only minimum 5M volume is required.
         status["volume_increase"] += 1
 
         # Liquidity increase and buys increase are intentionally NOT required.
