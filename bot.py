@@ -30,12 +30,18 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CMC_API_KEY = os.getenv("CMC_API_KEY", "")
 
+# Binance Square creator to monitor
+SQUARE_AUTHOR_NAME = os.getenv("SQUARE_AUTHOR_NAME", "Hua BNB")
+SQUARE_SCAN_INTERVAL = 5
+SQUARE_PAGE_SIZE = 20
+SQUARE_LATEST_URL = "https://www.binance.com/bapi/composite/v3/friendly/pgc/content/article/list"
+
 
 # ============================================================
 # GENERAL
 # ============================================================
 
-UA = "UnifiedMomentumBreakoutBot/8.0"
+UA = "UnifiedMomentumBreakoutBot/9.0-Square"
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA})
 
@@ -141,6 +147,11 @@ DEX_SEARCH_QUERIES = [
 
 SOLANA_ALERTED = {}
 SOLANA_PREVIOUS = {}
+
+# Binance Square state
+SQUARE_SEEN_POSTS = set()
+SQUARE_LAST_POST_ID = None
+SQUARE_LAST_STATUS = 0
 
 # Binance state
 BINANCE_SYMBOLS = []
@@ -1085,9 +1096,9 @@ def solana_analyze(pair, status):
             f"📊 5M Volume: ${volume:,.0f}\n"
             f"🟢 5M Buys: {buys}\n"
             f"🔴 5M Sells: {sells}\n"
-            f"⚖️ Buys > Sells: YES\n"
-            f"📈 Momentum increasing: YES\n"
-            f"📊 Volume increasing: YES\n"
+            f"⚖️ Buys > Sells: NOT REQUIRED\n"
+            f"📈 Momentum increasing: NOT REQUIRED\n"
+            f"📊 Volume increasing: NOT REQUIRED\n"
             f"🕐 Cooldown: 24H\n\n"
             f"🔗 {url}\n\n"
             f"⚠️ ALERT ONLY\n"
@@ -1141,6 +1152,191 @@ def solana_scan_loop():
 
 
 # ============================================================
+# BINANCE SQUARE MONITOR
+# ============================================================
+
+def square_get_latest():
+    """Fetch newest public Binance Square posts."""
+    params = {"pageIndex": 1, "pageSize": SQUARE_PAGE_SIZE, "type": 2}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.binance.com/en/square",
+    }
+    r = SESSION.get(SQUARE_LATEST_URL, params=params, headers=headers, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+
+    # The public feed has had several response wrappers. Find the post list.
+    def find_lists(obj):
+        found = []
+        if isinstance(obj, list):
+            if any(isinstance(x, dict) for x in obj):
+                found.append(obj)
+            return found
+        if isinstance(obj, dict):
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    found.extend(find_lists(value))
+        return found
+
+    lists = find_lists(data)
+    return [x for x in lists[0] if isinstance(x, dict)] if lists else []
+
+
+def square_post_id(post):
+    for key in ("id", "postId", "articleId", "contentId"):
+        value = post.get(key)
+        if value is not None and str(value):
+            return str(value)
+    return ""
+
+
+def square_author(post):
+    for key in ("authorName", "author", "userName", "nickName", "nickname"):
+        value = post.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            for k in ("name", "nickName", "nickname", "username"):
+                v = value.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    return ""
+
+
+def square_content(post):
+    parts = []
+    for key in ("title", "content", "body", "text", "description"):
+        value = post.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    return "\n".join(dict.fromkeys(parts))
+
+
+def square_post_time(post):
+    for key in ("date", "createTime", "createdAt", "publishTime", "releaseTime"):
+        value = post.get(key)
+        if value is None:
+            continue
+        try:
+            ts = float(value)
+            if ts > 10_000_000_000:
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            pass
+    return "unknown"
+
+
+def square_link(post, post_id):
+    for key in ("webLink", "url", "link"):
+        value = post.get(key)
+        if isinstance(value, str) and value.startswith("http"):
+            return value
+    return f"https://www.binance.com/en/square/post/{post_id}" if post_id else "https://www.binance.com/en/square"
+
+
+def square_extract_symbols(text):
+    import re
+    if not text:
+        return []
+    result = []
+    for match in re.findall(r"\$([A-Za-z][A-Za-z0-9]{1,14})\b", text):
+        sym = match.upper()
+        if sym not in result:
+            result.append(sym)
+    return result
+
+
+def square_alert(post):
+    post_id = square_post_id(post)
+    author = square_author(post) or SQUARE_AUTHOR_NAME
+    content = square_content(post)
+    symbols = square_extract_symbols(content)
+    coin_line = ", ".join(f"${s}" for s in symbols) if symbols else "No $symbol detected"
+
+    return (
+        f"🚨 <b>BINANCE SQUARE ALERT</b>\n\n"
+        f"👤 <b>{author}</b>\n"
+        f"🪙 <b>{coin_line}</b>\n"
+        f"🕐 {square_post_time(post)}\n\n"
+        f"📝 {content[:1200] if content else 'New post detected'}\n\n"
+        f"🔗 {square_link(post, post_id)}\n\n"
+        f"⚡ <b>FAST ALERT</b>\n"
+        f"⚠️ ALERT ONLY\n"
+        f"NO AUTOMATIC ORDER"
+    )
+
+
+def square_scan_loop():
+    global SQUARE_LAST_POST_ID, SQUARE_LAST_STATUS
+
+    # Seed current posts so a restart does not alert old posts.
+    try:
+        initial = square_get_latest()
+        for post in initial:
+            if square_author(post).casefold() == SQUARE_AUTHOR_NAME.casefold():
+                pid = square_post_id(post)
+                if pid:
+                    SQUARE_SEEN_POSTS.add(pid)
+                    if SQUARE_LAST_POST_ID is None:
+                        SQUARE_LAST_POST_ID = pid
+        print(f"BINANCE SQUARE | Monitoring: {SQUARE_AUTHOR_NAME} | Seeded: {len(SQUARE_SEEN_POSTS)}")
+    except Exception as e:
+        print("Binance Square startup error:", repr(e))
+
+    while not STOP_EVENT.is_set():
+        try:
+            posts = square_get_latest()
+            matched = 0
+            new_posts = []
+
+            for post in posts:
+                if square_author(post).casefold() != SQUARE_AUTHOR_NAME.casefold():
+                    continue
+                matched += 1
+                pid = square_post_id(post)
+                if pid and pid not in SQUARE_SEEN_POSTS:
+                    new_posts.append(post)
+
+            def post_time_value(post):
+                for key in ("date", "createTime", "createdAt", "publishTime", "releaseTime"):
+                    try:
+                        return float(post.get(key, 0) or 0)
+                    except Exception:
+                        pass
+                return 0
+
+            new_posts.sort(key=post_time_value)
+            for post in new_posts:
+                pid = square_post_id(post)
+                if not pid:
+                    continue
+                SQUARE_SEEN_POSTS.add(pid)
+                SQUARE_LAST_POST_ID = pid
+                send_alert(square_alert(post))
+
+            if len(SQUARE_SEEN_POSTS) > 2000:
+                SQUARE_SEEN_POSTS.clear()
+                for post in posts:
+                    pid = square_post_id(post)
+                    if pid:
+                        SQUARE_SEEN_POSTS.add(pid)
+
+            SQUARE_LAST_STATUS = time.time()
+            print(
+                "BINANCE SQUARE | "
+                f"Author: {SQUARE_AUTHOR_NAME} | "
+                f"Latest: {len(posts)} | Author: {matched} | New: {len(new_posts)}"
+            )
+        except Exception as e:
+            print("Binance Square scan error:", repr(e))
+
+        time.sleep(SQUARE_SCAN_INTERVAL)
+
+
+# ============================================================
 # STARTUP
 # ============================================================
 
@@ -1162,16 +1358,13 @@ def print_config():
     print("SOLANA DEXSCREENER:")
     print(f"  Age > {SOLANA_MIN_AGE_DAYS} days")
     print(f"  MCap: ${SOLANA_MIN_MCAP:,} - ${SOLANA_MAX_MCAP:,}")
-    print(
-        f"  5M momentum: +{SOLANA_MIN_MOMENTUM}% "
-        f"to +{SOLANA_MAX_MOMENTUM}%"
-    )
-    print("  Momentum increasing: REQUIRED")
-    print("  5M volume increasing: REQUIRED")
+    print("  5M momentum: NOT REQUIRED")
+    print("  Momentum increasing: NOT REQUIRED")
+    print("  5M volume increasing: NOT REQUIRED")
     print(f"  Minimum liquidity: ${SOLANA_MIN_LIQUIDITY:,}")
     print("  Liquidity increasing: NOT REQUIRED")
     print("  Buys increasing: NOT REQUIRED")
-    print("  Buys > sells: REQUIRED")
+    print("  Buys > sells: NOT REQUIRED")
     print(f"  Minimum 5M volume: ${SOLANA_MIN_5M_VOLUME}")
     print("  Same token cooldown: 24H")
     print("  ALERT ONLY")
@@ -1215,6 +1408,11 @@ def main():
     # Solana DexScreener scanner
     threading.Thread(
         target=solana_scan_loop,
+        daemon=True,
+    ).start()
+
+    threading.Thread(
+        target=square_scan_loop,
         daemon=True,
     ).start()
 
