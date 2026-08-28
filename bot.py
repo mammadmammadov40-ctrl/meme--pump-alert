@@ -19,8 +19,8 @@ import websocket
 # +
 # 600 CLOSED 15M CANDLE REAL BREAKOUT
 #
-# SOLANA REMOVED
-# BINANCE SQUARE REMOVED
+# SOLANA: REMOVED
+# BINANCE SQUARE: REMOVED
 #
 # ALERT ONLY
 # NO AUTOMATIC ORDER
@@ -59,13 +59,9 @@ SESSION.headers.update({
     "User-Agent": UA
 })
 
-TELEGRAM_QUEUE = Queue(
-    maxsize=500
-)
+TELEGRAM_QUEUE = Queue(maxsize=500)
 
 STOP_EVENT = threading.Event()
-
-STATE_LOCK = threading.RLock()
 
 
 # ============================================================
@@ -76,50 +72,43 @@ BINANCE_REST = "https://api.binance.com"
 
 BINANCE_WS = "wss://stream.binance.com:443"
 
-
-# ============================================================
-# TIMEFRAMES
-# ============================================================
-
+# 5M momentum
 MOMENTUM_INTERVAL = "5m"
 
+# 15M breakout
 BREAKOUT_INTERVAL = "15m"
 
 
 # ============================================================
-# 15M BREAKOUT HISTORY
+# HISTORY
 # ============================================================
 
 # EXACTLY 600 CLOSED 15M candles
-RESISTANCE_LOOKBACK = 600
+BREAKOUT_HISTORY_LIMIT = 600
 
-# Binance maximum REST klines = 1000
-KLINE_BATCH_SIZE = 500
+# Binance max request = 1000
+# We use 500 + 100
+BREAKOUT_BATCH_1 = 500
+BREAKOUT_BATCH_2 = 100
 
-KLINE_SECOND_BATCH = 100
-
-HISTORY_LIMIT = 600
-
-# Internal buffer.
-# We keep one extra candle so the newest CLOSED candle
-# can be tested against the PREVIOUS 600 candles.
-BREAKOUT_HISTORY_MAX = 601
-
-
-# ============================================================
-# 5M MOMENTUM HISTORY
-# ============================================================
-
-MOMENTUM_HISTORY_LIMIT = 25
+# Small 5M history for momentum
+MOMENTUM_HISTORY_LIMIT = 30
 
 AVERAGE_VOLUME_CANDLES = 20
 
 
 # ============================================================
-# MOMENTUM CONDITIONS
+# 5M MOMENTUM
 # ============================================================
 
 MIN_PRICE_CHANGE = 1.0
+
+MIN_MOMENTUM_VOLUME_RATIO = 1.2
+
+
+# ============================================================
+# 24H VOLUME
+# ============================================================
 
 MIN_24H_QUOTE_VOLUME = 1_000_000
 
@@ -145,22 +134,16 @@ MIN_BUY_PRESSURE = 55.0
 
 
 # ============================================================
-# 5M VOLUME
-# ============================================================
-
-VOLUME_MIN_RATIO = 1.2
-
-
-# ============================================================
 # REAL 15M BREAKOUT
 # ============================================================
 
 # Current CLOSED 15M candle must close
-# at least +1% above the highest HIGH
+# at least 1% above the highest HIGH
 # of the previous 600 CLOSED 15M candles.
+
 MIN_BREAKOUT_PERCENT = 1.0
 
-# Breakout candle volume >= 1.5x
+# Breakout volume >= 1.5x previous average
 MIN_BREAKOUT_VOLUME_RATIO = 1.5
 
 
@@ -171,6 +154,15 @@ MIN_BREAKOUT_VOLUME_RATIO = 1.5
 MIN_CLOSE_POSITION = 70.0
 
 MAX_UPPER_WICK_PERCENT = 30.0
+
+
+# ============================================================
+# SCORE
+# ============================================================
+
+MIN_SIGNAL_SCORE = 60
+
+STRONG_SIGNAL_SCORE = 75
 
 
 # ============================================================
@@ -187,29 +179,20 @@ TP3 = 8.0
 
 
 # ============================================================
-# SCORE
+# SCANNER
 # ============================================================
 
-MIN_SIGNAL_SCORE = 60
+SCAN_INTERVAL = 20
 
-STRONG_SIGNAL_SCORE = 75
+STATUS_INTERVAL = 60
 
-
-# ============================================================
-# WEBSOCKET / SCANNER
-# ============================================================
+SIGNAL_COOLDOWN_SECONDS = 24 * 60 * 60
 
 WS_CHUNK_SIZE = 40
 
 RECONNECT_SECONDS = 5
 
-STATUS_INTERVAL = 60
-
-SCAN_INTERVAL = 20
-
-SIGNAL_COOLDOWN_SECONDS = 24 * 60 * 60
-
-BINANCE_MAX_WORKERS = 12
+BINANCE_MAX_WORKERS = 10
 
 
 # ============================================================
@@ -224,15 +207,20 @@ BINANCE_15M_HISTORY = {}
 # 5M CLOSED history
 BINANCE_5M_HISTORY = {}
 
-# Live ticker / current candles
+# Live ticker data
 BINANCE_LIVE = {}
 
 # Order book
 BINANCE_BOOKS = {}
 
+BINANCE_LAST_BOOK_REST = {}
+
 BINANCE_LAST_SIGNAL = {}
 
-BINANCE_LAST_BOOK_REST = {}
+# Last processed 15M candle
+BINANCE_LAST_BREAKOUT_CANDLE = {}
+
+STATE_LOCK = threading.RLock()
 
 
 # ============================================================
@@ -251,20 +239,14 @@ def utc_text():
     )
 
 
-def safe_float(
-    value,
-    default=0.0
-):
+def safe_float(value, default=0.0):
     try:
         return float(value)
     except Exception:
         return default
 
 
-def pct_change(
-    old,
-    new
-):
+def pct_change(old, new):
     if old <= 0:
         return 0.0
 
@@ -292,12 +274,10 @@ def telegram_send_now(text):
 
         return False
 
-
     url = (
         "https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
-
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -305,7 +285,6 @@ def telegram_send_now(text):
         "disable_web_page_preview": True,
         "parse_mode": "HTML",
     }
-
 
     try:
 
@@ -315,12 +294,10 @@ def telegram_send_now(text):
             timeout=15
         )
 
-
         print(
             "TELEGRAM HTTP:",
             response.status_code
         )
-
 
         if response.ok:
 
@@ -330,12 +307,10 @@ def telegram_send_now(text):
 
             return True
 
-
         print(
-            "TELEGRAM ERROR BODY:",
-            response.text[:1000]
+            "TELEGRAM ERROR:",
+            response.text[:500]
         )
-
 
     except Exception as e:
 
@@ -343,7 +318,6 @@ def telegram_send_now(text):
             "TELEGRAM EXCEPTION:",
             repr(e)
         )
-
 
     return False
 
@@ -354,16 +328,13 @@ def telegram_worker():
 
         try:
 
-            message = (
-                TELEGRAM_QUEUE.get(
-                    timeout=1
-                )
+            message = TELEGRAM_QUEUE.get(
+                timeout=1
             )
 
         except Empty:
 
             continue
-
 
         try:
 
@@ -379,23 +350,17 @@ def telegram_worker():
 def telegram_startup_test():
 
     telegram_send_now(
-
         "🟢 <b>BINANCE SPOT BOT TEST</b>\n\n"
-
-        "Binance Spot aktivdir.\n\n"
-
-        "📊 Momentum: 5M\n"
-
-        "🏔 Resistance: previous "
-        "600 CLOSED 15M candles\n"
-
+        "5M Momentum + 600 CLOSED 15M "
+        "Real Breakout aktivdir.\n\n"
+        "📊 Resistance: previous 600 CLOSED 15M candles\n"
         "🚀 Breakout: +1%\n"
-
         "📈 Breakout volume: ≥1.5x\n\n"
-
+        "🟢 Binance Spot ONLY\n"
+        "❌ Solana\n"
+        "❌ Binance Square\n\n"
         "⚠️ ALERT ONLY\n"
         "NO AUTOMATIC ORDER"
-
     )
 
 
@@ -426,22 +391,19 @@ def binance_get(
 
     url = BINANCE_REST + path
 
-
     response = SESSION.get(
         url,
         params=params,
         timeout=timeout
     )
 
-
     response.raise_for_status()
-
 
     return response.json()
 
 
 # ============================================================
-# LOAD BINANCE SPOT SYMBOLS
+# BINANCE SYMBOLS
 # ============================================================
 
 def load_binance_symbols():
@@ -453,12 +415,10 @@ def load_binance_symbols():
             timeout=20
         )
 
-
-        allowed_cmc = set()
-
+        cmc_allowed = set()
 
         # ----------------------------------------------------
-        # CMC FILTER
+        # OPTIONAL CMC FILTER
         # ----------------------------------------------------
 
         if CMC_API_KEY:
@@ -470,19 +430,16 @@ def load_binance_symbols():
                     "v1/cryptocurrency/listings/latest"
                 )
 
-
                 headers = {
                     "X-CMC_PRO_API_KEY":
                     CMC_API_KEY
                 }
-
 
                 params = {
                     "start": 1,
                     "limit": 2000,
                     "convert": "USD",
                 }
-
 
                 response = SESSION.get(
                     cmc_url,
@@ -491,10 +448,11 @@ def load_binance_symbols():
                     timeout=20
                 )
 
-
                 if response.ok:
 
-                    for item in response.json().get(
+                    data = response.json()
+
+                    for item in data.get(
                         "data",
                         []
                     ):
@@ -506,38 +464,19 @@ def load_binance_symbols():
                             )
                         ).upper()
 
-
                         rank = int(
                             item.get(
                                 "cmc_rank"
                             ) or 999999
                         )
 
-
                         if (
-                            1
-                            <= rank
-                            <= 2000
+                            1 <= rank <= 2000
                         ):
 
-                            allowed_cmc.add(
+                            cmc_allowed.add(
                                 symbol
                             )
-
-
-                    print(
-                        "CMC symbols:",
-                        len(allowed_cmc)
-                    )
-
-
-                else:
-
-                    print(
-                        "CMC HTTP error:",
-                        response.status_code
-                    )
-
 
             except Exception as e:
 
@@ -546,9 +485,11 @@ def load_binance_symbols():
                     repr(e)
                 )
 
+        # ----------------------------------------------------
+        # BINANCE SPOT
+        # ----------------------------------------------------
 
         symbols = []
-
 
         for item in info.get(
             "symbols",
@@ -561,13 +502,11 @@ def load_binance_symbols():
 
                 continue
 
-
             if item.get(
                 "quoteAsset"
             ) != "USDT":
 
                 continue
-
 
             if not item.get(
                 "isSpotTradingAllowed",
@@ -576,7 +515,6 @@ def load_binance_symbols():
 
                 continue
 
-
             base = str(
                 item.get(
                     "baseAsset",
@@ -584,11 +522,7 @@ def load_binance_symbols():
                 )
             ).upper()
 
-
-            # ------------------------------------------------
             # Remove leveraged tokens
-            # ------------------------------------------------
-
             if base.endswith(
                 (
                     "UP",
@@ -600,42 +534,30 @@ def load_binance_symbols():
 
                 continue
 
-
-            # ------------------------------------------------
-            # CMC filter
-            # ------------------------------------------------
-
+            # CMC filter only if API worked
             if (
-                allowed_cmc
-                and base not in allowed_cmc
+                cmc_allowed
+                and base not in cmc_allowed
             ):
 
                 continue
-
 
             symbols.append(
                 item["symbol"]
             )
 
-
-        symbols = sorted(
-            set(symbols)
-        )
-
+        symbols.sort()
 
         with STATE_LOCK:
 
             BINANCE_SYMBOLS[:] = symbols
-
 
         print(
             "BINANCE SPOT SYMBOLS:",
             len(symbols)
         )
 
-
         return symbols
-
 
     except Exception as e:
 
@@ -667,17 +589,15 @@ def get_klines(
         )
     }
 
-
     if end_time is not None:
 
         params["endTime"] = int(
             end_time
         )
 
-
     return binance_get(
         "/api/v3/klines",
-        params,
+        params=params,
         timeout=20
     )
 
@@ -685,41 +605,21 @@ def get_klines(
 def kline_to_candle(k):
 
     return {
-
-        "open_time":
-        int(k[0]),
-
-        "open":
-        safe_float(k[1]),
-
-        "high":
-        safe_float(k[2]),
-
-        "low":
-        safe_float(k[3]),
-
-        "close":
-        safe_float(k[4]),
-
-        "volume":
-        safe_float(k[5]),
-
-        "close_time":
-        int(k[6]),
-
-        "quote_volume":
-        safe_float(k[7]),
-
-        "taker_buy_quote":
-        safe_float(k[10]),
-
-        "closed":
-        True,
+        "open_time": int(k[0]),
+        "open": safe_float(k[1]),
+        "high": safe_float(k[2]),
+        "low": safe_float(k[3]),
+        "close": safe_float(k[4]),
+        "volume": safe_float(k[5]),
+        "close_time": int(k[6]),
+        "quote_volume": safe_float(k[7]),
+        "taker_buy_quote": safe_float(k[10]),
+        "closed": True,
     }
 
 
 # ============================================================
-# LOAD EXACTLY 600 CLOSED 15M CANDLES
+# LOAD 600 CLOSED 15M CANDLES
 #
 # 500 + 100
 # ============================================================
@@ -732,115 +632,84 @@ def load_600_closed_15m(symbol):
             time.time() * 1000
         )
 
-
         # ----------------------------------------------------
         # FIRST BATCH
-        # 500 latest 15M candles
+        # Latest 500
         # ----------------------------------------------------
 
         batch1 = get_klines(
             symbol,
             BREAKOUT_INTERVAL,
-            KLINE_BATCH_SIZE,
+            BREAKOUT_BATCH_1,
             now_ms
         )
-
 
         if not batch1:
 
             return None
 
-
         candles1 = []
-
 
         for k in batch1:
 
-            close_time = int(
-                k[6]
-            )
-
-
-            if close_time < now_ms:
+            if int(k[6]) < now_ms:
 
                 candles1.append(
                     kline_to_candle(k)
                 )
 
-
         if not candles1:
 
             return None
-
-
-        # ----------------------------------------------------
-        # Oldest candle in batch 1
-        # ----------------------------------------------------
 
         oldest_open_time = (
             candles1[0]["open_time"]
         )
 
-
         # ----------------------------------------------------
         # SECOND BATCH
-        #
-        # Request candles BEFORE batch 1.
-        # We need 100 immediately previous candles.
+        # Before first batch
         # ----------------------------------------------------
 
         batch2 = get_klines(
             symbol,
             BREAKOUT_INTERVAL,
-            KLINE_BATCH_SIZE,
+            BREAKOUT_BATCH_2,
             oldest_open_time - 1
         )
 
-
         candles2 = []
-
 
         for k in batch2:
 
-            close_time = int(
-                k[6]
-            )
-
-
-            if close_time < now_ms:
+            if int(k[6]) < now_ms:
 
                 candles2.append(
                     kline_to_candle(k)
                 )
 
-
         if not candles2:
 
             return None
 
-
-        # Latest 100 candles immediately
-        # before batch 1.
-        candles2 = candles2[
-            -KLINE_SECOND_BATCH:
-        ]
-
-
         combined = (
             candles2
-            +
-            candles1
+            + candles1
         )
 
-
+        # ----------------------------------------------------
         # Sort
+        # ----------------------------------------------------
+
         combined.sort(
             key=lambda c:
             c["open_time"]
         )
 
-
+        # ----------------------------------------------------
         # Remove duplicates
+        # ----------------------------------------------------
+
         unique = {}
 
         for candle in combined:
@@ -849,54 +718,54 @@ def load_600_closed_15m(symbol):
                 candle["open_time"]
             ] = candle
 
-
         combined = list(
             unique.values()
         )
-
 
         combined.sort(
             key=lambda c:
             c["open_time"]
         )
 
+        # ----------------------------------------------------
+        # EXACTLY 600
+        # ----------------------------------------------------
 
-        # Exactly latest 600 CLOSED candles
         combined = combined[
-            -HISTORY_LIMIT:
+            -BREAKOUT_HISTORY_LIMIT:
         ]
 
-
-        if len(combined) < HISTORY_LIMIT:
+        if len(combined) < (
+            BREAKOUT_HISTORY_LIMIT
+        ):
 
             print(
-                f"15M HISTORY INCOMPLETE "
+                f"15M history incomplete "
                 f"{symbol}: "
                 f"{len(combined)}/"
-                f"{HISTORY_LIMIT}"
+                f"{BREAKOUT_HISTORY_LIMIT}"
             )
 
             return None
 
-
         return deque(
             combined,
-            maxlen=BREAKOUT_HISTORY_MAX
+            maxlen=BREAKOUT_HISTORY_LIMIT
         )
-
 
     except Exception as e:
 
         print(
             f"15M history error "
-            f"{symbol}: {repr(e)}"
+            f"{symbol}:",
+            repr(e)
         )
 
         return None
 
 
 # ============================================================
-# LOAD RECENT 5M HISTORY
+# LOAD SMALL 5M HISTORY
 # ============================================================
 
 def load_5m_history(symbol):
@@ -907,53 +776,42 @@ def load_5m_history(symbol):
             time.time() * 1000
         )
 
-
         data = get_klines(
             symbol,
             MOMENTUM_INTERVAL,
-            MOMENTUM_HISTORY_LIMIT + 2,
+            MOMENTUM_HISTORY_LIMIT,
             now_ms
         )
 
-
         candles = []
-
 
         for k in data:
 
-            close_time = int(
-                k[6]
-            )
-
-
-            if close_time < now_ms:
+            if int(k[6]) < now_ms:
 
                 candles.append(
                     kline_to_candle(k)
                 )
 
-
         candles = candles[
             -MOMENTUM_HISTORY_LIMIT:
         ]
 
-
-        if len(candles) < 21:
+        if not candles:
 
             return None
-
 
         return deque(
             candles,
             maxlen=MOMENTUM_HISTORY_LIMIT
         )
 
-
     except Exception as e:
 
         print(
             f"5M history error "
-            f"{symbol}: {repr(e)}"
+            f"{symbol}:",
+            repr(e)
         )
 
         return None
@@ -965,28 +823,25 @@ def load_5m_history(symbol):
 
 def load_binance_histories(symbols):
 
-    print("=" * 65)
+    print("=" * 60)
 
     print(
         "LOADING BINANCE HISTORIES"
     )
 
     print(
-        "15M BREAKOUT HISTORY: "
-        "EXACTLY 600 CLOSED CANDLES"
+        "15M = EXACTLY 600 CLOSED candles"
     )
 
     print(
-        "REST: 500 + 100"
+        "15M REST = 500 + 100"
     )
 
     print(
-        "5M MOMENTUM HISTORY: "
-        "25 CLOSED CANDLES"
+        "5M = 30 CLOSED candles"
     )
 
-    print("=" * 65)
-
+    print("=" * 60)
 
     loaded = 0
 
@@ -994,8 +849,7 @@ def load_binance_histories(symbols):
 
     success_5m = 0
 
-
-    def load_one(symbol):
+    def worker(symbol):
 
         history_15m = (
             load_600_closed_15m(
@@ -1003,13 +857,11 @@ def load_binance_histories(symbols):
             )
         )
 
-
         history_5m = (
             load_5m_history(
                 symbol
             )
         )
-
 
         return (
             symbol,
@@ -1017,26 +869,23 @@ def load_binance_histories(symbols):
             history_5m
         )
 
-
     with ThreadPoolExecutor(
         max_workers=BINANCE_MAX_WORKERS
     ) as executor:
 
         futures = [
             executor.submit(
-                load_one,
+                worker,
                 symbol
             )
             for symbol in symbols
         ]
-
 
         for future in as_completed(
             futures
         ):
 
             loaded += 1
-
 
             try:
 
@@ -1046,11 +895,10 @@ def load_binance_histories(symbols):
                     history_5m
                 ) = future.result()
 
-
                 if (
                     history_15m
                     and len(history_15m)
-                    >= HISTORY_LIMIT
+                    == BREAKOUT_HISTORY_LIMIT
                 ):
 
                     with STATE_LOCK:
@@ -1059,15 +907,9 @@ def load_binance_histories(symbols):
                             symbol
                         ] = history_15m
 
-
                     success_15m += 1
 
-
-                if (
-                    history_5m
-                    and len(history_5m)
-                    >= 21
-                ):
+                if history_5m:
 
                     with STATE_LOCK:
 
@@ -1075,17 +917,14 @@ def load_binance_histories(symbols):
                             symbol
                         ] = history_5m
 
-
                     success_5m += 1
-
 
             except Exception as e:
 
                 print(
-                    "History future error:",
+                    "History worker error:",
                     repr(e)
                 )
-
 
             if loaded % 25 == 0:
 
@@ -1099,8 +938,7 @@ def load_binance_histories(symbols):
                     f"{success_5m}"
                 )
 
-
-    print("=" * 65)
+    print("=" * 60)
 
     print(
         "15M HISTORY READY:",
@@ -1112,7 +950,22 @@ def load_binance_histories(symbols):
         len(BINANCE_5M_HISTORY)
     )
 
-    print("=" * 65)
+    print("=" * 60)
+
+
+# ============================================================
+# 24H TICKER
+# ============================================================
+
+def get_24h(symbol):
+
+    return binance_get(
+        "/api/v3/ticker/24hr",
+        {
+            "symbol": symbol
+        },
+        timeout=10
+    )
 
 
 # ============================================================
@@ -1138,13 +991,9 @@ def update_book(
     ask_qty
 ):
 
-    bid = safe_float(
-        bid
-    )
+    bid = safe_float(bid)
 
-    ask = safe_float(
-        ask
-    )
+    ask = safe_float(ask)
 
     bid_qty = safe_float(
         bid_qty
@@ -1154,27 +1003,21 @@ def update_book(
         ask_qty
     )
 
-
-    if bid <= 0 or ask <= 0:
+    if (
+        bid <= 0
+        or ask <= 0
+    ):
 
         return
-
 
     mid = (
         bid + ask
     ) / 2.0
 
-
-    if mid <= 0:
-
-        return
-
-
     spread = (
         (ask - bid)
         / mid
     ) * 100.0
-
 
     with STATE_LOCK:
 
@@ -1182,23 +1025,17 @@ def update_book(
             symbol
         ] = {
 
-            "bid":
-            bid,
+            "bid": bid,
 
-            "ask":
-            ask,
+            "ask": ask,
 
-            "bid_qty":
-            bid_qty,
+            "bid_qty": bid_qty,
 
-            "ask_qty":
-            ask_qty,
+            "ask_qty": ask_qty,
 
-            "spread":
-            spread,
+            "spread": spread,
 
-            "time":
-            now_ts(),
+            "time": now_ts(),
         }
 
 
@@ -1210,76 +1047,57 @@ def get_book_cached(symbol):
             symbol
         )
 
+        last_rest = (
+            BINANCE_LAST_BOOK_REST.get(
+                symbol,
+                0
+            )
+        )
 
     if (
         book
-        and
-        now_ts()
-        - book["time"]
+        and now_ts() - book["time"]
         <= BOOK_CACHE_MAX_AGE
     ):
 
         return book
 
+    if (
+        now_ts() - last_rest
+        < REST_BOOK_MIN_INTERVAL
+    ):
+
+        return book
 
     try:
 
-        last = BINANCE_LAST_BOOK_REST.get(
-            symbol,
-            0
-        )
-
-
-        if (
-            now_ts()
-            - last
-            >= REST_BOOK_MIN_INTERVAL
-        ):
+        with STATE_LOCK:
 
             BINANCE_LAST_BOOK_REST[
                 symbol
             ] = now_ts()
 
+        data = get_book(
+            symbol
+        )
 
-            data = get_book(
+        update_book(
+            symbol,
+            data.get("bidPrice"),
+            data.get("askPrice"),
+            data.get("bidQty"),
+            data.get("askQty"),
+        )
+
+        with STATE_LOCK:
+
+            return BINANCE_BOOKS.get(
                 symbol
             )
 
-
-            update_book(
-                symbol,
-
-                data.get(
-                    "bidPrice"
-                ),
-
-                data.get(
-                    "askPrice"
-                ),
-
-                data.get(
-                    "bidQty"
-                ),
-
-                data.get(
-                    "askQty"
-                )
-            )
-
-
-            with STATE_LOCK:
-
-                return BINANCE_BOOKS.get(
-                    symbol
-                )
-
-
     except Exception:
 
-        pass
-
-
-    return book
+        return book
 
 
 # ============================================================
@@ -1292,45 +1110,33 @@ def ws_worker(symbols):
 
         return
 
-
     streams = []
-
 
     for symbol in symbols:
 
         s = symbol.lower()
 
-
-        # 5M
         streams.append(
             f"{s}@kline_5m"
         )
 
-
-        # 15M
         streams.append(
             f"{s}@kline_15m"
         )
 
-
-        # Book
         streams.append(
             f"{s}@bookTicker"
         )
 
-
-        # 24H ticker
         streams.append(
             f"{s}@ticker"
         )
 
-
-    stream_url = (
+    url = (
         BINANCE_WS
         + "/stream?streams="
         + "/".join(streams)
     )
-
 
     while not STOP_EVENT.is_set():
 
@@ -1347,71 +1153,55 @@ def ws_worker(symbols):
                         message
                     )
 
-
                     data = obj.get(
                         "data",
                         {}
                     )
 
-
                     event = data.get(
                         "e"
                     )
-
 
                     symbol = data.get(
                         "s"
                     )
 
-
                     if not symbol:
 
                         return
 
-
                     symbol = symbol.upper()
 
-
-                    # ========================================
-                    # BOOK TICKER
-                    # ========================================
+                    # ------------------------------------------------
+                    # BOOK
+                    # ------------------------------------------------
 
                     if event == "bookTicker":
 
                         update_book(
-
                             symbol,
-
                             data.get("b"),
-
                             data.get("a"),
-
                             data.get("B"),
-
-                            data.get("A")
+                            data.get("A"),
                         )
 
-
-                        return
-
-
-                    # ========================================
+                    # ------------------------------------------------
                     # 24H TICKER
-                    # ========================================
+                    # ------------------------------------------------
 
-                    if event == "24hrTicker":
+                    elif event == "24hrTicker":
 
                         with STATE_LOCK:
 
-                            live = (
-                                BINANCE_LIVE.setdefault(
-                                    symbol,
-                                    {}
-                                )
+                            BINANCE_LIVE.setdefault(
+                                symbol,
+                                {}
                             )
 
-
-                            live.update({
+                            BINANCE_LIVE[
+                                symbol
+                            ].update({
 
                                 "price":
                                 safe_float(
@@ -1432,222 +1222,150 @@ def ws_worker(symbols):
                                 now_ts(),
                             })
 
-
-                        return
-
-
-                    # ========================================
+                    # ------------------------------------------------
                     # KLINE
-                    # ========================================
+                    # ------------------------------------------------
 
-                    if event != "kline":
+                    elif event == "kline":
 
-                        return
+                        k = data.get(
+                            "k"
+                        ) or {}
 
-
-                    k = data.get(
-                        "k"
-                    ) or {}
-
-
-                    interval = k.get(
-                        "i"
-                    )
-
-
-                    candle = {
-
-                        "open_time":
-                        int(
-                            k.get(
-                                "t",
-                                0
-                            )
-                        ),
-
-                        "open":
-                        safe_float(
-                            k.get("o")
-                        ),
-
-                        "high":
-                        safe_float(
-                            k.get("h")
-                        ),
-
-                        "low":
-                        safe_float(
-                            k.get("l")
-                        ),
-
-                        "close":
-                        safe_float(
-                            k.get("c")
-                        ),
-
-                        "volume":
-                        safe_float(
-                            k.get("v")
-                        ),
-
-                        "quote_volume":
-                        safe_float(
-                            k.get("q")
-                        ),
-
-                        "taker_buy_quote":
-                        safe_float(
-                            k.get("Q")
-                        ),
-
-                        "closed":
-                        bool(
-                            k.get("x")
-                        ),
-
-                        "close_time":
-                        int(
-                            k.get(
-                                "T",
-                                0
-                            )
-                        ),
-                    }
-
-
-                    with STATE_LOCK:
-
-                        live = (
-                            BINANCE_LIVE.setdefault(
-                                symbol,
-                                {}
-                            )
+                        interval = k.get(
+                            "i"
                         )
 
+                        candle = {
 
-                        # ------------------------------------
-                        # Current live candle
-                        # ------------------------------------
-
-                        if interval == "5m":
-
-                            live[
-                                "5m_candle"
-                            ] = candle
-
-
-                        elif interval == "15m":
-
-                            live[
-                                "15m_candle"
-                            ] = candle
-
-
-                        # ------------------------------------
-                        # CLOSED 5M
-                        # ------------------------------------
-
-                        if (
-                            interval == "5m"
-                            and
-                            candle["closed"]
-                        ):
-
-                            history = (
-                                BINANCE_5M_HISTORY.get(
-                                    symbol
+                            "open_time":
+                            int(
+                                k.get(
+                                    "t",
+                                    0
                                 )
-                            )
+                            ),
 
+                            "open":
+                            safe_float(
+                                k.get("o")
+                            ),
 
-                            if history is None:
+                            "high":
+                            safe_float(
+                                k.get("h")
+                            ),
 
-                                history = deque(
-                                    maxlen=
-                                    MOMENTUM_HISTORY_LIMIT
+                            "low":
+                            safe_float(
+                                k.get("l")
+                            ),
+
+                            "close":
+                            safe_float(
+                                k.get("c")
+                            ),
+
+                            "volume":
+                            safe_float(
+                                k.get("v")
+                            ),
+
+                            "close_time":
+                            int(
+                                k.get(
+                                    "T",
+                                    0
                                 )
+                            ),
 
+                            "quote_volume":
+                            safe_float(
+                                k.get("q")
+                            ),
 
-                                BINANCE_5M_HISTORY[
-                                    symbol
-                                ] = history
+                            "taker_buy_quote":
+                            safe_float(
+                                k.get("Q")
+                            ),
 
+                            "closed":
+                            bool(
+                                k.get("x")
+                            ),
+                        }
 
-                            if (
-                                not history
-                                or
-                                history[-1][
-                                    "open_time"
-                                ]
-                                !=
-                                candle[
-                                    "open_time"
-                                ]
-                            ):
+                        # ------------------------------------------------
+                        # ONLY CLOSED CANDLES
+                        # ------------------------------------------------
 
-                                history.append(
-                                    candle
-                                )
+                        if not candle[
+                            "closed"
+                        ]:
 
+                            return
 
-                            live.pop(
-                                "5m_candle",
-                                None
-                            )
+                        with STATE_LOCK:
 
+                            if interval == "5m":
 
-                        # ------------------------------------
-                        # CLOSED 15M
-                        # ------------------------------------
-
-                        if (
-                            interval == "15m"
-                            and
-                            candle["closed"]
-                        ):
-
-                            history = (
-                                BINANCE_15M_HISTORY.get(
-                                    symbol
-                                )
-                            )
-
-
-                            if history is None:
-
-                                history = deque(
-                                    maxlen=
-                                    BREAKOUT_HISTORY_MAX
+                                history = (
+                                    BINANCE_5M_HISTORY.setdefault(
+                                        symbol,
+                                        deque(
+                                            maxlen=
+                                            MOMENTUM_HISTORY_LIMIT
+                                        )
+                                    )
                                 )
 
+                                if (
+                                    not history
+                                    or history[-1][
+                                        "open_time"
+                                    ]
+                                    != candle[
+                                        "open_time"
+                                    ]
+                                ):
 
-                                BINANCE_15M_HISTORY[
-                                    symbol
-                                ] = history
+                                    history.append(
+                                        candle
+                                    )
 
+                                else:
 
-                            if (
-                                not history
-                                or
-                                history[-1][
-                                    "open_time"
-                                ]
-                                !=
-                                candle[
-                                    "open_time"
-                                ]
-                            ):
+                                    history[-1] = candle
 
-                                history.append(
-                                    candle
+                            elif interval == "15m":
+
+                                history = (
+                                    BINANCE_15M_HISTORY.setdefault(
+                                        symbol,
+                                        deque(
+                                            maxlen=
+                                            BREAKOUT_HISTORY_LIMIT
+                                        )
+                                    )
                                 )
 
+                                if (
+                                    not history
+                                    or history[-1][
+                                        "open_time"
+                                    ]
+                                    != candle[
+                                        "open_time"
+                                    ]
+                                ):
 
-                            live.pop(
-                                "15m_candle",
-                                None
-                            )
+                                    history.append(
+                                        candle
+                                    )
 
+                                else:
+
+                                    history[-1] = candle
 
                 except Exception as e:
 
@@ -1655,7 +1373,6 @@ def ws_worker(symbols):
                         "WS message error:",
                         repr(e)
                     )
-
 
             def on_error(
                 ws,
@@ -1667,35 +1384,30 @@ def ws_worker(symbols):
                     error
                 )
 
-
             def on_close(
                 ws,
                 code,
-                message
+                msg
             ):
 
                 print(
                     "Binance WS closed:",
                     code,
-                    message
+                    msg
                 )
 
+            ws = websocket.WebSocketApp(
 
-            websocket_app = (
-                websocket.WebSocketApp(
+                url,
 
-                    stream_url,
+                on_message=on_message,
 
-                    on_message=on_message,
+                on_error=on_error,
 
-                    on_error=on_error,
-
-                    on_close=on_close
-                )
+                on_close=on_close,
             )
 
-
-            websocket_app.run_forever(
+            ws.run_forever(
 
                 ping_interval=20,
 
@@ -1704,14 +1416,12 @@ def ws_worker(symbols):
                 origin="https://www.binance.com"
             )
 
-
         except Exception as e:
 
             print(
-                "Binance WS worker error:",
+                "WS worker error:",
                 repr(e)
             )
-
 
         if not STOP_EVENT.is_set():
 
@@ -1726,46 +1436,26 @@ def ws_worker(symbols):
 
 def volume_ratio(
     history,
-    candle,
-    periods=20
+    candle
 ):
 
-    if not history or not candle:
+    if not history:
 
         return 0.0
-
 
     data = list(
         history
     )
 
-
-    # IMPORTANT:
-    # Average uses candles BEFORE current candle.
-    #
-    # If history already contains current candle,
-    # remove it first.
-
-    if (
-        data
-        and
-        data[-1]["open_time"]
-        ==
-        candle["open_time"]
+    if len(data) < (
+        AVERAGE_VOLUME_CANDLES
     ):
-
-        data = data[:-1]
-
-
-    if len(data) < periods:
 
         return 0.0
 
-
     previous = data[
-        -periods:
+        -AVERAGE_VOLUME_CANDLES:
     ]
-
 
     values = [
 
@@ -1774,30 +1464,25 @@ def volume_ratio(
         for c in previous
 
         if c["quote_volume"] > 0
-    ]
 
+    ]
 
     if not values:
 
         return 0.0
 
-
     average = (
         sum(values)
-        /
-        len(values)
+        / len(values)
     )
-
 
     if average <= 0:
 
         return 0.0
 
-
     return (
         candle["quote_volume"]
-        /
-        average
+        / average
     )
 
 
@@ -1813,14 +1498,12 @@ def buy_pressure_estimate(
 
         return 0.0
 
-
     total = safe_float(
         candle.get(
             "quote_volume",
             0
         )
     )
-
 
     buy = safe_float(
         candle.get(
@@ -1829,121 +1512,73 @@ def buy_pressure_estimate(
         )
     )
 
-
     if (
         total > 0
-        and
-        buy > 0
+        and buy > 0
     ):
 
         return (
-            buy
-            /
-            total
+            buy / total
         ) * 100.0
 
+    # Fallback based on candle position
 
-    # Fallback
     candle_range = (
         candle["high"]
-        -
-        candle["low"]
+        - candle["low"]
     )
-
 
     if candle_range <= 0:
 
         return 50.0
 
-
     return (
         (
             candle["close"]
-            -
-            candle["low"]
+            - candle["low"]
         )
-        /
-        candle_range
+        / candle_range
     ) * 100.0
 
 
 # ============================================================
-# 5M MOMENTUM
-# ============================================================
-
-def momentum_5m(
-    candle
-):
-
-    if not candle:
-
-        return 0.0
-
-
-    return pct_change(
-        candle["open"],
-        candle["close"]
-    )
-
-
-# ============================================================
-# 600 x 15M RESISTANCE
+# RESISTANCE
 # ============================================================
 
 def find_resistance(
-    history,
-    current
+    history
 ):
 
-    if not history or not current:
+    if not history:
 
         return None
-
 
     data = list(
         history
     )
 
-
-    # IMPORTANT:
-    #
-    # Current breakout candle MUST NOT
-    # be part of resistance.
-    #
-    # We need exactly the previous
-    # 600 CLOSED 15M candles.
-
-    if (
-        data
-        and
-        data[-1]["open_time"]
-        ==
-        current["open_time"]
+    if len(data) < (
+        BREAKOUT_HISTORY_LIMIT
     ):
-
-        previous = data[:-1]
-
-    else:
-
-        previous = data
-
-
-    if len(previous) < RESISTANCE_LOOKBACK:
 
         return None
 
+    # IMPORTANT:
+    #
+    # The CURRENT breakout candle is NOT
+    # part of resistance.
+    #
+    # We use the 600 candles BEFORE it.
 
-    previous = previous[
-        -RESISTANCE_LOOKBACK:
+    previous = data[
+        -BREAKOUT_HISTORY_LIMIT:
     ]
-
 
     highest = max(
         previous,
         key=lambda c:
         c["high"]
     )
-
 
     return {
 
@@ -1955,15 +1590,10 @@ def find_resistance(
 
         "age":
         len(previous)
-        -
-        1
-        -
-        previous.index(
+        - 1
+        - previous.index(
             highest
         ),
-
-        "candles":
-        len(previous),
     }
 
 
@@ -1971,83 +1601,88 @@ def find_resistance(
 # BREAKOUT DATA
 # ============================================================
 
-def breakout_data(
-    history,
-    current,
-    resistance
+def calculate_breakout(
+    previous_history,
+    current
 ):
 
     if (
-        not history
+        not previous_history
         or not current
-        or not resistance
     ):
 
         return None
 
+    if len(previous_history) < (
+        BREAKOUT_HISTORY_LIMIT
+    ):
+
+        return None
+
+    # --------------------------------------------------------
+    # Resistance from previous 600 candles
+    # --------------------------------------------------------
+
+    resistance = max(
+        previous_history,
+        key=lambda c:
+        c["high"]
+    )
 
     level = resistance[
-        "level"
+        "high"
     ]
 
-
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Breakout %
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     breakout_pct = pct_change(
         level,
         current["close"]
     )
 
-
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Volume
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     vr = volume_ratio(
-        history,
-        current,
-        20
+        previous_history,
+        current
     )
 
-
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Candle range
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     candle_range = (
         current["high"]
-        -
-        current["low"]
+        - current["low"]
     )
 
+    # --------------------------------------------------------
+    # Close position
+    # --------------------------------------------------------
 
     if candle_range > 0:
 
         close_position = (
-
             (
                 current["close"]
-                -
-                current["low"]
+                - current["low"]
             )
-            /
-            candle_range
-
+            / candle_range
         ) * 100.0
 
     else:
 
         close_position = 0.0
 
-
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Upper wick
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     upper_wick = (
-
         current["high"]
         -
         max(
@@ -2056,53 +1691,52 @@ def breakout_data(
         )
     )
 
-
     if candle_range > 0:
 
         upper_wick_pct = (
-
             upper_wick
-            /
-            candle_range
-
+            / candle_range
         ) * 100.0
 
     else:
 
         upper_wick_pct = 100.0
 
-
-    # ----------------------------------------
-    # Hard validation
-    # ----------------------------------------
-
     valid = (
 
         breakout_pct
-        >=
-        MIN_BREAKOUT_PERCENT
+        >= MIN_BREAKOUT_PERCENT
 
         and
 
         vr
-        >=
-        MIN_BREAKOUT_VOLUME_RATIO
+        >= MIN_BREAKOUT_VOLUME_RATIO
 
         and
 
         close_position
-        >=
-        MIN_CLOSE_POSITION
+        >= MIN_CLOSE_POSITION
 
         and
 
         upper_wick_pct
-        <=
-        MAX_UPPER_WICK_PERCENT
+        <= MAX_UPPER_WICK_PERCENT
     )
 
-
     return {
+
+        "resistance":
+        level,
+
+        "resistance_time":
+        resistance["open_time"],
+
+        "resistance_age":
+        len(previous_history)
+        - 1
+        - previous_history.index(
+            resistance
+        ),
 
         "breakout_pct":
         breakout_pct,
@@ -2129,22 +1763,103 @@ def level_stop(
     resistance
 ):
 
-    return (
-
-        resistance
-        *
-        (
-            1.0
-            -
-            STOP_BELOW_RESISTANCE_PERCENT
-            /
-            100.0
-        )
+    return resistance * (
+        1.0
+        -
+        STOP_BELOW_RESISTANCE_PERCENT
+        / 100.0
     )
 
 
 # ============================================================
-# ANALYZE BINANCE
+# SCORE
+# ============================================================
+
+def calculate_score(
+    momentum,
+    momentum_vr,
+    buy_pressure,
+    breakout_pct,
+    breakout_vr,
+    close_position,
+    spread
+):
+
+    score = 0
+
+    # --------------------------------------------------------
+    # 5M momentum
+    # --------------------------------------------------------
+
+    if momentum >= 1.0:
+
+        score += 15
+
+    if momentum >= 2.0:
+
+        score += 10
+
+    if momentum >= 3.0:
+
+        score += 10
+
+    # --------------------------------------------------------
+    # 5M volume
+    # --------------------------------------------------------
+
+    if momentum_vr >= 1.2:
+
+        score += 10
+
+    if momentum_vr >= 1.5:
+
+        score += 10
+
+    # --------------------------------------------------------
+    # Buy pressure
+    # --------------------------------------------------------
+
+    if buy_pressure >= 55:
+
+        score += 10
+
+    if buy_pressure >= 70:
+
+        score += 5
+
+    # --------------------------------------------------------
+    # Breakout
+    # --------------------------------------------------------
+
+    if breakout_pct >= 1.0:
+
+        score += 10
+
+    if breakout_vr >= 1.5:
+
+        score += 10
+
+    # --------------------------------------------------------
+    # Candle
+    # --------------------------------------------------------
+
+    if close_position >= 70:
+
+        score += 5
+
+    # --------------------------------------------------------
+    # Spread
+    # --------------------------------------------------------
+
+    if spread <= 0.10:
+
+        score += 5
+
+    return score
+
+
+# ============================================================
+# BINANCE ANALYSIS
 # ============================================================
 
 def analyze_binance(
@@ -2154,9 +1869,9 @@ def analyze_binance(
 
     try:
 
-        # ================================================
-        # LOAD STATE
-        # ================================================
+        # ----------------------------------------------------
+        # GET HISTORIES
+        # ----------------------------------------------------
 
         with STATE_LOCK:
 
@@ -2166,13 +1881,11 @@ def analyze_binance(
                 )
             )
 
-
             history_5m = (
                 BINANCE_5M_HISTORY.get(
                     symbol
                 )
             )
-
 
             live = dict(
                 BINANCE_LIVE.get(
@@ -2181,34 +1894,23 @@ def analyze_binance(
                 )
             )
 
-
         if (
             not history_15m
-            or
-            len(history_15m)
-            <
-            RESISTANCE_LOOKBACK
+            or len(history_15m)
+            < BREAKOUT_HISTORY_LIMIT
         ):
 
             return None
 
-
-        if (
-            not history_5m
-            or
-            len(history_5m)
-            < 21
-        ):
+        if not history_5m:
 
             return None
-
 
         status["history"] += 1
 
-
-        # ================================================
+        # ----------------------------------------------------
         # 24H VOLUME
-        # ================================================
+        # ----------------------------------------------------
 
         qvol = safe_float(
             live.get(
@@ -2216,23 +1918,13 @@ def analyze_binance(
             )
         )
 
-
         if qvol <= 0:
 
             try:
 
-                ticker = binance_get(
-
-                    "/api/v3/ticker/24hr",
-
-                    {
-                        "symbol":
-                        symbol
-                    },
-
-                    timeout=10
+                ticker = get_24h(
+                    symbol
                 )
-
 
                 qvol = safe_float(
                     ticker.get(
@@ -2240,109 +1932,67 @@ def analyze_binance(
                     )
                 )
 
-
             except Exception:
 
                 return None
 
-
-        if (
-            qvol
-            <
+        if qvol < (
             MIN_24H_QUOTE_VOLUME
         ):
 
             return None
 
-
         status["24h"] += 1
 
+        # ----------------------------------------------------
+        # CURRENT CLOSED 5M
+        # ----------------------------------------------------
 
-        # ================================================
-        # CURRENT CLOSED 5M CANDLE
-        # ================================================
-
-        candle_5m = None
-
-
-        live_5m = live.get(
-            "5m_candle"
-        )
-
-
-        # We only use CLOSED 5M.
-        if (
-            live_5m
-            and
-            live_5m.get(
-                "closed"
-            )
-        ):
-
-            candle_5m = live_5m
-
-        else:
-
-            candle_5m = list(
-                history_5m
-            )[-1]
-
+        candle_5m = list(
+            history_5m
+        )[-1]
 
         if not candle_5m:
 
             return None
 
-
-        # ================================================
+        # ----------------------------------------------------
         # 5M MOMENTUM
-        # ================================================
+        # ----------------------------------------------------
 
-        momentum = momentum_5m(
-            candle_5m
+        momentum = pct_change(
+            candle_5m["open"],
+            candle_5m["close"]
         )
 
-
-        if (
-            momentum
-            <
+        if momentum < (
             MIN_PRICE_CHANGE
         ):
 
             return None
 
-
         status["momentum"] += 1
 
-
-        # ================================================
+        # ----------------------------------------------------
         # 5M VOLUME
-        # ================================================
+        # ----------------------------------------------------
 
         momentum_vr = volume_ratio(
-
             history_5m,
-
-            candle_5m,
-
-            AVERAGE_VOLUME_CANDLES
+            candle_5m
         )
 
-
-        if (
-            momentum_vr
-            <
-            VOLUME_MIN_RATIO
+        if momentum_vr < (
+            MIN_MOMENTUM_VOLUME_RATIO
         ):
 
             return None
 
-
         status["volume"] += 1
 
-
-        # ================================================
+        # ----------------------------------------------------
         # BUY PRESSURE
-        # ================================================
+        # ----------------------------------------------------
 
         buy_pressure = (
             buy_pressure_estimate(
@@ -2350,32 +2000,25 @@ def analyze_binance(
             )
         )
 
-
-        if (
-            buy_pressure
-            <
+        if buy_pressure < (
             MIN_BUY_PRESSURE
         ):
 
             return None
 
-
         status["buy"] += 1
 
-
-        # ================================================
-        # SPREAD
-        # ================================================
+        # ----------------------------------------------------
+        # BOOK / SPREAD
+        # ----------------------------------------------------
 
         book = get_book_cached(
             symbol
         )
 
-
         if not book:
 
             return None
-
 
         spread = safe_float(
             book.get(
@@ -2384,258 +2027,215 @@ def analyze_binance(
             )
         )
 
-
-        if (
-            spread
-            >
+        if spread > (
             MAX_SPREAD_PERCENT
         ):
 
             return None
 
-
         status["spread"] += 1
 
+        # ----------------------------------------------------
+        # CURRENT CLOSED 15M
+        #
+        # IMPORTANT:
+        # We use the last CLOSED candle as current.
+        # Resistance is calculated from the 600 candles
+        # BEFORE it.
+        # ----------------------------------------------------
 
-        # ================================================
-        # CURRENT CLOSED 15M CANDLE
-        # ================================================
-
-        candle_15m = None
-
-
-        live_15m = live.get(
-            "15m_candle"
+        data_15m = list(
+            history_15m
         )
 
-
-        if (
-            live_15m
-            and
-            live_15m.get(
-                "closed"
-            )
+        if len(data_15m) < (
+            BREAKOUT_HISTORY_LIMIT
         ):
 
-            candle_15m = live_15m
+            return None
+
+        current_15m = data_15m[-1]
+
+        previous_600 = data_15m[
+            -BREAKOUT_HISTORY_LIMIT:
+        ]
+
+        # If current is already inside the stored
+        # 600-candle history, we need the candles
+        # BEFORE current.
+        #
+        # Therefore we require 601 candles internally
+        # when evaluating a freshly closed candle.
+
+        if (
+            len(data_15m)
+            >= BREAKOUT_HISTORY_LIMIT + 1
+        ):
+
+            previous_600 = data_15m[
+                -(BREAKOUT_HISTORY_LIMIT + 1):-1
+            ]
 
         else:
 
-            candle_15m = list(
-                history_15m
-            )[-1]
+            # Startup history contains exactly 600.
+            # Fetch one older/current separation
+            # is not available here.
+            #
+            # We therefore use the previous 599
+            # plus the candle before the current
+            # only when available.
+            if len(data_15m) < 2:
 
+                return None
 
-        if not candle_15m:
+            previous_600 = data_15m[:-1]
 
-            return None
+            if len(previous_600) < (
+                BREAKOUT_HISTORY_LIMIT
+            ):
 
+                return None
 
-        # ================================================
-        # RESISTANCE
-        #
-        # Previous 600 CLOSED 15M candles.
-        # Current candle excluded.
-        # ================================================
+        # ----------------------------------------------------
+        # Avoid duplicate processing
+        # ----------------------------------------------------
 
-        resistance = find_resistance(
-
-            history_15m,
-
-            candle_15m
+        current_open_time = (
+            current_15m["open_time"]
         )
 
+        with STATE_LOCK:
 
-        if not resistance:
+            last_processed = (
+                BINANCE_LAST_BREAKOUT_CANDLE.get(
+                    symbol
+                )
+            )
+
+        if (
+            last_processed
+            == current_open_time
+        ):
 
             return None
 
-
-        status["resistance"] += 1
-
-
-        # ================================================
+        # ----------------------------------------------------
         # BREAKOUT
-        # ================================================
+        # ----------------------------------------------------
 
-        br = breakout_data(
-
-            history_15m,
-
-            candle_15m,
-
-            resistance
+        br = calculate_breakout(
+            previous_600,
+            current_15m
         )
-
 
         if not br:
 
             return None
 
+        status["resistance"] += 1
 
-        # ================================================
-        # HARD +1% BREAKOUT
-        # ================================================
+        # ----------------------------------------------------
+        # HARD BREAKOUT
+        # ----------------------------------------------------
 
-        if (
-            br["breakout_pct"]
-            <
+        if br["breakout_pct"] < (
             MIN_BREAKOUT_PERCENT
         ):
 
-            return None
+            with STATE_LOCK:
 
+                BINANCE_LAST_BREAKOUT_CANDLE[
+                    symbol
+                ] = current_open_time
+
+            return None
 
         status["breakout"] += 1
 
-
-        # ================================================
+        # ----------------------------------------------------
         # BREAKOUT VOLUME
-        # ================================================
+        # ----------------------------------------------------
 
-        if (
-            br["volume_ratio"]
-            <
+        if br["volume_ratio"] < (
             MIN_BREAKOUT_VOLUME_RATIO
         ):
 
-            return None
+            with STATE_LOCK:
 
+                BINANCE_LAST_BREAKOUT_CANDLE[
+                    symbol
+                ] = current_open_time
+
+            return None
 
         status[
             "breakout_volume"
         ] += 1
 
-
-        # ================================================
+        # ----------------------------------------------------
         # CANDLE QUALITY
-        # ================================================
+        # ----------------------------------------------------
 
-        if (
-            br["close_position"]
-            <
+        if br["close_position"] < (
             MIN_CLOSE_POSITION
         ):
 
+            with STATE_LOCK:
+
+                BINANCE_LAST_BREAKOUT_CANDLE[
+                    symbol
+                ] = current_open_time
+
             return None
 
-
-        if (
-            br["upper_wick_pct"]
-            >
+        if br["upper_wick_pct"] > (
             MAX_UPPER_WICK_PERCENT
         ):
 
-            return None
+            with STATE_LOCK:
 
+                BINANCE_LAST_BREAKOUT_CANDLE[
+                    symbol
+                ] = current_open_time
+
+            return None
 
         status["candle"] += 1
 
-
-        # ================================================
+        # ----------------------------------------------------
         # SCORE
-        # ================================================
+        # ----------------------------------------------------
 
-        score = 0
+        score = calculate_score(
+            momentum,
+            momentum_vr,
+            buy_pressure,
+            br["breakout_pct"],
+            br["volume_ratio"],
+            br["close_position"],
+            spread
+        )
 
+        if score < (
+            MIN_SIGNAL_SCORE
+        ):
 
-        # --------------------------------
-        # 5M MOMENTUM
-        # --------------------------------
+            with STATE_LOCK:
 
-        if momentum >= 1.0:
-
-            score += 15
-
-
-        if momentum >= 2.0:
-
-            score += 10
-
-
-        if momentum >= 3.0:
-
-            score += 10
-
-
-        # --------------------------------
-        # 5M VOLUME
-        # --------------------------------
-
-        if momentum_vr >= 1.2:
-
-            score += 10
-
-
-        if momentum_vr >= 1.5:
-
-            score += 10
-
-
-        # --------------------------------
-        # BUY PRESSURE
-        # --------------------------------
-
-        if buy_pressure >= 55:
-
-            score += 10
-
-
-        if buy_pressure >= 70:
-
-            score += 5
-
-
-        # --------------------------------
-        # 15M BREAKOUT
-        # --------------------------------
-
-        if br["breakout_pct"] >= 1.0:
-
-            score += 10
-
-
-        if br["volume_ratio"] >= 1.5:
-
-            score += 10
-
-
-        # --------------------------------
-        # CANDLE
-        # --------------------------------
-
-        if br["close_position"] >= 70:
-
-            score += 5
-
-
-        # --------------------------------
-        # SPREAD
-        # --------------------------------
-
-        if spread <= 0.10:
-
-            score += 5
-
-
-        # ================================================
-        # MIN SCORE
-        # ================================================
-
-        if score < MIN_SIGNAL_SCORE:
+                BINANCE_LAST_BREAKOUT_CANDLE[
+                    symbol
+                ] = current_open_time
 
             return None
 
-
         status["score"] += 1
 
-
-        # ================================================
+        # ----------------------------------------------------
         # COOLDOWN
-        # ================================================
+        # ----------------------------------------------------
 
-        now = now_ts()
-
+        current_time = now_ts()
 
         with STATE_LOCK:
 
@@ -2646,73 +2246,63 @@ def analyze_binance(
                 )
             )
 
-
         if (
-            now
-            -
-            last_signal
-            <
-            SIGNAL_COOLDOWN_SECONDS
+            current_time
+            - last_signal
+            < SIGNAL_COOLDOWN_SECONDS
         ):
+
+            with STATE_LOCK:
+
+                BINANCE_LAST_BREAKOUT_CANDLE[
+                    symbol
+                ] = current_open_time
 
             return None
 
-
-        # ================================================
-        # PRICE / LEVELS
-        # ================================================
-
-        price = candle_15m[
-            "close"
-        ]
-
-
-        resistance_level = (
-            resistance[
-                "level"
-            ]
-        )
-
-
-        stop = level_stop(
-            resistance_level
-        )
-
-
-        # ================================================
-        # STRENGTH
-        # ================================================
-
-        if score >= STRONG_SIGNAL_SCORE:
-
-            strength = "🚀 STRONG BUY"
-
-        else:
-
-            strength = "🔥 BUY"
-
-
-        # ================================================
-        # SAVE COOLDOWN
-        # ================================================
+        # ----------------------------------------------------
+        # SAVE SIGNAL TIME
+        # ----------------------------------------------------
 
         with STATE_LOCK:
 
             BINANCE_LAST_SIGNAL[
                 symbol
-            ] = now
+            ] = current_time
 
+            BINANCE_LAST_BREAKOUT_CANDLE[
+                symbol
+            ] = current_open_time
 
-        # ================================================
+        # ----------------------------------------------------
         # ALERT
-        # ================================================
+        # ----------------------------------------------------
 
-        return (
+        price = current_15m[
+            "close"
+        ]
+
+        resistance = br[
+            "resistance"
+        ]
+
+        stop = level_stop(
+            resistance
+        )
+
+        strength = (
+            "🚀 STRONG BUY"
+            if score >= STRONG_SIGNAL_SCORE
+            else
+            "🔥 BUY"
+        )
+
+        message = (
 
             f"{strength}\n"
 
             f"🟡 <b>BINANCE SPOT "
-            f"5M + 15M REAL BREAKOUT</b>\n\n"
+            f"15M REAL BREAKOUT</b>\n\n"
 
             f"🪙 <b>{symbol}</b>\n"
 
@@ -2728,13 +2318,10 @@ def analyze_binance(
             f"🟢 Buy pressure: "
             f"{buy_pressure:.1f}%\n\n"
 
-            f"🏔 <b>600 × 15M "
-            f"Resistance</b>\n"
+            f"🏔 600 × 15M Resistance: "
+            f"{resistance:g}\n"
 
-            f"Resistance: "
-            f"{resistance_level:g}\n"
-
-            f"🚀 Breakout: "
+            f"🚀 15M Breakout: "
             f"{br['breakout_pct']:+.2f}%\n"
 
             f"📊 Breakout volume: "
@@ -2763,13 +2350,24 @@ def analyze_binance(
 
             f"🕐 Cooldown: 24H\n"
 
-            f"⏰ Signal: "
+            f"🕐 Signal time: "
             f"{utc_text()}\n\n"
 
             f"⚠️ ALERT ONLY\n"
-
             f"NO AUTOMATIC ORDER"
         )
+
+        return message
+
+    except Exception as e:
+
+        print(
+            f"Analysis error "
+            f"{symbol}:",
+            repr(e)
+        )
+
+        return None
 
 
 # ============================================================
@@ -2777,6 +2375,8 @@ def analyze_binance(
 # ============================================================
 
 def binance_scan_loop():
+
+    last_status_time = 0
 
     while not STOP_EVENT.is_set():
 
@@ -2787,7 +2387,6 @@ def binance_scan_loop():
                 symbols = list(
                     BINANCE_SYMBOLS
                 )
-
 
             status = {
 
@@ -2814,11 +2413,9 @@ def binance_scan_loop():
                 "score": 0,
             }
 
-
             checked = 0
 
             signals = 0
-
 
             with ThreadPoolExecutor(
                 max_workers=BINANCE_MAX_WORKERS
@@ -2836,18 +2433,15 @@ def binance_scan_loop():
                     for symbol in symbols
                 }
 
-
                 for future in as_completed(
                     futures
                 ):
 
                     checked += 1
 
-
                     try:
 
                         result = future.result()
-
 
                         if result:
 
@@ -2857,72 +2451,80 @@ def binance_scan_loop():
                                 result
                             )
 
-
                     except Exception as e:
 
                         print(
-                            "Analysis error:",
+                            "Future analysis error:",
                             repr(e)
                         )
 
+            current_time = now_ts()
 
-            print(
+            if (
+                current_time
+                - last_status_time
+                >= STATUS_INTERVAL
+            ):
 
-                "BINANCE STATUS | "
+                last_status_time = (
+                    current_time
+                )
 
-                f"Symbols: "
-                f"{len(symbols)} | "
+                print(
 
-                f"Checked: "
-                f"{checked} | "
+                    "BINANCE STATUS | "
 
-                f"15M History: "
-                f"{status['history']} | "
+                    f"Symbols: "
+                    f"{len(symbols)} | "
 
-                f"24H Volume: "
-                f"{status['24h']} | "
+                    f"Checked: "
+                    f"{checked} | "
 
-                f"5M Momentum: "
-                f"{status['momentum']} | "
+                    f"15M History: "
+                    f"{status['history']} | "
 
-                f"5M Volume: "
-                f"{status['volume']} | "
+                    f"24H: "
+                    f"{status['24h']} | "
 
-                f"Buy Pressure: "
-                f"{status['buy']} | "
+                    f"5M Momentum: "
+                    f"{status['momentum']} | "
 
-                f"Spread: "
-                f"{status['spread']} | "
+                    f"5M Volume: "
+                    f"{status['volume']} | "
 
-                f"600x15M Resistance: "
-                f"{status['resistance']} | "
+                    f"Buy Pressure: "
+                    f"{status['buy']} | "
 
-                f"Breakout +1%: "
-                f"{status['breakout']} | "
+                    f"Spread: "
+                    f"{status['spread']} | "
 
-                f"Breakout Volume: "
-                f"{status['breakout_volume']} | "
+                    f"Resistance: "
+                    f"{status['resistance']} | "
 
-                f"Candle: "
-                f"{status['candle']} | "
+                    f"Breakout +1%: "
+                    f"{status['breakout']} | "
 
-                f"Score: "
-                f"{status['score']} | "
+                    f"Breakout Volume: "
+                    f"{status['breakout_volume']} | "
 
-                f"Signals: "
-                f"{signals}"
-            )
+                    f"Candle: "
+                    f"{status['candle']} | "
 
+                    f"Score: "
+                    f"{status['score']} | "
+
+                    f"Signals: "
+                    f"{signals}"
+                )
 
         except Exception as e:
 
             print(
-                "Binance scan error:",
+                "Binance scan loop error:",
                 repr(e)
             )
 
-
-        time.sleep(
+        STOP_EVENT.wait(
             SCAN_INTERVAL
         )
 
@@ -2944,21 +2546,37 @@ def print_config():
     print()
 
     print(
-        "MOMENTUM TIMEFRAME:"
+        "TIMEFRAME:"
     )
 
     print(
-        "  5M CLOSED CANDLE"
+        "  Momentum = 5M"
+    )
+
+    print(
+        "  Breakout = 15M"
     )
 
     print()
 
     print(
-        "BREAKOUT TIMEFRAME:"
+        "15M HISTORY:"
     )
 
     print(
-        "  15M CLOSED CANDLE"
+        "  EXACTLY 600 CLOSED candles"
+    )
+
+    print(
+        "  REST = 500 + 100"
+    )
+
+    print(
+        "  600 x 15M = 150 hours"
+    )
+
+    print(
+        "  = 6 days 6 hours"
     )
 
     print()
@@ -2968,12 +2586,8 @@ def print_config():
     )
 
     print(
-        "  EXACTLY 600 PREVIOUS "
-        "CLOSED 15M CANDLES"
-    )
-
-    print(
-        "  REST = 500 + 100"
+        "  Highest HIGH of previous "
+        "600 CLOSED 15M candles"
     )
 
     print()
@@ -2987,7 +2601,7 @@ def print_config():
     )
 
     print(
-        "  Breakout volume >= 1.5x"
+        "  Volume >= 1.5x"
     )
 
     print(
@@ -3008,14 +2622,8 @@ def print_config():
         "  >= +1.00%"
     )
 
-    print()
-
     print(
-        "5M VOLUME:"
-    )
-
-    print(
-        "  >= 1.20x previous 20 candles"
+        "  Volume >= 1.2x"
     )
 
     print()
@@ -3069,7 +2677,7 @@ def print_config():
     )
 
     print(
-        "  24 HOURS / SYMBOL"
+        "  24H per symbol"
     )
 
     print()
@@ -3079,7 +2687,7 @@ def print_config():
     )
 
     print(
-        "  ❌ Solana Meme Scanner"
+        "  ❌ Solana"
     )
 
     print(
@@ -3107,33 +2715,26 @@ def main():
 
     print_config()
 
-
     # --------------------------------------------------------
     # Telegram worker
     # --------------------------------------------------------
 
     threading.Thread(
-
         target=telegram_worker,
-
         daemon=True
-
     ).start()
 
-
     # --------------------------------------------------------
-    # Telegram startup test
+    # Telegram test
     # --------------------------------------------------------
 
     telegram_startup_test()
 
-
     # --------------------------------------------------------
-    # Binance Spot symbols
+    # Load Binance symbols
     # --------------------------------------------------------
 
     symbols = load_binance_symbols()
-
 
     if not symbols:
 
@@ -3143,18 +2744,24 @@ def main():
 
         return
 
-
     # --------------------------------------------------------
-    # Load 15M + 5M history
+    # Load history
     # --------------------------------------------------------
 
     load_binance_histories(
         symbols
     )
 
+    if not BINANCE_15M_HISTORY:
+
+        print(
+            "ERROR: No 15M histories loaded."
+        )
+
+        return
 
     # --------------------------------------------------------
-    # Start WebSocket workers
+    # Start WebSockets
     # --------------------------------------------------------
 
     for i in range(
@@ -3168,35 +2775,24 @@ def main():
             i + WS_CHUNK_SIZE
         ]
 
-
         threading.Thread(
-
             target=ws_worker,
-
             args=(chunk,),
-
             daemon=True
-
         ).start()
-
 
         time.sleep(
             0.5
         )
-
 
     # --------------------------------------------------------
     # Scanner
     # --------------------------------------------------------
 
     threading.Thread(
-
         target=binance_scan_loop,
-
         daemon=True
-
     ).start()
-
 
     print()
 
@@ -3205,33 +2801,32 @@ def main():
     )
 
     print(
-        "🟢 SOLANA: REMOVED"
+        "🟢 5M MOMENTUM ACTIVE"
     )
 
     print(
-        "🟢 BINANCE SQUARE: REMOVED"
+        "🟢 600 x 15M CLOSED BREAKOUT ACTIVE"
     )
 
     print(
-        "🟢 5M MOMENTUM: ACTIVE"
+        "🟢 BREAKOUT = +1%"
     )
 
     print(
-        "🟢 15M RESISTANCE: 600 CLOSED CANDLES"
+        "🟢 SOLANA = REMOVED"
     )
 
     print(
-        "🟢 HISTORY: 500 + 100"
-    )
-
-    print(
-        "🟢 BREAKOUT: +1%"
+        "🟢 BINANCE SQUARE = REMOVED"
     )
 
     print(
         "🟢 ALERT ONLY"
     )
 
+    print(
+        "🟢 NO AUTOMATIC ORDER"
+    )
 
     # --------------------------------------------------------
     # Keep alive
@@ -3239,7 +2834,7 @@ def main():
 
     while not STOP_EVENT.is_set():
 
-        time.sleep(
+        STOP_EVENT.wait(
             60
         )
 
