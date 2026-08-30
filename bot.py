@@ -2,30 +2,32 @@ import os
 import time
 import threading
 import requests
-import math
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ============================================================
-# BINANCE SPOT 15M HIGH QUALITY BREAKOUT ALERT BOT
+# BINANCE SPOT 15M ALERT BOT
+#
+# STRATEGY
 #
 # CMC MARKET CAP >= $200M
 # BINANCE USDT SPOT ONLY
+# 24H VOLUME >= $10M
 #
-# 15M ONLY
+# 15M MAIN TIMEFRAME
 # 500 CLOSED 15M CANDLES
 #
-# 100 CANDLE RESISTANCE
-# 5 CANDLE CONSOLIDATION
+# 100 CANDLES = BREAKOUT RESISTANCE
+# 5 CANDLES   = PRE-BREAKOUT CONSOLIDATION
 #
-# BREAKOUT >= 0.5%
+# BREAKOUT >= +0.5%
 # MOMENTUM +1% TO +4%
-# VOLUME >= 1.8x
+# VOLUME >= 1.8X
 #
-# EMA 20 > 50 > 200
-# RSI 50 - 75
-# ATR14 ACTIVITY FILTER
+# EMA20 > EMA50 > EMA200
+# RSI 50-75
+# ATR14 ACTIVE FILTER
 #
 # CLOSE POSITION >= 75%
 # UPPER WICK <= 25%
@@ -53,92 +55,107 @@ TELEGRAM_CHAT_ID = os.getenv(
     ""
 )
 
-CMC_API_KEY = os.getenv(
-    "CMC_API_KEY",
-    ""
+CMC_API_KEY = (
+    os.getenv("CMC_API_KEY", "")
+    or os.getenv("CMC_PRO_API_KEY", "")
 )
 
 
 # ============================================================
-# API
+# URLS
 # ============================================================
 
 BINANCE_REST = "https://api.binance.com"
-CMC_REST = "https://pro-api.coinmarketcap.com"
+
+CMC_BASE = "https://pro-api.coinmarketcap.com"
+
+CMC_PUBLIC_BASE = (
+    "https://pro-api.coinmarketcap.com/public-api"
+)
 
 
 # ============================================================
-# TIMEFRAME
+# SETTINGS
 # ============================================================
 
 INTERVAL = "15m"
 
 
-# ============================================================
+# ------------------------------------------------------------
 # HISTORY
-# ============================================================
+# ------------------------------------------------------------
 
 HISTORY_CANDLES = 500
 
 
-# ============================================================
+# ------------------------------------------------------------
 # CMC
-# ============================================================
+# ------------------------------------------------------------
 
 MIN_MARKET_CAP = 200_000_000
 
+CMC_LIMIT = 500
 
-# ============================================================
-# BINANCE 24H VOLUME
-# ============================================================
+
+# ------------------------------------------------------------
+# BINANCE 24H LIQUIDITY
+# ------------------------------------------------------------
 
 MIN_24H_QUOTE_VOLUME = 10_000_000
 
 
-# ============================================================
-# BREAKOUT
-# ============================================================
-
-BREAKOUT_LOOKBACK = 100
-
-MIN_BREAKOUT_PERCENT = 0.50
-
-BREAKOUT_VOLUME_AVERAGE = 20
-
-MIN_BREAKOUT_VOLUME_RATIO = 1.80
-
-
-# ============================================================
-# CONSOLIDATION
-# ============================================================
-
-CONSOLIDATION_CANDLES = 5
-
-# Previous 5 candles must remain relatively tight.
-# 2% maximum total range.
-MAX_CONSOLIDATION_RANGE_PERCENT = 2.0
-
-
-# ============================================================
+# ------------------------------------------------------------
 # MOMENTUM
-# ============================================================
+# ------------------------------------------------------------
 
 MIN_MOMENTUM_PERCENT = 1.0
 MAX_MOMENTUM_PERCENT = 4.0
 
 
-# ============================================================
+# ------------------------------------------------------------
+# VOLUME
+# ------------------------------------------------------------
+
+VOLUME_AVERAGE_CANDLES = 20
+MIN_VOLUME_RATIO = 1.80
+
+
+# ------------------------------------------------------------
+# BREAKOUT
+# ------------------------------------------------------------
+
+BREAKOUT_LOOKBACK = 100
+
+MIN_BREAKOUT_PERCENT = 0.50
+
+
+# ------------------------------------------------------------
+# CONSOLIDATION
+# ------------------------------------------------------------
+
+CONSOLIDATION_CANDLES = 5
+
+# Maximum total range of the 5 candles
+# relative to their average close.
+#
+# Example:
+# 5-candle range <= 2.5%
+#
+MAX_CONSOLIDATION_RANGE_PERCENT = 2.50
+
+
+# ------------------------------------------------------------
 # EMA
-# ============================================================
+# ------------------------------------------------------------
 
 EMA_FAST = 20
-EMA_MID = 50
+EMA_MIDDLE = 50
 EMA_SLOW = 200
 
 
-# ============================================================
+# ------------------------------------------------------------
 # RSI
-# ============================================================
+# ------------------------------------------------------------
 
 RSI_PERIOD = 14
 
@@ -146,43 +163,53 @@ MIN_RSI = 50.0
 MAX_RSI = 75.0
 
 
-# ============================================================
+# ------------------------------------------------------------
 # ATR
-# ============================================================
+# ------------------------------------------------------------
 
 ATR_PERIOD = 14
 
-# ATR must be at least this percentage of price.
-# Prevents extremely dead markets.
+# ATR as percentage of price.
+#
+# ATR14 / close * 100
+#
+# Minimum activity:
 MIN_ATR_PERCENT = 0.20
 
 
-# ============================================================
+# ------------------------------------------------------------
 # CANDLE QUALITY
-# ============================================================
+# ------------------------------------------------------------
 
 MIN_CLOSE_POSITION = 75.0
 
-MAX_UPPER_WICK = 25.0
+MAX_UPPER_WICK_PERCENT = 25.0
 
 
-# ============================================================
+# ------------------------------------------------------------
 # SPREAD
-# ============================================================
+# ------------------------------------------------------------
 
 MAX_SPREAD_PERCENT = 0.15
 
 
-# ============================================================
+# ------------------------------------------------------------
 # SCORE
-# ============================================================
+# ------------------------------------------------------------
 
 MIN_SCORE = 70
 
 
-# ============================================================
+# ------------------------------------------------------------
+# COOLDOWN
+# ------------------------------------------------------------
+
+SIGNAL_COOLDOWN_SECONDS = 24 * 60 * 60
+
+
+# ------------------------------------------------------------
 # SCAN
-# ============================================================
+# ------------------------------------------------------------
 
 SCAN_INTERVAL = 60
 
@@ -191,24 +218,11 @@ MAX_WORKERS = 8
 REQUEST_TIMEOUT = 10
 
 
-# ============================================================
+# ------------------------------------------------------------
 # CMC CACHE
-# ============================================================
+# ------------------------------------------------------------
 
-CMC_REFRESH_SECONDS = 10 * 60
-
-cmc_cache = {}
-
-cmc_cache_time = 0
-
-cmc_lock = threading.Lock()
-
-
-# ============================================================
-# COOLDOWN
-# ============================================================
-
-SIGNAL_COOLDOWN_SECONDS = 24 * 60 * 60
+CMC_REFRESH_SECONDS = 300
 
 
 # ============================================================
@@ -218,7 +232,7 @@ SIGNAL_COOLDOWN_SECONDS = 24 * 60 * 60
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "BinanceSpot15MBreakoutBot/3.0",
+    "User-Agent": "BinanceSpot15MAlertBot/3.0",
     "Accept": "application/json"
 })
 
@@ -231,6 +245,10 @@ spot_symbols = {}
 
 last_alert = {}
 
+cmc_market_caps = {}
+
+cmc_last_update = 0
+
 lock = threading.Lock()
 
 
@@ -241,11 +259,19 @@ lock = threading.Lock()
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
-        print("ERROR: TELEGRAM_BOT_TOKEN missing")
+
+        print(
+            "ERROR: TELEGRAM_BOT_TOKEN missing"
+        )
+
         return False
 
     if not TELEGRAM_CHAT_ID:
-        print("ERROR: TELEGRAM_CHAT_ID missing")
+
+        print(
+            "ERROR: TELEGRAM_CHAT_ID missing"
+        )
+
         return False
 
     url = (
@@ -274,7 +300,7 @@ def send_telegram(message):
         print(
             "Telegram error:",
             r.status_code,
-            r.text[:500]
+            r.text[:300]
         )
 
     except Exception as e:
@@ -307,10 +333,10 @@ def binance_get(
         if r.status_code != 200:
 
             print(
-                "Binance HTTP error:",
+                "Binance HTTP:",
                 r.status_code,
                 path,
-                r.text[:300]
+                r.text[:200]
             )
 
             return None
@@ -329,7 +355,7 @@ def binance_get(
 
 
 # ============================================================
-# CMC GET
+# CMC GET AUTHENTICATED
 # ============================================================
 
 def cmc_get(
@@ -340,7 +366,7 @@ def cmc_get(
     if not CMC_API_KEY:
 
         print(
-            "ERROR: CMC_API_KEY missing"
+            "CMC ERROR: API KEY MISSING"
         )
 
         return None
@@ -353,18 +379,112 @@ def cmc_get(
     try:
 
         r = session.get(
-            CMC_REST + path,
-            params=params,
+            CMC_BASE + path,
             headers=headers,
+            params=params,
             timeout=REQUEST_TIMEOUT
+        )
+
+        print(
+            "CMC HTTP:",
+            r.status_code,
+            path
+        )
+
+        if r.status_code != 200:
+
+            try:
+
+                body = r.json()
+
+                status = body.get(
+                    "status",
+                    {}
+                )
+
+                print(
+                    "CMC ERROR CODE:",
+                    status.get("error_code")
+                )
+
+                print(
+                    "CMC ERROR MESSAGE:",
+                    status.get("error_message")
+                )
+
+            except Exception:
+
+                print(
+                    "CMC RAW ERROR:",
+                    r.text[:500]
+                )
+
+            return None
+
+        data = r.json()
+
+        status = data.get(
+            "status",
+            {}
+        )
+
+        error_code = status.get(
+            "error_code",
+            0
+        )
+
+        if str(error_code) != "0":
+
+            print(
+                "CMC API ERROR:",
+                error_code,
+                status.get(
+                    "error_message"
+                )
+            )
+
+            return None
+
+        return data
+
+    except Exception as e:
+
+        print(
+            "CMC REQUEST EXCEPTION:",
+            repr(e)
+        )
+
+        return None
+
+
+# ============================================================
+# CMC PUBLIC FALLBACK
+# ============================================================
+
+def cmc_public_get(
+    path,
+    params=None
+):
+
+    try:
+
+        r = session.get(
+            CMC_PUBLIC_BASE + path,
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        )
+
+        print(
+            "CMC PUBLIC HTTP:",
+            r.status_code,
+            path
         )
 
         if r.status_code != 200:
 
             print(
-                "CMC HTTP ERROR:",
-                r.status_code,
-                r.text[:1000]
+                "CMC PUBLIC ERROR:",
+                r.text[:400]
             )
 
             return None
@@ -381,17 +501,14 @@ def cmc_get(
             0
         )
 
-        error_message = status.get(
-            "error_message",
-            ""
-        )
-
-        if error_code not in (0, None):
+        if str(error_code) != "0":
 
             print(
-                "CMC API ERROR:",
+                "CMC PUBLIC API ERROR:",
                 error_code,
-                error_message
+                status.get(
+                    "error_message"
+                )
             )
 
             return None
@@ -401,11 +518,236 @@ def cmc_get(
     except Exception as e:
 
         print(
-            "CMC REQUEST ERROR:",
+            "CMC PUBLIC EXCEPTION:",
             repr(e)
         )
 
         return None
+
+
+# ============================================================
+# LOAD CMC MARKET CAPS
+# ============================================================
+
+def load_cmc_market_caps(
+    force=False
+):
+
+    global cmc_market_caps
+    global cmc_last_update
+
+    now = time.time()
+
+    # --------------------------------------------------------
+    # Cache
+    # --------------------------------------------------------
+
+    if (
+        not force
+        and cmc_market_caps
+        and now - cmc_last_update
+        < CMC_REFRESH_SECONDS
+    ):
+
+        return cmc_market_caps
+
+    print()
+    print("=" * 60)
+    print("CMC MARKET CAP UPDATE")
+    print("=" * 60)
+
+    params = {
+        "start": 1,
+        "limit": CMC_LIMIT,
+        "convert": "USD"
+    }
+
+    data = None
+
+    # --------------------------------------------------------
+    # Authenticated CMC
+    # --------------------------------------------------------
+
+    if CMC_API_KEY:
+
+        data = cmc_get(
+            "/v3/cryptocurrency/listings/latest",
+            params
+        )
+
+    # --------------------------------------------------------
+    # Public fallback
+    # --------------------------------------------------------
+
+    if not data:
+
+        print(
+            "CMC authenticated request failed."
+        )
+
+        print(
+            "Trying CMC public fallback..."
+        )
+
+        data = cmc_public_get(
+            "/v3/cryptocurrency/listings/latest",
+            params
+        )
+
+    if not data:
+
+        print(
+            "CMC MARKET CAP DATA FAILED"
+        )
+
+        return None
+
+    coins = data.get(
+        "data",
+        []
+    )
+
+    if not coins:
+
+        print(
+            "CMC returned EMPTY DATA"
+        )
+
+        return None
+
+    result = {}
+
+    for coin in coins:
+
+        try:
+
+            symbol = str(
+                coin.get(
+                    "symbol",
+                    ""
+                )
+            ).upper().strip()
+
+            if not symbol:
+                continue
+
+            quote = coin.get(
+                "quote",
+                {}
+            )
+
+            # ------------------------------------------------
+            # CMC versions can represent quote differently.
+            # Support both dict and list.
+            # ------------------------------------------------
+
+            usd = None
+
+            if isinstance(
+                quote,
+                dict
+            ):
+
+                usd = quote.get(
+                    "USD"
+                )
+
+            elif isinstance(
+                quote,
+                list
+            ):
+
+                for q in quote:
+
+                    if not isinstance(
+                        q,
+                        dict
+                    ):
+                        continue
+
+                    if str(
+                        q.get(
+                            "name",
+                            ""
+                        )
+                    ).upper() == "USD":
+
+                        usd = q
+                        break
+
+                    if str(
+                        q.get(
+                            "symbol",
+                            ""
+                        )
+                    ).upper() == "USD":
+
+                        usd = q
+                        break
+
+            if not usd:
+                continue
+
+            market_cap = float(
+                usd.get(
+                    "market_cap",
+                    0
+                )
+            )
+
+            if market_cap <= 0:
+                continue
+
+            # Same symbol can exist multiple times.
+            # Keep highest market cap.
+            previous = result.get(
+                symbol
+            )
+
+            if (
+                previous is None
+                or market_cap > previous
+            ):
+
+                result[
+                    symbol
+                ] = market_cap
+
+        except Exception:
+            continue
+
+    if not result:
+
+        print(
+            "CMC returned no usable market-cap data."
+        )
+
+        return None
+
+    cmc_market_caps = result
+
+    cmc_last_update = now
+
+    qualified = sum(
+        1
+        for value in result.values()
+        if value >= MIN_MARKET_CAP
+    )
+
+    print(
+        "CMC COINS LOADED:",
+        len(result)
+    )
+
+    print(
+        "CMC >= $200M:",
+        qualified
+    )
+
+    print("=" * 60)
+    print()
+
+    return result
 
 
 # ============================================================
@@ -432,7 +774,9 @@ def load_spot_symbols():
 
         try:
 
-            symbol = item["symbol"]
+            symbol = item.get(
+                "symbol"
+            )
 
             if item.get(
                 "status"
@@ -455,6 +799,7 @@ def load_spot_symbols():
                 ""
             ).upper()
 
+            # Remove leveraged tokens
             if base.endswith(
                 (
                     "UP",
@@ -465,9 +810,10 @@ def load_spot_symbols():
             ):
                 continue
 
-            result[symbol] = {
-                "base": base,
-                "quote": "USDT"
+            result[
+                symbol
+            ] = {
+                "base_asset": base
             }
 
         except Exception:
@@ -481,234 +827,6 @@ def load_spot_symbols():
     )
 
     return True
-
-
-# ============================================================
-# CMC MARKET CAP
-#
-# IMPORTANT FIX
-#
-# CMC official modern endpoint:
-#
-# /v3/cryptocurrency/listings/latest
-#
-# We request market_cap_min directly.
-#
-# If CMC returns no data with the server-side filter,
-# we retry without that filter and apply >= $200M locally.
-# ============================================================
-
-def load_cmc_market_caps(
-    force=False
-):
-
-    global cmc_cache
-    global cmc_cache_time
-
-    now = time.time()
-
-    with cmc_lock:
-
-        if (
-            not force
-            and cmc_cache
-            and now - cmc_cache_time
-            < CMC_REFRESH_SECONDS
-        ):
-
-            return dict(cmc_cache)
-
-    print()
-    print(
-        "========== CMC MARKET CAP LOAD =========="
-    )
-
-    if not CMC_API_KEY:
-
-        print(
-            "ERROR: CMC_API_KEY is not configured."
-        )
-
-        return {}
-
-    # --------------------------------------------------------
-    # FIRST TRY
-    #
-    # Server-side market cap filter
-    # --------------------------------------------------------
-
-    params = {
-        "start": 1,
-        "limit": 1000,
-        "convert": "USD",
-        "market_cap_min": MIN_MARKET_CAP,
-        "sort": "market_cap",
-        "sort_dir": "desc"
-    }
-
-    data = cmc_get(
-        "/v3/cryptocurrency/listings/latest",
-        params
-    )
-
-    records = []
-
-    if data:
-
-        records = data.get(
-            "data",
-            []
-        )
-
-    print(
-        "CMC filtered records:",
-        len(records)
-    )
-
-    # --------------------------------------------------------
-    # FALLBACK
-    #
-    # If CMC returned no records, retry without
-    # market_cap_min.
-    #
-    # Then apply the filter locally.
-    # --------------------------------------------------------
-
-    if not records:
-
-        print(
-            "CMC filtered request returned no data."
-        )
-
-        print(
-            "Retrying CMC without market_cap_min..."
-        )
-
-        fallback_params = {
-            "start": 1,
-            "limit": 1000,
-            "convert": "USD",
-            "sort": "market_cap",
-            "sort_dir": "desc"
-        }
-
-        fallback = cmc_get(
-            "/v3/cryptocurrency/listings/latest",
-            fallback_params
-        )
-
-        if fallback:
-
-            records = fallback.get(
-                "data",
-                []
-            )
-
-            print(
-                "CMC fallback records:",
-                len(records)
-            )
-
-    if not records:
-
-        print(
-            "ERROR: CMC returned no cryptocurrency records."
-        )
-
-        print(
-            "Check CMC_API_KEY and CMC API plan."
-        )
-
-        return {}
-
-    # --------------------------------------------------------
-    # BUILD MARKET CAP MAP
-    #
-    # Symbol -> highest valid market cap
-    #
-    # We keep the highest value if CMC contains
-    # duplicate symbols.
-    # --------------------------------------------------------
-
-    result = {}
-
-    for coin in records:
-
-        try:
-
-            symbol = str(
-                coin.get(
-                    "symbol",
-                    ""
-                )
-            ).upper().strip()
-
-            if not symbol:
-                continue
-
-            quote = coin.get(
-                "quote",
-                {}
-            )
-
-            usd = quote.get(
-                "USD",
-                {}
-            )
-
-            market_cap = float(
-                usd.get(
-                    "market_cap",
-                    0
-                ) or 0
-            )
-
-            if market_cap < MIN_MARKET_CAP:
-                continue
-
-            old = result.get(
-                symbol
-            )
-
-            if (
-                old is None
-                or market_cap > old
-            ):
-
-                result[symbol] = market_cap
-
-        except Exception:
-            continue
-
-    with cmc_lock:
-
-        cmc_cache = result
-
-        cmc_cache_time = time.time()
-
-    print(
-        "CMC coins >= $200M:",
-        len(result)
-    )
-
-    if result:
-
-        print(
-            "CMC market-cap data loaded successfully."
-        )
-
-    else:
-
-        print(
-            "ERROR: No CMC coins passed $200M."
-        )
-
-    print(
-        "=========================================="
-    )
-    print()
-
-    return dict(result)
 
 
 # ============================================================
@@ -751,19 +869,74 @@ def get_24h_tickers():
                 )
             )
 
-            if (
-                quote_volume
-                < MIN_24H_QUOTE_VOLUME
-            ):
+            if quote_volume < MIN_24H_QUOTE_VOLUME:
                 continue
 
             if last_price <= 0:
                 continue
 
-            result[symbol] = {
+            result[
+                symbol
+            ] = {
                 "quote_volume": quote_volume,
-                "price": last_price
+                "price": last_price,
+                "base_asset":
+                    spot_symbols[
+                        symbol
+                    ][
+                        "base_asset"
+                    ]
             }
+
+        except Exception:
+            continue
+
+    return result
+
+
+# ============================================================
+# FILTER CMC
+# ============================================================
+
+def filter_by_market_cap(
+    tickers,
+    market_caps
+):
+
+    if not market_caps:
+        return {}
+
+    result = {}
+
+    for symbol, ticker in tickers.items():
+
+        try:
+
+            base = ticker[
+                "base_asset"
+            ].upper()
+
+            market_cap = market_caps.get(
+                base
+            )
+
+            if market_cap is None:
+                continue
+
+            if market_cap < MIN_MARKET_CAP:
+                continue
+
+            item = dict(
+                ticker
+            )
+
+            item[
+                "market_cap"
+            ] = market_cap
+
+            result[
+                symbol
+            ] = item
 
         except Exception:
             continue
@@ -777,29 +950,19 @@ def get_24h_tickers():
 
 def get_klines(
     symbol,
-    interval,
-    limit=1000,
-    end_time=None
+    limit=500
 ):
-
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": min(
-            limit,
-            1000
-        )
-    }
-
-    if end_time is not None:
-
-        params[
-            "endTime"
-        ] = end_time
 
     return binance_get(
         "/api/v3/klines",
-        params
+        {
+            "symbol": symbol,
+            "interval": INTERVAL,
+            "limit": min(
+                limit,
+                1000
+            )
+        }
     )
 
 
@@ -829,7 +992,6 @@ def only_closed(
             )
 
             if close_time <= now_ms:
-
                 result.append(
                     candle
                 )
@@ -837,122 +999,39 @@ def only_closed(
         except Exception:
             continue
 
+    result.sort(
+        key=lambda x: int(x[0])
+    )
+
     return result
 
 
 # ============================================================
-# LOAD EXACT CLOSED HISTORY
+# LOAD 500 CLOSED 15M
 # ============================================================
 
-def load_closed_history(
-    symbol,
-    interval,
-    required
+def load_history(
+    symbol
 ):
-
-    collected = {}
-
-    first_limit = min(
-        1000,
-        required + 2
-    )
 
     data = get_klines(
         symbol,
-        interval,
-        first_limit
+        HISTORY_CANDLES + 2
     )
 
     if not data:
         return []
 
-    for candle in data:
-
-        try:
-
-            open_time = int(
-                candle[0]
-            )
-
-            collected[
-                open_time
-            ] = candle
-
-        except Exception:
-            pass
-
-    while True:
-
-        closed = only_closed(
-            list(
-                collected.values()
-            )
-        )
-
-        if len(closed) >= required:
-            break
-
-        if not collected:
-            break
-
-        oldest_open_time = min(
-            collected.keys()
-        )
-
-        data = get_klines(
-            symbol,
-            interval,
-            1000,
-            oldest_open_time - 1
-        )
-
-        if not data:
-            break
-
-        before = len(
-            collected
-        )
-
-        for candle in data:
-
-            try:
-
-                open_time = int(
-                    candle[0]
-                )
-
-                collected[
-                    open_time
-                ] = candle
-
-            except Exception:
-                pass
-
-        if len(collected) == before:
-            break
-
-        if len(collected) > (
-            required + 2500
-        ):
-            break
-
     closed = only_closed(
-        list(
-            collected.values()
-        )
+        data
     )
 
-    closed.sort(
-        key=lambda x: int(x[0])
-    )
+    if len(closed) < HISTORY_CANDLES:
+        return closed
 
-    if len(closed) >= required:
-
-        return closed[
-            -required:
-        ]
-
-    return closed
+    return closed[
+        -HISTORY_CANDLES:
+    ]
 
 
 # ============================================================
@@ -976,11 +1055,15 @@ def get_spread(
     try:
 
         bid = float(
-            data["bidPrice"]
+            data[
+                "bidPrice"
+            ]
         )
 
         ask = float(
-            data["askPrice"]
+            data[
+                "askPrice"
+            ]
         )
 
         if bid <= 0 or ask <= 0:
@@ -1007,37 +1090,30 @@ def get_spread(
 # ============================================================
 
 def calculate_ema(
-    values,
+    closes,
     period
 ):
 
-    if len(values) < period:
+    if len(closes) < period:
         return None
 
     multiplier = (
-        2
-        / (
-            period + 1
-        )
+        2.0
+        / (period + 1)
     )
 
-    ema = (
-        sum(
-            values[
-                :period
-            ]
-        )
-        / period
-    )
+    ema = sum(
+        closes[
+            :period
+        ]
+    ) / period
 
-    for price in values[
+    for price in closes[
         period:
     ]:
 
         ema = (
-            (
-                price - ema
-            )
+            (price - ema)
             * multiplier
             + ema
         )
@@ -1054,15 +1130,16 @@ def calculate_rsi(
     period=14
 ):
 
-    if len(closes) < (
-        period + 1
-    ):
+    if len(closes) <= period:
         return None
 
     gains = []
     losses = []
 
-    for i in range(1, len(closes)):
+    for i in range(
+        1,
+        period + 1
+    ):
 
         change = (
             closes[i]
@@ -1070,70 +1147,70 @@ def calculate_rsi(
         )
 
         if change > 0:
-
             gains.append(
                 change
             )
-
-            losses.append(
-                0
-            )
-
+            losses.append(0)
         else:
-
-            gains.append(
-                0
-            )
-
+            gains.append(0)
             losses.append(
                 abs(change)
             )
 
     avg_gain = (
-        sum(
-            gains[
-                :period
-            ]
-        )
+        sum(gains)
         / period
     )
 
     avg_loss = (
-        sum(
-            losses[
-                :period
-            ]
-        )
+        sum(losses)
         / period
     )
 
+    if avg_loss == 0:
+        return 100.0
+
     for i in range(
-        period,
-        len(gains)
+        period + 1,
+        len(closes)
     ):
+
+        change = (
+            closes[i]
+            - closes[i - 1]
+        )
+
+        gain = (
+            max(
+                change,
+                0
+            )
+        )
+
+        loss = (
+            max(
+                -change,
+                0
+            )
+        )
 
         avg_gain = (
             (
                 avg_gain
-                * (
-                    period - 1
-                )
+                * (period - 1)
             )
-            + gains[i]
+            + gain
         ) / period
 
         avg_loss = (
             (
                 avg_loss
-                * (
-                    period - 1
-                )
+                * (period - 1)
             )
-            + losses[i]
+            + loss
         ) / period
 
     if avg_loss == 0:
-
         return 100.0
 
     rs = (
@@ -1145,9 +1222,7 @@ def calculate_rsi(
         100
         - (
             100
-            / (
-                1 + rs
-            )
+            / (1 + rs)
         )
     )
 
@@ -1157,34 +1232,32 @@ def calculate_rsi(
 # ============================================================
 
 def calculate_atr(
-    candles,
+    history,
     period=14
 ):
 
-    if len(candles) < (
-        period + 1
-    ):
+    if len(history) < period + 1:
         return None
 
     true_ranges = []
 
     for i in range(
         1,
-        len(candles)
+        len(history)
     ):
 
         try:
 
             high = float(
-                candles[i][2]
+                history[i][2]
             )
 
             low = float(
-                candles[i][3]
+                history[i][3]
             )
 
             previous_close = float(
-                candles[i - 1][4]
+                history[i - 1][4]
             )
 
             tr = max(
@@ -1225,9 +1298,7 @@ def calculate_atr(
         atr = (
             (
                 atr
-                * (
-                    period - 1
-                )
+                * (period - 1)
             )
             + tr
         ) / period
@@ -1236,138 +1307,32 @@ def calculate_atr(
 
 
 # ============================================================
-# CANDLE QUALITY
+# CANDLE DATA
 # ============================================================
 
-def candle_quality(
+def candle_values(
     candle
 ):
 
-    try:
-
-        high = float(
-            candle[2]
-        )
-
-        low = float(
-            candle[3]
-        )
-
-        close = float(
-            candle[4]
-        )
-
-        open_price = float(
+    return {
+        "open": float(
             candle[1]
+        ),
+        "high": float(
+            candle[2]
+        ),
+        "low": float(
+            candle[3]
+        ),
+        "close": float(
+            candle[4]
+        ),
+        "volume": float(
+            candle[5]
+        ),
+        "quote_volume": float(
+            candle[7]
         )
-
-    except Exception:
-        return None
-
-    candle_range = (
-        high - low
-    )
-
-    if candle_range <= 0:
-        return None
-
-    close_position = (
-        (
-            close - low
-        )
-        / candle_range
-        * 100
-    )
-
-    body_top = max(
-        open_price,
-        close
-    )
-
-    upper_wick = (
-        high - body_top
-    )
-
-    upper_wick_percent = (
-        upper_wick
-        / candle_range
-        * 100
-    )
-
-    return {
-        "close_position":
-            close_position,
-        "upper_wick":
-            upper_wick_percent
-    }
-
-
-# ============================================================
-# 5 CANDLE CONSOLIDATION
-# ============================================================
-
-def check_consolidation(
-    history
-):
-
-    if len(history) < (
-        CONSOLIDATION_CANDLES + 1
-    ):
-        return None
-
-    candles = history[
-        -(
-            CONSOLIDATION_CANDLES + 1
-        ):
-        -1
-    ]
-
-    highs = []
-    lows = []
-
-    for candle in candles:
-
-        try:
-
-            highs.append(
-                float(candle[2])
-            )
-
-            lows.append(
-                float(candle[3])
-            )
-
-        except Exception:
-            return None
-
-    highest = max(
-        highs
-    )
-
-    lowest = min(
-        lows
-    )
-
-    if lowest <= 0:
-        return None
-
-    range_percent = (
-        (
-            highest - lowest
-        )
-        / lowest
-        * 100
-    )
-
-    if (
-        range_percent
-        > MAX_CONSOLIDATION_RANGE_PERCENT
-    ):
-        return None
-
-    return {
-        "range_percent":
-            range_percent
     }
 
 
@@ -1377,8 +1342,7 @@ def check_consolidation(
 
 def analyze_symbol(
     symbol,
-    ticker,
-    market_cap
+    ticker
 ):
 
     try:
@@ -1392,84 +1356,42 @@ def analyze_symbol(
         ):
             return None
 
+
         # ----------------------------------------------------
-        # 500 CLOSED 15M CANDLES
+        # HISTORY
         # ----------------------------------------------------
 
-        history = load_closed_history(
-            symbol,
-            INTERVAL,
-            HISTORY_CANDLES
+        history = load_history(
+            symbol
         )
 
         if len(history) != HISTORY_CANDLES:
 
+            print(
+                f"{symbol}: "
+                f"history "
+                f"{len(history)}/"
+                f"{HISTORY_CANDLES}"
+            )
+
             return None
+
 
         # ----------------------------------------------------
-        # Latest CLOSED candle
+        # CURRENT CLOSED BREAKOUT CANDLE
         # ----------------------------------------------------
 
-        current = history[-1]
-
-        try:
-
-            open_price = float(
-                current[1]
-            )
-
-            high = float(
-                current[2]
-            )
-
-            low = float(
-                current[3]
-            )
-
-            close = float(
-                current[4]
-            )
-
-            volume = float(
-                current[5]
-            )
-
-            quote_volume = float(
-                current[7]
-            )
-
-        except Exception:
-
-            return None
-
-        if open_price <= 0:
-            return None
-
-        # ====================================================
-        # MOMENTUM
-        # ====================================================
-
-        momentum = (
-            (
-                close
-                - open_price
-            )
-            / open_price
-            * 100
+        breakout = candle_values(
+            history[-1]
         )
 
-        if momentum < MIN_MOMENTUM_PERCENT:
-            return None
 
-        if momentum > MAX_MOMENTUM_PERCENT:
-            return None
-
-        # ====================================================
-        # 100 CANDLE RESISTANCE
+        # ----------------------------------------------------
+        # PREVIOUS CANDLES
         #
-        # Previous 100 CLOSED candles
-        # excluding current breakout candle
-        # ====================================================
+        # The latest candle is breakout.
+        # The 100 candles before it define resistance.
+        # ----------------------------------------------------
 
         resistance_history = history[
             -(
@@ -1484,6 +1406,11 @@ def analyze_symbol(
 
             return None
 
+
+        # ----------------------------------------------------
+        # RESISTANCE
+        # ----------------------------------------------------
+
         resistance = max(
             float(c[2])
             for c in resistance_history
@@ -1492,13 +1419,14 @@ def analyze_symbol(
         if resistance <= 0:
             return None
 
-        # ====================================================
-        # BREAKOUT
-        # ====================================================
+
+        # ----------------------------------------------------
+        # BREAKOUT %
+        # ----------------------------------------------------
 
         breakout_percent = (
             (
-                close
+                breakout["close"]
                 - resistance
             )
             / resistance
@@ -1511,95 +1439,156 @@ def analyze_symbol(
         ):
             return None
 
-        # ====================================================
-        # 5 CANDLE CONSOLIDATION
-        # ====================================================
 
-        consolidation = (
-            check_consolidation(
-                history
-            )
-        )
+        # ----------------------------------------------------
+        # MOMENTUM
+        #
+        # Latest closed 15M candle
+        # must be +1% to +4%.
+        # ----------------------------------------------------
 
-        if not consolidation:
+        if breakout["open"] <= 0:
             return None
 
-        # ====================================================
+        momentum = (
+            (
+                breakout["close"]
+                - breakout["open"]
+            )
+            / breakout["open"]
+            * 100
+        )
+
+        if momentum < MIN_MOMENTUM_PERCENT:
+            return None
+
+        if momentum > MAX_MOMENTUM_PERCENT:
+            return None
+
+
+        # ----------------------------------------------------
         # VOLUME
-        #
-        # Current breakout candle vs previous 20
-        # ====================================================
+        # ----------------------------------------------------
 
         volume_reference = history[
             -(
-                BREAKOUT_VOLUME_AVERAGE + 1
+                VOLUME_AVERAGE_CANDLES + 1
             ):
             -1
         ]
 
-        reference_volumes = []
+        reference_volumes = [
+            float(c[5])
+            for c in volume_reference
+        ]
 
-        for candle in volume_reference:
-
-            try:
-
-                reference_volumes.append(
-                    float(candle[5])
-                )
-
-            except Exception:
-                pass
-
-        if len(
-            reference_volumes
-        ) != BREAKOUT_VOLUME_AVERAGE:
-
+        if not reference_volumes:
             return None
 
         average_volume = (
-            sum(
-                reference_volumes
-            )
-            / len(
-                reference_volumes
-            )
+            sum(reference_volumes)
+            / len(reference_volumes)
         )
 
         if average_volume <= 0:
             return None
 
         volume_ratio = (
-            volume
+            breakout["volume"]
             / average_volume
         )
 
         if (
             volume_ratio
-            < MIN_BREAKOUT_VOLUME_RATIO
+            < MIN_VOLUME_RATIO
         ):
             return None
 
-        # ====================================================
-        # CLOSE POSITION / UPPER WICK
-        # ====================================================
 
-        quality = candle_quality(
-            current
+        # ----------------------------------------------------
+        # 5 CANDLE CONSOLIDATION
+        #
+        # Immediately BEFORE breakout.
+        # ----------------------------------------------------
+
+        consolidation = history[
+            -(
+                CONSOLIDATION_CANDLES + 1
+            ):
+            -1
+        ]
+
+        if len(
+            consolidation
+        ) != CONSOLIDATION_CANDLES:
+
+            return None
+
+        consolidation_high = max(
+            float(c[2])
+            for c in consolidation
         )
 
-        if not quality:
+        consolidation_low = min(
+            float(c[3])
+            for c in consolidation
+        )
+
+        consolidation_closes = [
+            float(c[4])
+            for c in consolidation
+        ]
+
+        average_consolidation_close = (
+            sum(
+                consolidation_closes
+            )
+            / len(
+                consolidation_closes
+            )
+        )
+
+        if (
+            average_consolidation_close
+            <= 0
+        ):
+            return None
+
+        consolidation_range = (
+            (
+                consolidation_high
+                - consolidation_low
+            )
+            / average_consolidation_close
+            * 100
+        )
+
+        if (
+            consolidation_range
+            > MAX_CONSOLIDATION_RANGE_PERCENT
+        ):
+            return None
+
+
+        # ----------------------------------------------------
+        # CLOSE POSITION
+        # ----------------------------------------------------
+
+        candle_range = (
+            breakout["high"]
+            - breakout["low"]
+        )
+
+        if candle_range <= 0:
             return None
 
         close_position = (
-            quality[
-                "close_position"
-            ]
-        )
-
-        upper_wick = (
-            quality[
-                "upper_wick"
-            ]
+            (
+                breakout["close"]
+                - breakout["low"]
+            )
+            / candle_range
+            * 100
         )
 
         if (
@@ -1608,28 +1597,40 @@ def analyze_symbol(
         ):
             return None
 
-        if (
+
+        # ----------------------------------------------------
+        # UPPER WICK
+        # ----------------------------------------------------
+
+        upper_wick = (
+            breakout["high"]
+            - max(
+                breakout["open"],
+                breakout["close"]
+            )
+        )
+
+        upper_wick_percent = (
             upper_wick
-            > MAX_UPPER_WICK
+            / candle_range
+            * 100
+        )
+
+        if (
+            upper_wick_percent
+            > MAX_UPPER_WICK_PERCENT
         ):
             return None
 
-        # ====================================================
+
+        # ----------------------------------------------------
         # EMA
-        # ====================================================
+        # ----------------------------------------------------
 
-        closes = []
-
-        for candle in history:
-
-            try:
-
-                closes.append(
-                    float(candle[4])
-                )
-
-            except Exception:
-                return None
+        closes = [
+            float(c[4])
+            for c in history
+        ]
 
         ema20 = calculate_ema(
             closes,
@@ -1638,7 +1639,7 @@ def analyze_symbol(
 
         ema50 = calculate_ema(
             closes,
-            EMA_MID
+            EMA_MIDDLE
         )
 
         ema200 = calculate_ema(
@@ -1660,9 +1661,10 @@ def analyze_symbol(
         ):
             return None
 
-        # ====================================================
+
+        # ----------------------------------------------------
         # RSI
-        # ====================================================
+        # ----------------------------------------------------
 
         rsi = calculate_rsi(
             closes,
@@ -1678,9 +1680,10 @@ def analyze_symbol(
         if rsi > MAX_RSI:
             return None
 
-        # ====================================================
-        # ATR14
-        # ====================================================
+
+        # ----------------------------------------------------
+        # ATR
+        # ----------------------------------------------------
 
         atr = calculate_atr(
             history,
@@ -1692,7 +1695,7 @@ def analyze_symbol(
 
         atr_percent = (
             atr
-            / close
+            / breakout["close"]
             * 100
         )
 
@@ -1702,9 +1705,10 @@ def analyze_symbol(
         ):
             return None
 
-        # ====================================================
+
+        # ----------------------------------------------------
         # SPREAD
-        # ====================================================
+        # ----------------------------------------------------
 
         spread = get_spread(
             symbol
@@ -1713,124 +1717,177 @@ def analyze_symbol(
         if spread is None:
             return None
 
-        if (
-            spread
-            > MAX_SPREAD_PERCENT
-        ):
+        if spread > MAX_SPREAD_PERCENT:
             return None
+
 
         # ====================================================
         # SCORE
-        #
-        # Maximum = 100
-        #
-        # Momentum       15
-        # Breakout       20
-        # Volume         20
-        # EMA            15
-        # RSI            10
-        # Consolidation  5
-        # Candle quality 10
-        # Spread          5
         # ====================================================
 
         score = 0
 
-        # Momentum
-        if momentum >= 2.0:
+
+        # ----------------------------------------------------
+        # Breakout quality
+        # ----------------------------------------------------
+
+        if breakout_percent >= 1.0:
             score += 15
         else:
             score += 10
 
-        # Breakout
-        if breakout_percent >= 1.0:
-            score += 20
-        else:
-            score += 15
 
+        # ----------------------------------------------------
         # Volume
+        # ----------------------------------------------------
+
         if volume_ratio >= 2.5:
             score += 20
-        else:
+
+        elif volume_ratio >= 2.0:
+            score += 17
+
+        elif volume_ratio >= 1.8:
             score += 15
 
-        # EMA
+
+        # ----------------------------------------------------
+        # EMA trend
+        # ----------------------------------------------------
+
         score += 15
 
+
+        # ----------------------------------------------------
         # RSI
+        # ----------------------------------------------------
+
         if 55 <= rsi <= 70:
             score += 10
+
+        elif 50 <= rsi <= 75:
+            score += 8
+
+
+        # ----------------------------------------------------
+        # Momentum
+        # ----------------------------------------------------
+
+        if 1.5 <= momentum <= 3.0:
+            score += 10
+
+        else:
+            score += 8
+
+
+        # ----------------------------------------------------
+        # Consolidation
+        # ----------------------------------------------------
+
+        if consolidation_range <= 1.5:
+            score += 10
+
         else:
             score += 7
 
-        # Consolidation
-        if (
-            consolidation[
-                "range_percent"
-            ] <= 1.0
-        ):
-            score += 5
-        else:
-            score += 3
 
+        # ----------------------------------------------------
         # Candle quality
+        # ----------------------------------------------------
+
         if (
             close_position >= 85
-            and upper_wick <= 15
+            and upper_wick_percent <= 15
         ):
+
             score += 10
+
         else:
+
             score += 7
 
-        # Spread
-        if spread <= 0.08:
+
+        # ----------------------------------------------------
+        # ATR
+        # ----------------------------------------------------
+
+        if atr_percent >= 0.50:
             score += 5
+
         else:
             score += 3
+
+
+        # ----------------------------------------------------
+        # Spread
+        # ----------------------------------------------------
+
+        if spread <= 0.08:
+            score += 5
+
+        else:
+            score += 3
+
+
+        # ----------------------------------------------------
+        # SCORE FILTER
+        # ----------------------------------------------------
 
         if score < MIN_SCORE:
             return None
 
+
         # ====================================================
-        # SIGNAL
+        # RESULT
         # ====================================================
 
         return {
             "symbol": symbol,
-            "market_cap": market_cap,
-            "price": close,
-            "momentum": momentum,
+            "price": breakout["close"],
+            "market_cap": ticker[
+                "market_cap"
+            ],
+            "quote_volume": ticker[
+                "quote_volume"
+            ],
+
             "resistance": resistance,
             "breakout_percent":
                 breakout_percent,
+
+            "momentum": momentum,
+
             "volume_ratio":
                 volume_ratio,
-            "consolidation":
-                consolidation[
-                    "range_percent"
-                ],
+
+            "consolidation_range":
+                consolidation_range,
+
             "ema20": ema20,
             "ema50": ema50,
             "ema200": ema200,
+
             "rsi": rsi,
+
             "atr": atr,
             "atr_percent": atr_percent,
+
             "close_position":
                 close_position,
-            "upper_wick":
-                upper_wick,
+
+            "upper_wick_percent":
+                upper_wick_percent,
+
             "spread": spread,
-            "score": score,
-            "quote_volume":
-                ticker[
-                    "quote_volume"
-                ]
+
+            "score": score
         }
 
     except Exception as e:
 
         print(
-            f"{symbol} ERROR:",
+            f"{symbol} ANALYSIS ERROR:",
             repr(e)
         )
 
@@ -1874,152 +1931,123 @@ def set_alert_time(
 
 
 # ============================================================
-# TELEGRAM MESSAGE
+# TELEGRAM SIGNAL
 # ============================================================
 
 def build_signal(
-    signal
+    result
 ):
 
     return (
-        "🟢 BINANCE SPOT 15M BREAKOUT\n"
+        "🟢 BINANCE SPOT 15M SIGNAL\n"
         "\n"
-        f"🪙 {signal['symbol']}\n"
-        f"💰 Price: {signal['price']:.12g}\n"
+
+        f"🪙 {result['symbol']}\n"
+        f"💰 Price: "
+        f"{result['price']:.12g}\n"
+        "\n"
+
+        "💎 MARKET DATA\n"
         f"💎 Market Cap: "
-        f"${signal['market_cap']:,.0f}\n"
-        "\n"
-        "⚡ 15M MOMENTUM\n"
-        f"📈 Momentum: "
-        f"+{signal['momentum']:.2f}%\n"
-        "\n"
-        "🚀 REAL BREAKOUT\n"
-        f"🔴 Resistance: "
-        f"{signal['resistance']:.12g}\n"
-        f"🚀 Breakout: "
-        f"+{signal['breakout_percent']:.2f}%\n"
-        "\n"
-        "📊 VOLUME\n"
-        f"🔥 Volume: "
-        f"{signal['volume_ratio']:.2f}x\n"
+        f"${result['market_cap']:,.0f}\n"
         f"💧 24H Volume: "
-        f"${signal['quote_volume']:,.0f}\n"
+        f"${result['quote_volume']:,.0f}\n"
+        f"↔️ Spread: "
+        f"{result['spread']:.3f}%\n"
         "\n"
-        "📐 TREND\n"
-        f"EMA20: {signal['ema20']:.12g}\n"
-        f"EMA50: {signal['ema50']:.12g}\n"
-        f"EMA200: {signal['ema200']:.12g}\n"
-        "🟢 EMA20 > EMA50 > EMA200\n"
+
+        "🚀 15M BREAKOUT\n"
+        f"🔴 Resistance: "
+        f"{result['resistance']:.12g}\n"
+        f"🚀 Breakout: "
+        f"+{result['breakout_percent']:.2f}%\n"
+        f"⚡ Momentum: "
+        f"+{result['momentum']:.2f}%\n"
+        f"📊 Volume: "
+        f"{result['volume_ratio']:.2f}x\n"
         "\n"
-        "📊 RSI / ATR\n"
-        f"RSI14: {signal['rsi']:.1f}\n"
-        f"ATR14: {signal['atr_percent']:.2f}%\n"
-        "\n"
-        "🕯️ CANDLE QUALITY\n"
-        f"Close Position: "
-        f"{signal['close_position']:.1f}%\n"
-        f"Upper Wick: "
-        f"{signal['upper_wick']:.1f}%\n"
-        "\n"
+
         "📦 CONSOLIDATION\n"
         f"5 Candle Range: "
-        f"{signal['consolidation']:.2f}%\n"
+        f"{result['consolidation_range']:.2f}%\n"
         "\n"
-        f"↔️ Spread: "
-        f"{signal['spread']:.3f}%\n"
+
+        "📈 TREND\n"
+        f"EMA20: "
+        f"{result['ema20']:.12g}\n"
+        f"EMA50: "
+        f"{result['ema50']:.12g}\n"
+        f"EMA200: "
+        f"{result['ema200']:.12g}\n"
+        "EMA20 > EMA50 > EMA200 ✅\n"
+        "\n"
+
+        "📐 INDICATORS\n"
+        f"RSI14: "
+        f"{result['rsi']:.1f}\n"
+        f"ATR14: "
+        f"{result['atr_percent']:.2f}%\n"
+        "\n"
+
+        "🕯️ CANDLE QUALITY\n"
+        f"Close Position: "
+        f"{result['close_position']:.1f}%\n"
+        f"Upper Wick: "
+        f"{result['upper_wick_percent']:.1f}%\n"
+        "\n"
+
         f"🏆 SCORE: "
-        f"{signal['score']}/100\n"
+        f"{result['score']}/100\n"
         "\n"
+
         "📚 500 CLOSED 15M CANDLES\n"
         "📚 Resistance = previous 100 candles\n"
         "📦 Consolidation = previous 5 candles\n"
+        "🕯️ Breakout = latest CLOSED 15M candle\n"
         "\n"
-        "🟢 Binance Spot USDT ONLY\n"
-        "💎 CMC Market Cap >= $200M\n"
+
+        "🟢 Binance USDT Spot ONLY\n"
         "❌ Solana OFF\n"
         "❌ Binance Square OFF\n"
         "\n"
+
         "⚠️ TELEGRAM ALERT ONLY\n"
         "❌ NO AUTOMATIC ORDER"
     )
 
 
 # ============================================================
-# MAIN SCAN LOOP
+# SCAN LOOP
 # ============================================================
 
 def binance_scan_loop():
 
     print()
-    print(
-        "=" * 65
-    )
-    print(
-        "🟢 BINANCE SPOT 15M ALERT BOT"
-    )
-    print(
-        "=" * 65
-    )
-    print(
-        "CMC MARKET CAP      : >= $200M"
-    )
-    print(
-        "BINANCE             : USDT SPOT ONLY"
-    )
-    print(
-        "24H VOLUME          : >= $10M"
-    )
-    print(
-        "TIMEFRAME           : 15M"
-    )
-    print(
-        "HISTORY             : 500 CLOSED"
-    )
-    print(
-        "RESISTANCE          : 100 CLOSED"
-    )
-    print(
-        "CONSOLIDATION       : 5 CANDLES"
-    )
-    print(
-        "BREAKOUT            : >= +0.5%"
-    )
-    print(
-        "MOMENTUM            : +1% TO +4%"
-    )
-    print(
-        "VOLUME              : >= 1.8x"
-    )
-    print(
-        "EMA                 : 20 > 50 > 200"
-    )
-    print(
-        "RSI                 : 50 - 75"
-    )
-    print(
-        "ATR14               : >= 0.20%"
-    )
-    print(
-        "CLOSE POSITION      : >= 75%"
-    )
-    print(
-        "UPPER WICK          : <= 25%"
-    )
-    print(
-        "SPREAD              : <= 0.15%"
-    )
-    print(
-        "SCORE               : >= 70"
-    )
-    print(
-        "COOLDOWN            : 24 HOURS"
-    )
-    print(
-        "AUTO ORDER          : OFF"
-    )
-    print(
-        "=" * 65
-    )
+    print("=" * 70)
+    print("🟢 BINANCE SPOT 15M ALERT BOT")
+    print("=" * 70)
+    print()
+    print("CMC MARKET CAP    : >= $200M")
+    print("BINANCE            : USDT SPOT ONLY")
+    print("24H VOLUME         : >= $10M")
+    print("TIMEFRAME          : 15M")
+    print("HISTORY            : 500 CLOSED CANDLES")
+    print("RESISTANCE         : 100 CANDLES")
+    print("CONSOLIDATION      : 5 CANDLES")
+    print("BREAKOUT           : >= +0.5%")
+    print("MOMENTUM           : +1% TO +4%")
+    print("VOLUME             : >= 1.8x")
+    print("EMA                : 20 > 50 > 200")
+    print("RSI                : 50 - 75")
+    print("ATR14              : ACTIVE")
+    print("CLOSE POSITION     : >= 75%")
+    print("UPPER WICK         : <= 25%")
+    print("SPREAD             : <= 0.15%")
+    print("SCORE              : >= 70")
+    print("COOLDOWN           : 24 HOURS")
+    print("TELEGRAM           : ON")
+    print("AUTO ORDER         : OFF")
+    print("=" * 70)
     print()
 
     while True:
@@ -2032,14 +2060,13 @@ def binance_scan_loop():
             # CMC
             # =================================================
 
-            market_caps = (
-                load_cmc_market_caps()
-            )
+            market_caps = load_cmc_market_caps()
 
             if not market_caps:
 
                 print(
-                    "[SCAN] CMC market-cap data unavailable."
+                    "SCAN STOPPED: "
+                    "CMC market-cap data unavailable."
                 )
 
                 time.sleep(
@@ -2047,19 +2074,19 @@ def binance_scan_loop():
                 )
 
                 continue
+
 
             # =================================================
             # BINANCE 24H
             # =================================================
 
-            tickers = (
-                get_24h_tickers()
-            )
+            tickers = get_24h_tickers()
 
             if not tickers:
 
                 print(
-                    "[SCAN] No Binance symbols passed 24H volume."
+                    "No Binance symbols "
+                    "passed 24H volume."
                 )
 
                 time.sleep(
@@ -2068,89 +2095,46 @@ def binance_scan_loop():
 
                 continue
 
+
+            print(
+                f"[24H FILTER] "
+                f"{len(tickers)} symbols "
+                f">= $10M"
+            )
+
+
             # =================================================
-            # CMC + BINANCE INTERSECTION
+            # CMC FILTER
             # =================================================
 
-            candidates = {}
-
-            for symbol, ticker in tickers.items():
-
-                info = spot_symbols.get(
-                    symbol
-                )
-
-                if not info:
-                    continue
-
-                base = info.get(
-                    "base",
-                    ""
-                ).upper()
-
-                market_cap = market_caps.get(
-                    base
-                )
-
-                if market_cap is None:
-                    continue
-
-                if market_cap < MIN_MARKET_CAP:
-                    continue
-
-                candidates[
-                    symbol
-                ] = {
-                    "ticker": ticker,
-                    "market_cap":
-                        market_cap
-                }
-
-            print()
-            print(
-                "[SCAN]"
+            candidates = filter_by_market_cap(
+                tickers,
+                market_caps
             )
 
             print(
-                "Binance 24H >= $10M:",
-                len(tickers)
+                f"[CMC FILTER] "
+                f"{len(candidates)} symbols "
+                f">= $200M"
             )
 
-            print(
-                "CMC >= $200M:",
-                len(market_caps)
-            )
-
-            print(
-                "Final candidates:",
-                len(candidates)
-            )
 
             if not candidates:
 
-                elapsed = (
-                    time.time()
-                    - cycle_start
-                )
-
                 print(
-                    f"[SCAN COMPLETE] "
-                    f"{elapsed:.1f}s | "
-                    "No candidates"
+                    "No symbols passed "
+                    "CMC market-cap filter."
                 )
 
                 time.sleep(
-                    max(
-                        1,
-                        SCAN_INTERVAL
-                        - elapsed
-                    )
+                    SCAN_INTERVAL
                 )
 
                 continue
 
+
             # =================================================
-            # PARALLEL ANALYSIS
+            # ANALYSIS
             # =================================================
 
             signals = 0
@@ -2161,17 +2145,14 @@ def binance_scan_loop():
 
                 futures = {}
 
-                for symbol, data in candidates.items():
-
-                    future = executor.submit(
-                        analyze_symbol,
-                        symbol,
-                        data["ticker"],
-                        data["market_cap"]
-                    )
+                for symbol, ticker in candidates.items():
 
                     futures[
-                        future
+                        executor.submit(
+                            analyze_symbol,
+                            symbol,
+                            ticker
+                        )
                     ] = symbol
 
                 for future in as_completed(
@@ -2184,35 +2165,72 @@ def binance_scan_loop():
 
                     try:
 
-                        signal = (
-                            future.result()
-                        )
+                        result = future.result()
 
-                        if not signal:
+                        if not result:
                             continue
 
-                        message = (
-                            build_signal(
-                                signal
-                            )
-                        )
+                        # -------------------------------------
+                        # Cooldown protection
+                        # -------------------------------------
 
                         set_alert_time(
                             symbol
                         )
 
-                        signals += 1
+                        message = build_signal(
+                            result
+                        )
+
+                        print()
+                        print(
+                            "================================"
+                        )
 
                         print(
-                            f"[SIGNAL] "
-                            f"{symbol} | "
-                            f"Score "
-                            f"{signal['score']}"
+                            "[SIGNAL]",
+                            symbol
+                        )
+
+                        print(
+                            "Score:",
+                            result["score"]
+                        )
+
+                        print(
+                            "Breakout:",
+                            f"{result['breakout_percent']:.2f}%"
+                        )
+
+                        print(
+                            "Momentum:",
+                            f"{result['momentum']:.2f}%"
+                        )
+
+                        print(
+                            "Volume:",
+                            f"{result['volume_ratio']:.2f}x"
+                        )
+
+                        print(
+                            "RSI:",
+                            f"{result['rsi']:.1f}"
+                        )
+
+                        print(
+                            "ATR:",
+                            f"{result['atr_percent']:.2f}%"
+                        )
+
+                        print(
+                            "================================"
                         )
 
                         send_telegram(
                             message
                         )
+
+                        signals += 1
 
                     except Exception as e:
 
@@ -2222,15 +2240,24 @@ def binance_scan_loop():
                             repr(e)
                         )
 
+
+            # =================================================
+            # COMPLETE
+            # =================================================
+
             elapsed = (
                 time.time()
                 - cycle_start
             )
 
+            print()
             print(
                 f"[SCAN COMPLETE] "
                 f"{elapsed:.1f}s | "
-                f"Signals: {signals}"
+                f"Candidates: "
+                f"{len(candidates)} | "
+                f"Signals: "
+                f"{signals}"
             )
 
         except Exception as e:
@@ -2240,6 +2267,11 @@ def binance_scan_loop():
                 repr(e)
             )
 
+
+        # =====================================================
+        # NEXT SCAN
+        # =====================================================
+
         elapsed = (
             time.time()
             - cycle_start
@@ -2247,8 +2279,7 @@ def binance_scan_loop():
 
         sleep_time = max(
             1,
-            SCAN_INTERVAL
-            - elapsed
+            SCAN_INTERVAL - elapsed
         )
 
         print(
@@ -2262,31 +2293,77 @@ def binance_scan_loop():
 
 
 # ============================================================
+# CMC TEST
+# ============================================================
+
+def test_cmc():
+
+    print()
+    print("=" * 60)
+    print("CMC TEST")
+    print("=" * 60)
+
+    if not CMC_API_KEY:
+
+        print(
+            "CMC TEST FAILED"
+        )
+
+        print(
+            "CMC_API_KEY is missing."
+        )
+
+        return False
+
+    data = load_cmc_market_caps(
+        force=True
+    )
+
+    if not data:
+
+        print(
+            "CMC TEST FAILED"
+        )
+
+        return False
+
+    print(
+        "CMC TEST PASSED"
+    )
+
+    print(
+        "Coins:",
+        len(data)
+    )
+
+    return True
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
 
     print()
-    print(
-        "=" * 65
-    )
-    print(
-        "🟢 BINANCE SPOT 15M ALERT BOT STARTING"
-    )
-    print(
-        "=" * 65
-    )
+    print("=" * 70)
+    print("🟢 BINANCE SPOT 15M ALERT BOT STARTING")
+    print("=" * 70)
+    print()
+    print("No 5M timeframe")
+    print("No Solana")
+    print("No Binance Square")
+    print("No automatic orders")
     print()
 
     # --------------------------------------------------------
-    # TELEGRAM
+    # ENV CHECK
     # --------------------------------------------------------
 
     if not TELEGRAM_BOT_TOKEN:
 
         print(
-            "ERROR: TELEGRAM_BOT_TOKEN missing."
+            "ERROR: TELEGRAM_BOT_TOKEN missing"
         )
 
         return
@@ -2294,22 +2371,11 @@ def main():
     if not TELEGRAM_CHAT_ID:
 
         print(
-            "ERROR: TELEGRAM_CHAT_ID missing."
+            "ERROR: TELEGRAM_CHAT_ID missing"
         )
 
         return
 
-    # --------------------------------------------------------
-    # CMC
-    # --------------------------------------------------------
-
-    if not CMC_API_KEY:
-
-        print(
-            "ERROR: CMC_API_KEY missing."
-        )
-
-        return
 
     # --------------------------------------------------------
     # BINANCE
@@ -2324,36 +2390,25 @@ def main():
 
         return
 
+
     # --------------------------------------------------------
-    # TEST CMC BEFORE STARTING
+    # CMC TEST
     # --------------------------------------------------------
 
-    market_caps = (
-        load_cmc_market_caps(
-            force=True
-        )
-    )
-
-    if not market_caps:
+    if not test_cmc():
 
         print()
         print(
-            "================================================"
+            "ERROR: CMC market-cap "
+            "data unavailable."
         )
-        print(
-            "CMC TEST FAILED"
-        )
+
         print(
             "Bot will NOT start."
         )
-        print(
-            "Check CMC_API_KEY in Railway Variables."
-        )
-        print(
-            "================================================"
-        )
 
         return
+
 
     # --------------------------------------------------------
     # TELEGRAM STARTUP
@@ -2361,27 +2416,28 @@ def main():
 
     send_telegram(
         "🟢 BINANCE SPOT 15M ALERT BOT STARTED\n\n"
-        "💎 CMC Market Cap >= $200M\n"
+        "💎 Market Cap >= $200M\n"
         "💧 24H Volume >= $10M\n"
-        "📊 15M Timeframe\n"
-        "📚 500 CLOSED 15M candles\n"
-        "🔴 Previous 100 candle resistance\n"
-        "📦 5 candle consolidation\n"
+        "⏱️ 15M Timeframe\n"
+        "📚 500 Closed Candles\n"
+        "🔴 100 Candle Resistance\n"
+        "📦 5 Candle Consolidation\n"
         "🚀 Breakout >= +0.5%\n"
         "⚡ Momentum +1% to +4%\n"
-        "🔥 Volume >= 1.8x\n"
+        "📊 Volume >= 1.8x\n"
         "📈 EMA20 > EMA50 > EMA200\n"
-        "📊 RSI 50-75\n"
-        "📐 ATR14 activity filter\n"
+        "📐 RSI 50-75\n"
+        "📐 ATR14 Active\n"
         "🕯️ Close Position >= 75%\n"
         "🕯️ Upper Wick <= 25%\n"
         "↔️ Spread <= 0.15%\n"
         "🏆 Score >= 70\n"
-        "⏱️ Cooldown 24 hours\n\n"
-        "🟢 Binance Spot USDT ONLY\n"
+        "⏳ Cooldown 24H\n\n"
+        "🟢 Binance USDT Spot ONLY\n"
         "⚠️ ALERT ONLY\n"
         "❌ NO AUTOMATIC ORDER"
     )
+
 
     # --------------------------------------------------------
     # START
