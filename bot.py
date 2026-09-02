@@ -9,14 +9,30 @@ from zoneinfo import ZoneInfo
 # BINANCE SPOT FVG ALERT BOT
 #
 # MARKET CAP > $300M
-# 1H: CLOSE > EMA20 > EMA50 > EMA100
-# 15M BEARISH FVG
+#
+# 1H TREND:
+# CLOSE > EMA20 > EMA50 > EMA100
+#
+# FVG:
+# 1) FIRST SEARCH 15M BEARISH FVG
+# 2) IF NO 15M FVG -> SEARCH 1H BEARISH FVG
+#
 # FVG MUST BE INSIDE 2ND CANDLE BODY
 # FVG SIZE >= 50% OF 2ND CANDLE BODY
+#
 # TARGET = 3% BELOW 2ND CANDLE CLOSE
-# IF PRICE RETURNS TO 2ND CLOSE BEFORE TARGET:
-#     CANCEL FVG
-#     GO BACK TO 1H TREND CHECK
+#
+# ACTIVE FVG:
+# - TARGET HIT -> SIGNAL -> FVG FINISHED
+# - PRICE RETURNS TO 2ND CLOSE -> CANCEL FVG
+#
+# WHILE FVG IS ACTIVE:
+# NEW FVGs ARE IGNORED
+#
+# AFTER FVG FINISHES:
+# GO BACK TO 1H TREND
+# THEN SEARCH 15M FVG
+# IF NONE -> SEARCH 1H FVG
 #
 # ALERT ONLY
 # NO AUTOMATIC ORDERS
@@ -80,8 +96,14 @@ session.headers.update({
 # STATE
 # ============================================================
 
+# Only ONE active FVG per coin
 active_fvgs = {}
 
+# Last completed/cancelled FVG
+# Used to prevent old FVG from being detected again
+last_finished_fvg = {}
+
+# Signal cooldown
 last_signal_time = {}
 
 
@@ -90,8 +112,15 @@ last_signal_time = {}
 # ============================================================
 
 def log(message):
-    now = datetime.now(AZ_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
+
+    now = datetime.now(AZ_TZ).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    print(
+        f"[{now}] {message}",
+        flush=True
+    )
 
 
 # ============================================================
@@ -100,7 +129,10 @@ def log(message):
 
 def send_telegram(message):
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
         log("Telegram credentials missing.")
         return False
 
@@ -117,6 +149,7 @@ def send_telegram(message):
     }
 
     try:
+
         response = session.post(
             url,
             json=payload,
@@ -128,11 +161,15 @@ def send_telegram(message):
 
         log(
             f"Telegram error: "
-            f"{response.status_code} {response.text[:300]}"
+            f"{response.status_code} "
+            f"{response.text[:300]}"
         )
 
     except Exception as e:
-        log(f"Telegram exception: {e}")
+
+        log(
+            f"Telegram exception: {e}"
+        )
 
     return False
 
@@ -143,17 +180,27 @@ def send_telegram(message):
 
 def get_binance_symbols():
 
-    url = f"{BINANCE_URL}/api/v3/exchangeInfo"
+    url = (
+        f"{BINANCE_URL}/api/v3/exchangeInfo"
+    )
 
     try:
-        response = session.get(url, timeout=15)
+
+        response = session.get(
+            url,
+            timeout=15
+        )
+
         response.raise_for_status()
 
         data = response.json()
 
         symbols = []
 
-        for item in data.get("symbols", []):
+        for item in data.get(
+            "symbols",
+            []
+        ):
 
             if item.get("status") != "TRADING":
                 continue
@@ -161,7 +208,9 @@ def get_binance_symbols():
             if item.get("quoteAsset") != "USDT":
                 continue
 
-            if not item.get("isSpotTradingAllowed"):
+            if not item.get(
+                "isSpotTradingAllowed"
+            ):
                 continue
 
             symbol = item.get("symbol")
@@ -184,12 +233,19 @@ def get_binance_symbols():
                 "base": base_asset
             })
 
-        log(f"Binance USDT Spot symbols: {len(symbols)}")
+        log(
+            f"Binance USDT Spot symbols: "
+            f"{len(symbols)}"
+        )
 
         return symbols
 
     except Exception as e:
-        log(f"ExchangeInfo error: {e}")
+
+        log(
+            f"ExchangeInfo error: {e}"
+        )
+
         return []
 
 
@@ -200,10 +256,17 @@ def get_binance_symbols():
 def get_market_caps():
 
     if not CMC_API_KEY:
-        log("CMC_API_KEY is missing.")
+
+        log(
+            "CMC_API_KEY is missing."
+        )
+
         return {}
 
-    url = f"{CMC_URL}/v1/cryptocurrency/listings/latest"
+    url = (
+        f"{CMC_URL}/v1/cryptocurrency/"
+        f"listings/latest"
+    )
 
     headers = {
         "X-CMC_PRO_API_KEY": CMC_API_KEY,
@@ -231,23 +294,38 @@ def get_market_caps():
 
         result = {}
 
-        for coin in data.get("data", []):
+        for coin in data.get(
+            "data",
+            []
+        ):
 
             symbol = coin.get("symbol")
 
-            quote = coin.get("quote", {}).get("USD", {})
+            quote = coin.get(
+                "quote",
+                {}
+            ).get(
+                "USD",
+                {}
+            )
 
-            market_cap = quote.get("market_cap")
+            market_cap = quote.get(
+                "market_cap"
+            )
 
             if not symbol or not market_cap:
                 continue
 
-            # Keep highest market cap if duplicate symbol exists
+            # Keep highest market cap if
+            # duplicate symbol exists
             if (
                 symbol not in result
                 or market_cap > result[symbol]
             ):
-                result[symbol] = float(market_cap)
+
+                result[symbol] = float(
+                    market_cap
+                )
 
         log(
             f"CoinMarketCap coins loaded: "
@@ -257,7 +335,11 @@ def get_market_caps():
         return result
 
     except Exception as e:
-        log(f"CoinMarketCap error: {e}")
+
+        log(
+            f"CoinMarketCap error: {e}"
+        )
+
         return {}
 
 
@@ -265,9 +347,15 @@ def get_market_caps():
 # BINANCE KLINES
 # ============================================================
 
-def get_klines(symbol, interval, limit):
+def get_klines(
+    symbol,
+    interval,
+    limit
+):
 
-    url = f"{BINANCE_URL}/api/v3/klines"
+    url = (
+        f"{BINANCE_URL}/api/v3/klines"
+    )
 
     params = {
         "symbol": symbol,
@@ -301,18 +389,27 @@ def get_klines(symbol, interval, limit):
 # EMA
 # ============================================================
 
-def calculate_ema(values, period):
+def calculate_ema(
+    values,
+    period
+):
 
     if len(values) < period:
         return None
 
-    multiplier = 2 / (period + 1)
+    multiplier = 2 / (
+        period + 1
+    )
 
-    ema = sum(values[:period]) / period
+    ema = sum(
+        values[:period]
+    ) / period
 
     for price in values[period:]:
+
         ema = (
-            (price - ema) * multiplier
+            (price - ema)
+            * multiplier
             + ema
         )
 
@@ -334,8 +431,7 @@ def check_1h_bullish(symbol):
     if len(candles) < EMA_SLOW + 5:
         return None
 
-    # Last candle may still be forming.
-    # Use only CLOSED candles.
+    # Ignore currently forming candle
     closed = candles[:-1]
 
     closes = [
@@ -377,42 +473,56 @@ def check_1h_bullish(symbol):
     )
 
     return {
+
         "bullish": bullish,
+
         "close": last_close,
+
         "ema20": ema20,
+
         "ema50": ema50,
+
         "ema100": ema100
     }
 
 
 # ============================================================
 # BEARISH FVG DETECTION
+#
+# IMPORTANT:
+# We search from newest to oldest.
+#
+# But ONLY return an FVG that is newer than
+# last_finished_fvg for this symbol/timeframe.
+#
+# This prevents the bot from repeatedly taking
+# an old FVG.
 # ============================================================
 
-def find_bearish_fvg(symbol):
+def find_bearish_fvg(
+    symbol,
+    interval,
+    limit
+):
 
     candles = get_klines(
         symbol,
-        INTERVAL_15M,
-        KLINE_LIMIT_15M
+        interval,
+        limit
     )
 
     if len(candles) < 10:
         return None
 
-    # Only closed 15M candles
+    # Only closed candles
     closed = candles[:-1]
 
-    # Search from newest formation backwards
-    # We use three consecutive candles:
-    #
-    # candle 1
-    # candle 2
-    # candle 3
-    #
-    # Bearish FVG:
-    # candle1 LOW > candle3 HIGH
+    # Last completed FVG for this timeframe
+    finished_time = last_finished_fvg.get(
+        (symbol, interval)
+    )
 
+    # Search newest formation first
     for i in range(
         len(closed) - 3,
         -1,
@@ -423,6 +533,20 @@ def find_bearish_fvg(symbol):
         c2 = closed[i + 1]
         c3 = closed[i + 2]
 
+        c1_time = int(c1[0])
+        c2_time = int(c2[0])
+        c3_time = int(c3[0])
+
+        # ----------------------------------------------------
+        # Do not use an FVG that was already finished
+        # ----------------------------------------------------
+
+        if (
+            finished_time is not None
+            and c3_time <= finished_time
+        ):
+            continue
+
         c1_low = float(c1[3])
 
         c2_open = float(c2[1])
@@ -432,22 +556,27 @@ def find_bearish_fvg(symbol):
 
         # ----------------------------------------------------
         # BEARISH FVG
+        #
+        # Candle 1 LOW > Candle 3 HIGH
         # ----------------------------------------------------
 
-        if not (c1_low > c3_high):
+        if not (
+            c1_low > c3_high
+        ):
             continue
 
         fvg_low = c3_high
         fvg_high = c1_low
 
-        fvg_size = fvg_high - fvg_low
+        fvg_size = (
+            fvg_high - fvg_low
+        )
 
         if fvg_size <= 0:
             continue
 
         # ----------------------------------------------------
         # 2ND CANDLE BODY
-        # ONLY OPEN/CLOSE
         # ----------------------------------------------------
 
         body_low = min(
@@ -460,7 +589,9 @@ def find_bearish_fvg(symbol):
             c2_close
         )
 
-        body_size = body_high - body_low
+        body_size = (
+            body_high - body_low
+        )
 
         if body_size <= 0:
             continue
@@ -479,45 +610,61 @@ def find_bearish_fvg(symbol):
             continue
 
         # ----------------------------------------------------
-        # FVG MUST BE AT LEAST 50% OF BODY
+        # FVG >= 50% OF BODY
         # ----------------------------------------------------
 
         fvg_ratio = (
             fvg_size / body_size
         )
 
-        if fvg_ratio < FVG_MIN_RATIO:
+        if (
+            fvg_ratio
+            < FVG_MIN_RATIO
+        ):
             continue
 
         # ----------------------------------------------------
-        # 3% TARGET FROM 2ND CANDLE CLOSE
+        # TARGET = 3% BELOW 2ND CANDLE CLOSE
         # ----------------------------------------------------
 
         target_price = (
-            c2_close *
-            (1 - DROP_PERCENT / 100)
+            c2_close
+            * (
+                1
+                - DROP_PERCENT / 100
+            )
         )
 
         return {
+
             "symbol": symbol,
 
-            "candle1_time": int(c1[0]),
-            "candle2_time": int(c2[0]),
-            "candle3_time": int(c3[0]),
+            "interval": interval,
+
+            "candle1_time": c1_time,
+
+            "candle2_time": c2_time,
+
+            "candle3_time": c3_time,
 
             "candle1_low": c1_low,
 
             "candle2_open": c2_open,
+
             "candle2_close": c2_close,
 
             "candle3_high": c3_high,
 
             "fvg_low": fvg_low,
+
             "fvg_high": fvg_high,
+
             "fvg_size": fvg_size,
 
             "body_low": body_low,
+
             "body_high": body_high,
+
             "body_size": body_size,
 
             "fvg_ratio": fvg_ratio,
@@ -531,12 +678,55 @@ def find_bearish_fvg(symbol):
 
 
 # ============================================================
+# FIND FVG
+#
+# PRIORITY:
+# 1. 15M
+# 2. If no 15M -> 1H
+# ============================================================
+
+def find_best_fvg(symbol):
+
+    # --------------------------------------------------------
+    # FIRST: 15M FVG
+    # --------------------------------------------------------
+
+    fvg_15m = find_bearish_fvg(
+        symbol,
+        INTERVAL_15M,
+        KLINE_LIMIT_15M
+    )
+
+    if fvg_15m:
+
+        return fvg_15m
+
+    # --------------------------------------------------------
+    # SECOND: 1H FVG
+    # --------------------------------------------------------
+
+    fvg_1h = find_bearish_fvg(
+        symbol,
+        INTERVAL_1H,
+        KLINE_LIMIT_1H
+    )
+
+    if fvg_1h:
+
+        return fvg_1h
+
+    return None
+
+
+# ============================================================
 # CURRENT PRICE
 # ============================================================
 
 def get_current_price(symbol):
 
-    url = f"{BINANCE_URL}/api/v3/ticker/price"
+    url = (
+        f"{BINANCE_URL}/api/v3/ticker/price"
+    )
 
     params = {
         "symbol": symbol
@@ -554,9 +744,12 @@ def get_current_price(symbol):
 
         data = response.json()
 
-        return float(data["price"])
+        return float(
+            data["price"]
+        )
 
     except Exception:
+
         return None
 
 
@@ -566,7 +759,9 @@ def get_current_price(symbol):
 
 def signal_allowed(symbol):
 
-    last = last_signal_time.get(symbol)
+    last = last_signal_time.get(
+        symbol
+    )
 
     if last is None:
         return True
@@ -581,37 +776,65 @@ def signal_allowed(symbol):
 # SEND SIGNAL
 # ============================================================
 
-def send_signal(fvg, market_cap):
+def send_signal(
+    fvg,
+    market_cap
+):
 
     symbol = fvg["symbol"]
 
-    if not signal_allowed(symbol):
+    if not signal_allowed(
+        symbol
+    ):
+
         log(
-            f"{symbol}: signal cooldown active."
+            f"{symbol}: "
+            f"signal cooldown active."
         )
+
         return
 
-    price = get_current_price(symbol)
+    price = get_current_price(
+        symbol
+    )
 
     if price is None:
         return
 
-    target = fvg["target_price"]
+    target = fvg[
+        "target_price"
+    ]
+
+    timeframe = fvg[
+        "interval"
+    ]
 
     message = (
+
         "🚨 <b>FVG SIGNAL</b>\n\n"
 
         f"🪙 <b>{symbol}</b>\n"
+
         f"💰 Market Cap: "
         f"${market_cap:,.0f}\n\n"
 
         "📊 <b>1H TREND</b>\n"
-        f"Close: {fvg.get('trend_close', 0):.8f}\n"
-        f"EMA20: {fvg.get('ema20', 0):.8f}\n"
-        f"EMA50: {fvg.get('ema50', 0):.8f}\n"
-        f"EMA100: {fvg.get('ema100', 0):.8f}\n\n"
 
-        "📉 <b>15M BEARISH FVG</b>\n"
+        f"Close: "
+        f"{fvg.get('trend_close', 0):.8f}\n"
+
+        f"EMA20: "
+        f"{fvg.get('ema20', 0):.8f}\n"
+
+        f"EMA50: "
+        f"{fvg.get('ema50', 0):.8f}\n"
+
+        f"EMA100: "
+        f"{fvg.get('ema100', 0):.8f}\n\n"
+
+        f"📉 <b>{timeframe} "
+        f"BEARISH FVG</b>\n"
+
         f"FVG: "
         f"{fvg['fvg_low']:.8f} - "
         f"{fvg['fvg_high']:.8f}\n"
@@ -625,27 +848,33 @@ def send_signal(fvg, market_cap):
         f"FVG/Body: "
         f"{fvg['fvg_ratio'] * 100:.2f}%\n\n"
 
-        f"🎯 <b>3% LEVEL:</b> "
+        f"🎯 <b>3% TARGET:</b> "
         f"{target:.8f}\n"
 
         f"💵 Current Price: "
         f"{price:.8f}\n\n"
 
         "⚠️ <b>ALERT ONLY</b>\n"
+
         "No automatic order."
     )
 
-    if send_telegram(message):
+    if send_telegram(
+        message
+    ):
 
-        last_signal_time[symbol] = time.time()
+        last_signal_time[
+            symbol
+        ] = time.time()
 
         log(
-            f"🚨 SIGNAL SENT: {symbol}"
+            f"🚨 SIGNAL SENT: "
+            f"{symbol}"
         )
 
 
 # ============================================================
-# SAVE ACTIVE FVG
+# ACTIVATE FVG
 # ============================================================
 
 def activate_fvg(
@@ -653,23 +882,69 @@ def activate_fvg(
     trend
 ):
 
-    symbol = fvg["symbol"]
+    symbol = fvg[
+        "symbol"
+    ]
 
-    fvg["trend_close"] = trend["close"]
-    fvg["ema20"] = trend["ema20"]
-    fvg["ema50"] = trend["ema50"]
-    fvg["ema100"] = trend["ema100"]
+    fvg["trend_close"] = (
+        trend["close"]
+    )
 
-    active_fvgs[symbol] = fvg
+    fvg["ema20"] = (
+        trend["ema20"]
+    )
+
+    fvg["ema50"] = (
+        trend["ema50"]
+    )
+
+    fvg["ema100"] = (
+        trend["ema100"]
+    )
+
+    # Only ONE active FVG per coin
+    active_fvgs[
+        symbol
+    ] = fvg
 
     log(
         f"{symbol}: "
-        f"NEW FVG | "
-        f"FVG={fvg['fvg_low']:.8f}-"
+        f"NEW {fvg['interval']} FVG | "
+        f"FVG="
+        f"{fvg['fvg_low']:.8f}-"
         f"{fvg['fvg_high']:.8f} | "
-        f"Body={fvg['body_size']:.8f} | "
-        f"Ratio={fvg['fvg_ratio'] * 100:.2f}% | "
-        f"Target={fvg['target_price']:.8f}"
+        f"Body="
+        f"{fvg['body_size']:.8f} | "
+        f"Ratio="
+        f"{fvg['fvg_ratio'] * 100:.2f}% | "
+        f"Target="
+        f"{fvg['target_price']:.8f}"
+    )
+
+
+# ============================================================
+# FINISH FVG
+# ============================================================
+
+def finish_fvg(
+    symbol,
+    fvg
+):
+
+    # Remember the FVG that has finished
+    last_finished_fvg[
+        (
+            symbol,
+            fvg["interval"]
+        )
+    ] = fvg[
+        "candle3_time"
+    ]
+
+    # Remove active FVG
+    active_fvgs.pop(
+        symbol,
+        None
     )
 
 
@@ -682,18 +957,27 @@ def monitor_active_fvg(
     market_cap
 ):
 
-    fvg = active_fvgs.get(symbol)
+    fvg = active_fvgs.get(
+        symbol
+    )
 
     if not fvg:
         return
 
-    price = get_current_price(symbol)
+    price = get_current_price(
+        symbol
+    )
 
     if price is None:
         return
 
-    close2 = fvg["candle2_close"]
-    target = fvg["target_price"]
+    close2 = fvg[
+        "candle2_close"
+    ]
+
+    target = fvg[
+        "target_price"
+    ]
 
     # --------------------------------------------------------
     # TARGET HIT FIRST
@@ -703,6 +987,7 @@ def monitor_active_fvg(
 
         log(
             f"{symbol}: "
+            f"{fvg['interval']} "
             f"3% TARGET HIT "
             f"price={price:.8f}"
         )
@@ -712,10 +997,10 @@ def monitor_active_fvg(
             market_cap
         )
 
-        # Old FVG is finished.
-        active_fvgs.pop(
+        # FVG is finished
+        finish_fvg(
             symbol,
-            None
+            fvg
         )
 
         return
@@ -728,24 +1013,22 @@ def monitor_active_fvg(
 
         log(
             f"{symbol}: "
+            f"{fvg['interval']} "
             f"FVG CANCELLED - "
-            f"price returned to 2nd close."
+            f"price returned to "
+            f"2nd close."
         )
 
-        active_fvgs.pop(
+        finish_fvg(
             symbol,
-            None
+            fvg
         )
-
-        # Important:
-        # We do NOT create another FVG here.
-        # Main scanner will return to 1H first.
 
         return
 
 
 # ============================================================
-# ANALYZE NEW SYMBOL
+# ANALYZE SYMBOL
 # ============================================================
 
 def analyze_symbol(
@@ -753,14 +1036,21 @@ def analyze_symbol(
     market_caps
 ):
 
-    symbol = symbol_data["symbol"]
-    base = symbol_data["base"]
+    symbol = symbol_data[
+        "symbol"
+    ]
+
+    base = symbol_data[
+        "base"
+    ]
 
     # --------------------------------------------------------
     # MARKET CAP
     # --------------------------------------------------------
 
-    market_cap = market_caps.get(base)
+    market_cap = market_caps.get(
+        base
+    )
 
     if market_cap is None:
         return
@@ -769,7 +1059,11 @@ def analyze_symbol(
         return
 
     # --------------------------------------------------------
-    # ACTIVE FVG?
+    # ACTIVE FVG
+    #
+    # IMPORTANT:
+    # If an FVG is active, we DO NOT SEARCH
+    # FOR ANOTHER FVG.
     # --------------------------------------------------------
 
     if symbol in active_fvgs:
@@ -785,7 +1079,9 @@ def analyze_symbol(
     # 1H TREND
     # --------------------------------------------------------
 
-    trend = check_1h_bullish(symbol)
+    trend = check_1h_bullish(
+        symbol
+    )
 
     if not trend:
         return
@@ -794,27 +1090,22 @@ def analyze_symbol(
         return
 
     # --------------------------------------------------------
-    # 15M FVG
+    # FVG SEARCH
+    #
+    # 15M FIRST
+    # IF NONE -> 1H
     # --------------------------------------------------------
 
-    fvg = find_bearish_fvg(symbol)
+    fvg = find_best_fvg(
+        symbol
+    )
 
     if not fvg:
         return
 
     # --------------------------------------------------------
-    # Avoid repeatedly activating same FVG
+    # ACTIVATE
     # --------------------------------------------------------
-
-    previous = active_fvgs.get(symbol)
-
-    if previous:
-
-        if (
-            previous["candle3_time"]
-            == fvg["candle3_time"]
-        ):
-            return
 
     activate_fvg(
         fvg,
@@ -829,18 +1120,29 @@ def analyze_symbol(
 def scan():
 
     log("=" * 60)
-    log("Starting market scan...")
+
+    log(
+        "Starting market scan..."
+    )
 
     symbols = get_binance_symbols()
 
     if not symbols:
-        log("No Binance symbols.")
+
+        log(
+            "No Binance symbols."
+        )
+
         return
 
     market_caps = get_market_caps()
 
     if not market_caps:
-        log("No market cap data.")
+
+        log(
+            "No market cap data."
+        )
+
         return
 
     eligible = []
@@ -855,17 +1157,17 @@ def scan():
             continue
 
         if market_cap > MIN_MARKET_CAP:
-            eligible.append(item)
+
+            eligible.append(
+                item
+            )
 
     log(
         f"Market Cap > $300M: "
         f"{len(eligible)} coins"
     )
 
-    for index, item in enumerate(
-        eligible,
-        start=1
-    ):
+    for item in eligible:
 
         try:
 
@@ -881,7 +1183,7 @@ def scan():
                 f"analysis error: {e}"
             )
 
-        # Small pause to avoid hammering API
+        # Small pause
         time.sleep(0.05)
 
     log(
@@ -893,24 +1195,27 @@ def scan():
 
 
 # ============================================================
-# STARTUP
+# STARTUP CHECK
 # ============================================================
 
 def startup_check():
 
     if not CMC_API_KEY:
+
         log(
             "ERROR: CMC_API_KEY "
             "environment variable is missing."
         )
 
     if not TELEGRAM_BOT_TOKEN:
+
         log(
             "ERROR: TELEGRAM_BOT_TOKEN "
             "environment variable is missing."
         )
 
     if not TELEGRAM_CHAT_ID:
+
         log(
             "ERROR: TELEGRAM_CHAT_ID "
             "environment variable is missing."
@@ -923,12 +1228,26 @@ def startup_check():
     ):
 
         send_telegram(
+
             "🤖 <b>FVG BOT STARTED</b>\n\n"
+
             "Market Cap > $300M\n"
-            "1H: Close > EMA20 > EMA50 > EMA100\n"
-            "15M Bearish FVG\n"
-            "FVG ≥ 50% of 2nd candle body\n"
+
+            "1H: "
+            "Close > EMA20 > EMA50 > EMA100\n"
+
+            "FVG Priority:\n"
+            "1️⃣ 15M Bearish FVG\n"
+            "2️⃣ If no 15M -> 1H Bearish FVG\n\n"
+
+            "FVG inside 2nd candle body\n"
+
+            "FVG ≥ 50% of body\n"
+
             "3% target from 2nd candle Close\n\n"
+
+            "Only ONE active FVG per coin\n"
+
             "⚠️ Alert Only"
         )
 
@@ -939,10 +1258,29 @@ def startup_check():
 
 def main():
 
-    log("==========================================")
-    log("BINANCE FVG ALERT BOT")
-    log("ALERT ONLY - NO AUTOMATIC ORDERS")
-    log("==========================================")
+    log(
+        "=========================================="
+    )
+
+    log(
+        "BINANCE FVG ALERT BOT"
+    )
+
+    log(
+        "15M FVG -> 1H FVG FALLBACK"
+    )
+
+    log(
+        "ONE ACTIVE FVG PER COIN"
+    )
+
+    log(
+        "ALERT ONLY - NO AUTOMATIC ORDERS"
+    )
+
+    log(
+        "=========================================="
+    )
 
     startup_check()
 
@@ -960,7 +1298,9 @@ def main():
                 f"MAIN LOOP ERROR: {e}"
             )
 
-        elapsed = time.time() - start
+        elapsed = (
+            time.time() - start
+        )
 
         sleep_time = max(
             1,
@@ -972,7 +1312,9 @@ def main():
             f"{sleep_time:.1f}s"
         )
 
-        time.sleep(sleep_time)
+        time.sleep(
+            sleep_time
+        )
 
 
 # ============================================================
@@ -980,4 +1322,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
