@@ -4,67 +4,135 @@ import requests
 from datetime import datetime, timezone
 
 
-# =========================================================
-# CONFIG
-# =========================================================
+# ============================================================
+# BINANCE SPOT BEAR FVG ALERT BOT
+#
+# STRATEGY
+#
+# 1) Binance Spot USDT pairs
+# 2) CoinMarketCap Market Cap > $300M
+# 3) 1H trend:
+#       Close > EMA20 > EMA50 > EMA100
+# 4) First search 15M Bear FVG
+#    If no valid 15M FVG -> search 1H Bear FVG
+# 5) Bear FVG:
+#       Candle 1 Low > Candle 3 High
+#       Candle 1 is bearish
+#       Candle 2 is bearish
+#       FVG completely inside Candle 2 Open/Close body
+#       FVG size >= 50% of Candle 2 body
+# 6) FVG becomes active
+# 7) Active FVG:
+#       Price <= 3rd candle High - 1.7%
+#           -> Telegram signal
+#
+#       Price > 3rd candle High
+#           -> FVG CANCEL
+#
+# 8) After TARGET or CANCEL:
+#       Forget old FVG
+#       Return to 1H trend
+#       Search for a NEW FVG
+# 9) Scan every 60 seconds
+# 10) CMC refresh every 5 minutes
+# ============================================================
+
+
+# ============================================================
+# API SETTINGS
+# ============================================================
 
 CMC_API_KEY = os.getenv("CMC_API_KEY")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
+
+# ============================================================
+# STRATEGY SETTINGS
+# ============================================================
+
 MIN_MARKET_CAP = 300_000_000
 
-# FVG must be at least 50% of 2nd candle body
 FVG_MIN_RATIO = 0.50
 
-# Target = 3% below 3rd candle HIGH
-DROP_PERCENT = 3.0
+TARGET_DROP_PERCENT = 1.7
 
-# Main market scan
 SCAN_INTERVAL = 60
 
-# CoinMarketCap market-cap cache
-# CMC is refreshed only once every 15 minutes
-CMC_CACHE_SECONDS = 15 * 60
-
-# Telegram signal cooldown
-SIGNAL_COOLDOWN = 24 * 60 * 60
+CMC_CACHE_SECONDS = 5 * 60
 
 
-# =========================================================
-# GLOBAL STATE
-# =========================================================
+# ============================================================
+# BOT STATE
+# ============================================================
 
+# One active FVG per symbol
 active_fvgs = {}
 
-last_finished_fvg = {}
+# Last processed FVG formation time.
+#
+# This is NOT an old-FVG blacklist.
+# It only prevents the exact same already-processed
+# candle formation from being activated again.
+#
+# Key:
+#     (symbol, interval)
+#
+# Value:
+#     3rd candle open time
+last_processed_fvg = {}
 
-last_signal_time = {}
 
+# CMC cache
 market_cap_cache = {}
-
 market_cap_cache_time = 0
 
 
-# =========================================================
-# LOG
-# =========================================================
+# Binance symbols cache
+binance_symbols_cache = []
+binance_symbols_cache_time = 0
 
-def log(message):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
+SYMBOL_CACHE_SECONDS = 60 * 60
 
 
-# =========================================================
+# ============================================================
+# SESSION
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": "Bear-FVG-Bot/1.0"
+})
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def format_time(timestamp_ms):
+    dt = datetime.fromtimestamp(
+        timestamp_ms / 1000,
+        tz=timezone.utc
+    )
+
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ============================================================
 # TELEGRAM
-# =========================================================
+# ============================================================
 
 def send_telegram(message):
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram credentials missing.")
+        print("Telegram credentials missing.")
         return False
 
     url = (
@@ -78,7 +146,7 @@ def send_telegram(message):
     }
 
     try:
-        response = requests.post(
+        response = session.post(
             url,
             json=payload,
             timeout=15
@@ -89,74 +157,115 @@ def send_telegram(message):
         return True
 
     except Exception as e:
-        log(f"Telegram error: {e}")
+        print(f"Telegram error: {e}")
         return False
 
 
-# =========================================================
-# BINANCE
-# =========================================================
+# ============================================================
+# BINANCE REQUEST
+# ============================================================
 
-def get_binance_usdt_symbols():
+def binance_get(endpoint, params=None):
 
-    url = f"{BINANCE_BASE_URL}/api/v3/exchangeInfo"
+    url = BINANCE_BASE_URL + endpoint
 
     try:
-
-        response = requests.get(
+        response = session.get(
             url,
-            timeout=20
+            params=params,
+            timeout=15
         )
 
         response.raise_for_status()
 
-        data = response.json()
-
-        symbols = []
-
-        for item in data.get("symbols", []):
-
-            if (
-                item.get("status") == "TRADING"
-                and item.get("quoteAsset") == "USDT"
-                and item.get("isSpotTradingAllowed") is True
-            ):
-                symbols.append(item["symbol"])
-
-        log(
-            f"Binance USDT Spot symbols: "
-            f"{len(symbols)}"
-        )
-
-        return symbols
+        return response.json()
 
     except Exception as e:
-
-        log(f"Binance symbols error: {e}")
-
-        return []
+        print(f"Binance error [{endpoint}]: {e}")
+        return None
 
 
-# =========================================================
+# ============================================================
+# BINANCE SPOT USDT SYMBOLS
+# ============================================================
+
+def get_binance_spot_symbols():
+
+    global binance_symbols_cache
+    global binance_symbols_cache_time
+
+    current_time = time.time()
+
+    if (
+        binance_symbols_cache
+        and current_time - binance_symbols_cache_time
+        < SYMBOL_CACHE_SECONDS
+    ):
+        return binance_symbols_cache
+
+    data = binance_get("/api/v3/exchangeInfo")
+
+    if not data:
+        return binance_symbols_cache
+
+    symbols = []
+
+    for item in data.get("symbols", []):
+
+        if item.get("status") != "TRADING":
+            continue
+
+        if item.get("quoteAsset") != "USDT":
+            continue
+
+        if not item.get("isSpotTradingAllowed", False):
+            continue
+
+        symbol = item.get("symbol")
+        base_asset = item.get("baseAsset")
+
+        if not symbol or not base_asset:
+            continue
+
+        symbols.append({
+            "symbol": symbol,
+            "base_asset": base_asset
+        })
+
+    binance_symbols_cache = symbols
+    binance_symbols_cache_time = current_time
+
+    print(f"Binance Spot USDT pairs: {len(symbols)}")
+
+    return symbols
+
+
+# ============================================================
 # COINMARKETCAP
-# =========================================================
+# ============================================================
 
-def fetch_market_caps_from_cmc():
+def get_market_caps():
 
     global market_cap_cache
     global market_cap_cache_time
 
-    if not CMC_API_KEY:
-        log("CMC_API_KEY is missing.")
+    current_time = time.time()
+
+    # 5 minute cache
+    if (
+        market_cap_cache
+        and current_time - market_cap_cache_time
+        < CMC_CACHE_SECONDS
+    ):
         return market_cap_cache
 
-    url = (
-        "https://pro-api.coinmarketcap.com/"
-        "v1/cryptocurrency/listings/latest"
-    )
+    if not CMC_API_KEY:
+        print("CMC_API_KEY missing.")
+        return market_cap_cache
+
+    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 
     headers = {
-        "Accept": "application/json",
         "X-CMC_PRO_API_KEY": CMC_API_KEY
     }
 
@@ -166,213 +275,156 @@ def fetch_market_caps_from_cmc():
         "convert": "USD"
     }
 
-    max_retries = 4
-
-    for attempt in range(max_retries):
-
-        try:
-
-            response = requests.get(
-                url,
-                headers=headers,
-                params=params,
-                timeout=30
-            )
-
-            # -------------------------------------------------
-            # 429 RATE LIMIT
-            # -------------------------------------------------
-
-            if response.status_code == 429:
-
-                wait_seconds = min(
-                    60,
-                    5 * (2 ** attempt)
-                )
-
-                log(
-                    "CoinMarketCap 429 "
-                    f"rate limit. "
-                    f"Retry in {wait_seconds}s..."
-                )
-
-                time.sleep(wait_seconds)
-
-                continue
-
-            response.raise_for_status()
-
-            result = response.json()
-
-            data = result.get("data", [])
-
-            if not data:
-
-                log("CoinMarketCap returned no data.")
-
-                return market_cap_cache
-
-            new_cache = {}
-
-            for coin in data:
-
-                symbol = coin.get("symbol")
-
-                quote = (
-                    coin.get("quote", {})
-                    .get("USD", {})
-                )
-
-                market_cap = quote.get("market_cap")
-
-                if not symbol or market_cap is None:
-                    continue
-
-                # If duplicate symbols exist,
-                # keep the highest market cap.
-                if (
-                    symbol not in new_cache
-                    or market_cap > new_cache[symbol]
-                ):
-                    new_cache[symbol] = market_cap
-
-            market_cap_cache = new_cache
-            market_cap_cache_time = time.time()
-
-            log(
-                f"CoinMarketCap coins loaded: "
-                f"{len(market_cap_cache)}"
-            )
-
-            return market_cap_cache
-
-        except requests.exceptions.RequestException as e:
-
-            log(
-                f"CoinMarketCap request error: {e}"
-            )
-
-            if attempt < max_retries - 1:
-
-                wait_seconds = min(
-                    30,
-                    2 ** attempt
-                )
-
-                log(
-                    f"Retry in {wait_seconds}s..."
-                )
-
-                time.sleep(wait_seconds)
-
-        except Exception as e:
-
-            log(
-                f"CoinMarketCap error: {e}"
-            )
-
-            break
-
-    # ---------------------------------------------------------
-    # IMPORTANT:
-    # If CMC fails, KEEP OLD CACHE
-    # ---------------------------------------------------------
-
-    if market_cap_cache:
-
-        log(
-            "CMC unavailable. "
-            "Using previous market-cap cache."
-        )
-
-    else:
-
-        log(
-            "CMC unavailable and "
-            "no market-cap cache exists."
-        )
-
-    return market_cap_cache
-
-
-def get_market_caps():
-
-    global market_cap_cache_time
-
-    now = time.time()
-
-    # ---------------------------------------------------------
-    # USE CACHE
-    # ---------------------------------------------------------
-
-    if (
-        market_cap_cache
-        and
-        (now - market_cap_cache_time)
-        < CMC_CACHE_SECONDS
-    ):
-
-        age = int(
-            now - market_cap_cache_time
-        )
-
-        log(
-            f"Using CMC cache "
-            f"(age={age}s)"
-        )
-
-        return market_cap_cache
-
-    # ---------------------------------------------------------
-    # REFRESH CMC
-    # ---------------------------------------------------------
-
-    log(
-        "Refreshing CoinMarketCap data..."
-    )
-
-    return fetch_market_caps_from_cmc()
-
-
-# =========================================================
-# BINANCE KLINES
-# =========================================================
-
-def get_klines(symbol, interval, limit=100):
-
-    url = f"{BINANCE_BASE_URL}/api/v3/klines"
-
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
-
     try:
 
-        response = requests.get(
+        response = session.get(
             url,
+            headers=headers,
             params=params,
-            timeout=20
+            timeout=30
         )
+
+        if response.status_code == 429:
+            print("CMC rate limit. Keeping old cache.")
+            return market_cap_cache
 
         response.raise_for_status()
 
-        return response.json()
+        data = response.json()
+
+        new_cache = {}
+
+        for coin in data.get("data", []):
+
+            symbol = coin.get("symbol")
+            quote = coin.get("quote", {})
+            usd = quote.get("USD", {})
+
+            market_cap = usd.get("market_cap")
+
+            if not symbol or market_cap is None:
+                continue
+
+            # If duplicate symbols exist, keep the largest market cap.
+            if (
+                symbol not in new_cache
+                or market_cap > new_cache[symbol]
+            ):
+                new_cache[symbol] = market_cap
+
+        if new_cache:
+
+            market_cap_cache = new_cache
+            market_cap_cache_time = current_time
+
+            print(
+                f"CMC updated: "
+                f"{len(market_cap_cache)} coins"
+            )
+
+        return market_cap_cache
 
     except Exception as e:
 
-        log(
-            f"{symbol}: "
-            f"{interval} klines error: {e}"
-        )
+        print(f"CMC error: {e}")
 
+        return market_cap_cache
+
+
+# ============================================================
+# FILTER QUALIFIED COINS
+# ============================================================
+
+def get_qualified_symbols():
+
+    binance_symbols = get_binance_spot_symbols()
+
+    if not binance_symbols:
         return []
 
+    market_caps = get_market_caps()
 
-# =========================================================
+    if not market_caps:
+        return []
+
+    qualified = []
+
+    for item in binance_symbols:
+
+        symbol = item["symbol"]
+        base_asset = item["base_asset"]
+
+        market_cap = market_caps.get(base_asset)
+
+        if market_cap is None:
+            continue
+
+        if market_cap > MIN_MARKET_CAP:
+
+            qualified.append({
+                "symbol": symbol,
+                "base_asset": base_asset,
+                "market_cap": market_cap
+            })
+
+    return qualified
+
+
+# ============================================================
+# KLINES
+# ============================================================
+
+def get_klines(symbol, interval, limit=100):
+
+    data = binance_get(
+        "/api/v3/klines",
+        {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }
+    )
+
+    if not data:
+        return []
+
+    return data
+
+
+# ============================================================
+# CLOSED KLINES
+# ============================================================
+
+def get_closed_klines(symbol, interval, limit=100):
+
+    klines = get_klines(
+        symbol,
+        interval,
+        limit
+    )
+
+    if len(klines) < 4:
+        return []
+
+    current_time_ms = int(time.time() * 1000)
+
+    closed = []
+
+    for candle in klines:
+
+        open_time = candle[0]
+        close_time = candle[6]
+
+        # Only fully closed candles
+        if close_time <= current_time_ms:
+            closed.append(candle)
+
+    return closed
+
+
+# ============================================================
 # EMA
-# =========================================================
+# ============================================================
 
 def calculate_ema(values, period):
 
@@ -381,47 +433,42 @@ def calculate_ema(values, period):
 
     multiplier = 2 / (period + 1)
 
-    ema = sum(
-        values[:period]
-    ) / period
+    ema = sum(values[:period]) / period
 
     for price in values[period:]:
-
         ema = (
-            (price - ema)
-            * multiplier
-        ) + ema
+            (price - ema) * multiplier
+            + ema
+        )
 
     return ema
 
 
-# =========================================================
+# ============================================================
 # 1H TREND
-# =========================================================
+#
+# Uses ONLY closed 1H candles.
+#
+# Close > EMA20 > EMA50 > EMA100
+# ============================================================
 
 def check_1h_trend(symbol):
 
-    klines = get_klines(
+    klines = get_closed_klines(
         symbol,
         "1h",
         150
     )
 
-    if len(klines) < 105:
+    if len(klines) < 101:
         return False
-
-    # Ignore current forming candle
-    closed_klines = klines[:-1]
 
     closes = [
-        float(k[4])
-        for k in closed_klines
+        float(candle[4])
+        for candle in klines
     ]
 
-    if len(closes) < 100:
-        return False
-
-    close = closes[-1]
+    current_close = closes[-1]
 
     ema20 = calculate_ema(
         closes,
@@ -445,156 +492,178 @@ def check_1h_trend(symbol):
     ):
         return False
 
-    return (
-        close > ema20
-        and
-        ema20 > ema50
-        and
-        ema50 > ema100
+    trend_ok = (
+        current_close > ema20
+        and ema20 > ema50
+        and ema50 > ema100
     )
 
+    return trend_ok
 
-# =========================================================
-# BEARISH FVG
-# =========================================================
 
-def find_bearish_fvg(
+# ============================================================
+# BEAR FVG DETECTION
+#
+# Three CLOSED candles:
+#
+# Candle 1
+# Candle 2
+# Candle 3
+#
+# Candle 1 must be bearish:
+#     Close < Open
+#
+# Candle 2 must be bearish:
+#     Close < Open
+#
+# Bear FVG:
+#     Candle 1 Low > Candle 3 High
+#
+# FVG:
+#     Low  = Candle 3 High
+#     High = Candle 1 Low
+#
+# Candle 2 body:
+#     Low  = Close
+#     High = Open
+#
+# FVG must be completely inside body.
+#
+# FVG size >= 50% of Candle 2 body.
+#
+# Only the NEWEST valid FVG is returned.
+# ============================================================
+
+def find_new_bearish_fvg(
     symbol,
     interval
 ):
 
-    klines = get_klines(
+    klines = get_closed_klines(
         symbol,
         interval,
         100
     )
 
-    if len(klines) < 10:
+    if len(klines) < 3:
         return None
 
-    # Ignore current forming candle
-    closed_klines = klines[:-1]
+    last_processed = last_processed_fvg.get(
+        (symbol, interval),
+        0
+    )
 
-    # Search newest -> oldest
+    # Newest -> oldest
     for i in range(
-        len(closed_klines) - 3,
+        len(klines) - 3,
         -1,
         -1
     ):
 
-        c1 = closed_klines[i]
-        c2 = closed_klines[i + 1]
-        c3 = closed_klines[i + 2]
+        c1 = klines[i]
+        c2 = klines[i + 1]
+        c3 = klines[i + 2]
 
-        c1_open = float(c1[1])
-        c1_high = float(c1[2])
-        c1_low = float(c1[3])
-        c1_close = float(c1[4])
+        # ====================================================
+        # Candle timestamps
+        # ====================================================
 
-        c2_open = float(c2[1])
-        c2_high = float(c2[2])
-        c2_low = float(c2[3])
-        c2_close = float(c2[4])
+        c3_open_time = c3[0]
 
-        c3_open = float(c3[1])
-        c3_high = float(c3[2])
-        c3_low = float(c3[3])
-        c3_close = float(c3[4])
-
-        # -----------------------------------------------------
-        # BEARISH FVG
-        # 1st candle LOW > 3rd candle HIGH
-        # -----------------------------------------------------
-
-        if not (
-            c1_low > c3_high
-        ):
+        # Do not process an already processed formation.
+        if c3_open_time <= last_processed:
             continue
 
-        fvg_low = c3_high
-        fvg_high = c1_low
+        # ====================================================
+        # Candle 1
+        # ====================================================
 
-        fvg_size = (
-            fvg_high
-            - fvg_low
+        c1_open = float(c1[1])
+        c1_close = float(c1[4])
+        c1_low = float(c1[3])
+
+        # Candle 1 must close down
+        if c1_close >= c1_open:
+            continue
+
+        # ====================================================
+        # Candle 2
+        # ====================================================
+
+        c2_open = float(c2[1])
+        c2_close = float(c2[4])
+
+        # Candle 2 must close down
+        if c2_close >= c2_open:
+            continue
+
+        # Body = Open to Close ONLY
+        body_low = min(
+            c2_open,
+            c2_close
         )
-
-        # -----------------------------------------------------
-        # 2ND CANDLE BODY
-        # -----------------------------------------------------
 
         body_high = max(
             c2_open,
             c2_close
         )
 
-        body_low = min(
-            c2_open,
-            c2_close
-        )
-
-        body_size = (
-            body_high
-            - body_low
-        )
+        body_size = body_high - body_low
 
         if body_size <= 0:
             continue
 
-        # -----------------------------------------------------
-        # FVG MUST BE FULLY INSIDE 2ND CANDLE BODY
-        # -----------------------------------------------------
+        # ====================================================
+        # Candle 3
+        # ====================================================
 
-        if not (
-            fvg_low >= body_low
-            and
-            fvg_high <= body_high
-        ):
-            continue
+        c3_high = float(c3[2])
 
-        # -----------------------------------------------------
-        # FVG >= 50% OF 2ND CANDLE BODY
-        # -----------------------------------------------------
-
-        ratio = (
-            fvg_size
-            / body_size
-        )
-
-        if ratio < FVG_MIN_RATIO:
-            continue
-
-        # -----------------------------------------------------
-        # CHECK IF THIS FVG WAS ALREADY FINISHED
-        # -----------------------------------------------------
-
-        candle_time = c2[0]
-
-        previous_finished = (
-            last_finished_fvg.get(symbol)
-        )
-
-        if (
-            previous_finished is not None
-            and
-            candle_time <= previous_finished
-        ):
-            continue
-
-        # -----------------------------------------------------
-        # TARGET
+        # ====================================================
+        # Bear FVG
         #
-        # 3rd candle HIGH - 3%
-        # -----------------------------------------------------
+        # Candle 1 Low > Candle 3 High
+        # ====================================================
+
+        if c1_low <= c3_high:
+            continue
+
+        fvg_low = c3_high
+        fvg_high = c1_low
+
+        fvg_size = fvg_high - fvg_low
+
+        if fvg_size <= 0:
+            continue
+
+        # ====================================================
+        # FVG must be completely inside Candle 2 body
+        # ====================================================
+
+        if fvg_low < body_low:
+            continue
+
+        if fvg_high > body_high:
+            continue
+
+        # ====================================================
+        # FVG must be at least 50% of Candle 2 body
+        # ====================================================
+
+        fvg_ratio = fvg_size / body_size
+
+        if fvg_ratio < FVG_MIN_RATIO:
+            continue
+
+        # ====================================================
+        # Target
+        #
+        # 1.7% below Candle 3 High
+        # ====================================================
 
         target_price = (
             c3_high
-            *
-            (
-                1
-                -
-                DROP_PERCENT / 100
-            )
+            * (1 - TARGET_DROP_PERCENT / 100)
         )
 
         return {
@@ -605,488 +674,439 @@ def find_bearish_fvg(
             "candle2_time": c2[0],
             "candle3_time": c3[0],
 
+            "candle1_low": c1_low,
+
             "candle2_open": c2_open,
             "candle2_close": c2_close,
+            "candle2_body": body_size,
 
-            "c3_high": c3_high,
+            "candle3_high": c3_high,
 
             "fvg_low": fvg_low,
             "fvg_high": fvg_high,
+            "fvg_size": fvg_size,
+            "fvg_ratio": fvg_ratio,
 
-            "ratio": ratio,
+            "target": target_price,
 
-            "target": target_price
+            "activated_at": time.time()
         }
 
     return None
 
 
-# =========================================================
-# FINISH FVG
-# =========================================================
+# ============================================================
+# SEARCH NEW FVG
+#
+# First 15M.
+# If no NEW valid 15M FVG:
+#     search 1H.
+#
+# If both have valid NEW FVGs, use the more recent
+# formation. If formation times are equal, 15M wins.
+# ============================================================
 
-def finish_fvg(
-    symbol,
-    fvg
-):
+def search_new_fvg(symbol):
 
-    active_fvgs.pop(
+    fvg_15m = find_new_bearish_fvg(
         symbol,
-        None
+        "15m"
     )
 
-    last_finished_fvg[symbol] = (
-        fvg["candle2_time"]
+    fvg_1h = find_new_bearish_fvg(
+        symbol,
+        "1h"
     )
 
+    if fvg_15m and fvg_1h:
 
-# =========================================================
-# SIGNAL
-# =========================================================
+        if fvg_15m["candle3_time"] >= fvg_1h["candle3_time"]:
+            return fvg_15m
 
-def send_signal(
-    fvg,
-    market_cap
-):
+        return fvg_1h
+
+    if fvg_15m:
+        return fvg_15m
+
+    if fvg_1h:
+        return fvg_1h
+
+    return None
+
+
+# ============================================================
+# GET CURRENT PRICE
+# ============================================================
+
+def get_current_price(symbol):
+
+    data = binance_get(
+        "/api/v3/ticker/price",
+        {
+            "symbol": symbol
+        }
+    )
+
+    if not data:
+        return None
+
+    try:
+        return float(data["price"])
+
+    except Exception:
+        return None
+
+
+# ============================================================
+# ACTIVATE FVG
+# ============================================================
+
+def activate_fvg(fvg):
 
     symbol = fvg["symbol"]
+    interval = fvg["interval"]
 
-    now = time.time()
+    active_fvgs[symbol] = fvg
 
-    previous_signal = (
-        last_signal_time.get(symbol, 0)
+    # Remember only the formation timestamp.
+    # This prevents the exact same FVG from being
+    # activated again after TARGET/CANCEL.
+    last_processed_fvg[
+        (symbol, interval)
+    ] = fvg["candle3_time"]
+
+    print()
+    print("==========================================")
+    print("FVG ACTIVATED")
+    print("==========================================")
+    print(f"Symbol      : {symbol}")
+    print(f"Timeframe   : {interval}")
+    print(
+        f"Candle 3    : "
+        f"{format_time(fvg['candle3_time'])}"
+    )
+    print(
+        f"Candle 3 High: "
+        f"{fvg['candle3_high']}"
+    )
+    print(
+        f"FVG         : "
+        f"{fvg['fvg_low']} - {fvg['fvg_high']}"
+    )
+    print(
+        f"FVG Size    : "
+        f"{fvg['fvg_size']}"
+    )
+    print(
+        f"Body Size   : "
+        f"{fvg['candle2_body']}"
+    )
+    print(
+        f"FVG Ratio   : "
+        f"{fvg['fvg_ratio'] * 100:.2f}%"
+    )
+    print(
+        f"Target      : "
+        f"{fvg['target']}"
+    )
+    print("==========================================")
+    print()
+
+
+# ============================================================
+# FINISH / FORGET ACTIVE FVG
+# ============================================================
+
+def finish_fvg(symbol):
+
+    if symbol in active_fvgs:
+        del active_fvgs[symbol]
+
+    print(
+        f"{symbol}: Active FVG finished. "
+        f"Returning to 1H trend."
     )
 
-    if (
-        now - previous_signal
-        < SIGNAL_COOLDOWN
-    ):
-        log(
-            f"{symbol}: "
-            "Signal cooldown active."
-        )
-        return
 
-    last_signal_time[symbol] = now
+# ============================================================
+# MONITOR ACTIVE FVG
+#
+# IMPORTANT:
+# If active FVG exists:
+#     NO NEW FVG SEARCH
+#
+# Only:
+#     TARGET
+#     OR
+#     CANCEL
+# ============================================================
 
-    market_cap_text = (
-        f"${market_cap:,.0f}"
-        if market_cap
-        else "N/A"
-    )
-
-    message = (
-        "🚨 BEARISH FVG TARGET HIT 🚨\n\n"
-
-        f"Symbol: {symbol}\n"
-        f"Market Cap: {market_cap_text}\n\n"
-
-        f"1H Trend: "
-        "CLOSE > EMA20 > EMA50 > EMA100\n\n"
-
-        f"FVG Timeframe: "
-        f"{fvg['interval']}\n"
-
-        f"FVG Range: "
-        f"{fvg['fvg_low']:.8f} - "
-        f"{fvg['fvg_high']:.8f}\n\n"
-
-        f"2nd Candle Open: "
-        f"{fvg['candle2_open']:.8f}\n"
-
-        f"2nd Candle Close: "
-        f"{fvg['candle2_close']:.8f}\n\n"
-
-        f"FVG Ratio: "
-        f"{fvg['ratio'] * 100:.2f}%\n\n"
-
-        f"3rd Candle High: "
-        f"{fvg['c3_high']:.8f}\n"
-
-        f"Target: "
-        f"{fvg['target']:.8f}\n"
-    )
-
-    send_telegram(message)
-
-
-# =========================================================
-# ACTIVE FVG MONITOR
-# =========================================================
-
-def monitor_active_fvg(
-    symbol,
-    market_cap
-):
+def monitor_active_fvg(symbol):
 
     fvg = active_fvgs.get(symbol)
 
     if not fvg:
         return
 
-    url = (
-        f"{BINANCE_BASE_URL}/api/v3/ticker/price"
-    )
+    price = get_current_price(symbol)
 
-    try:
-
-        response = requests.get(
-            url,
-            params={
-                "symbol": symbol
-            },
-            timeout=10
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        price = float(
-            data["price"]
-        )
-
-    except Exception as e:
-
-        log(
-            f"{symbol}: price error: {e}"
-        )
-
+    if price is None:
         return
 
     target = fvg["target"]
+    third_high = fvg["candle3_high"]
 
-    c3_high = fvg["c3_high"]
-
-    # ---------------------------------------------------------
-    # TARGET FIRST
-    # ---------------------------------------------------------
+    # ========================================================
+    # TARGET
+    # Price reached 1.7% below Candle 3 High
+    # ========================================================
 
     if price <= target:
 
-        log(
-            f"{symbol}: "
-            f"{fvg['interval']} "
-            f"FVG TARGET HIT - "
-            f"price={price:.8f}, "
-            f"target={target:.8f}"
+        message = (
+            "🔴 BEAR FVG SIGNAL\n\n"
+            f"Symbol: {symbol}\n"
+            f"Timeframe: {fvg['interval']}\n\n"
+            f"3rd Candle High: {third_high}\n"
+            f"Target (-1.7%): {target}\n"
+            f"Current Price: {price}\n\n"
+            "Bear FVG target reached."
         )
 
-        send_signal(
-            fvg,
-            market_cap
-        )
+        print()
+        print(message)
+        print()
 
-        finish_fvg(
-            symbol,
-            fvg
-        )
+        send_telegram(message)
+
+        # FVG is now finished.
+        finish_fvg(symbol)
 
         return
 
-    # ---------------------------------------------------------
+    # ========================================================
     # CANCEL
     #
-    # If price crosses ABOVE 3rd candle HIGH
-    # before target is hit.
-    # ---------------------------------------------------------
+    # Price crossed above Candle 3 High
+    # ========================================================
 
-    if price > c3_high:
+    if price > third_high:
 
-        log(
-            f"{symbol}: "
-            f"{fvg['interval']} "
-            f"FVG CANCELLED - "
-            f"price crossed 3rd candle high "
-            f"(price={price:.8f}, "
-            f"3rd_high={c3_high:.8f})"
+        print()
+        print(
+            f"{symbol}: FVG CANCELLED"
         )
-
-        finish_fvg(
-            symbol,
-            fvg
+        print(
+            f"Price {price} > "
+            f"3rd candle High {third_high}"
         )
+        print()
+
+        finish_fvg(symbol)
 
         return
 
 
-# =========================================================
-# FIND NEW FVG
-# =========================================================
+# ============================================================
+# PROCESS ONE COIN
+# ============================================================
 
-def search_new_fvg(
-    symbol
-):
+def process_symbol(item):
 
-    # ---------------------------------------------------------
-    # FIRST: 15M
-    # ---------------------------------------------------------
+    symbol = item["symbol"]
 
-    fvg = find_bearish_fvg(
-        symbol,
-        "15m"
-    )
+    # ========================================================
+    # ACTIVE FVG EXISTS
+    #
+    # DO NOT CHECK TREND
+    # DO NOT SEARCH NEW FVG
+    #
+    # ONLY MONITOR CURRENT FVG
+    # ========================================================
 
-    if fvg:
+    if symbol in active_fvgs:
 
-        return fvg
+        monitor_active_fvg(symbol)
 
-    # ---------------------------------------------------------
-    # FALLBACK: 1H
-    # ---------------------------------------------------------
+        return
 
-    fvg = find_bearish_fvg(
-        symbol,
-        "1h"
-    )
+    # ========================================================
+    # NO ACTIVE FVG
+    #
+    # Return to 1H trend
+    # ========================================================
 
-    return fvg
+    trend_ok = check_1h_trend(symbol)
+
+    if not trend_ok:
+        return
+
+    # ========================================================
+    # 1H trend is valid.
+    #
+    # Search NEW FVG.
+    # ========================================================
+
+    fvg = search_new_fvg(symbol)
+
+    if not fvg:
+        return
+
+    # ========================================================
+    # Activate only after all FVG conditions passed.
+    # ========================================================
+
+    activate_fvg(fvg)
 
 
-# =========================================================
-# MAIN MARKET SCAN
-# =========================================================
+# ============================================================
+# MARKET SCAN
+# ============================================================
 
 def market_scan():
 
-    log(
-        "Starting market scan..."
+    print()
+    print("==========================================")
+    print(
+        f"MARKET SCAN "
+        f"{now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+    print("==========================================")
+
+    qualified = get_qualified_symbols()
+
+    print(
+        f"Qualified coins (> $300M): "
+        f"{len(qualified)}"
     )
 
-    # ---------------------------------------------------------
-    # GET BINANCE SYMBOLS
-    # ---------------------------------------------------------
-
-    symbols = (
-        get_binance_usdt_symbols()
-    )
-
-    if not symbols:
-
-        log(
-            "No Binance symbols."
-        )
-
+    if not qualified:
+        print("No qualified coins.")
         return
 
-    # ---------------------------------------------------------
-    # GET / CACHE MARKET CAPS
-    # ---------------------------------------------------------
+    for index, item in enumerate(
+        qualified,
+        start=1
+    ):
 
-    market_caps = get_market_caps()
-
-    if not market_caps:
-
-        log(
-            "No market cap data."
-        )
-
-        return
-
-    # ---------------------------------------------------------
-    # FILTER MARKET CAP
-    # ---------------------------------------------------------
-
-    qualified_symbols = []
-
-    for symbol in symbols:
-
-        base_asset = (
-            symbol[:-4]
-            if symbol.endswith("USDT")
-            else None
-        )
-
-        if not base_asset:
-            continue
-
-        market_cap = (
-            market_caps.get(
-                base_asset
-            )
-        )
-
-        if (
-            market_cap is not None
-            and
-            market_cap > MIN_MARKET_CAP
-        ):
-
-            qualified_symbols.append(
-                symbol
-            )
-
-    log(
-        f"Market Cap > $300M: "
-        f"{len(qualified_symbols)} coins"
-    )
-
-    # ---------------------------------------------------------
-    # PROCESS COINS
-    # ---------------------------------------------------------
-
-    for symbol in qualified_symbols:
+        symbol = item["symbol"]
+        market_cap = item["market_cap"]
 
         try:
 
-            # -------------------------------------------------
-            # ACTIVE FVG
-            # -------------------------------------------------
-
-            if symbol in active_fvgs:
-
-                monitor_active_fvg(
-                    symbol,
-                    market_caps.get(
-                        symbol[:-4]
-                    )
-                )
-
-                continue
-
-            # -------------------------------------------------
-            # 1H TREND
-            # -------------------------------------------------
-
-            if not check_1h_trend(
-                symbol
-            ):
-
-                continue
-
-            # -------------------------------------------------
-            # FIND FVG
-            # -------------------------------------------------
-
-            fvg = search_new_fvg(
-                symbol
+            print(
+                f"[{index}/{len(qualified)}] "
+                f"{symbol} | "
+                f"MC ${market_cap:,.0f}"
             )
 
-            if not fvg:
-                continue
-
-            # -------------------------------------------------
-            # ACTIVATE FVG
-            # -------------------------------------------------
-
-            active_fvgs[symbol] = fvg
-
-            log(
-                f"{symbol}: "
-                f"NEW {fvg['interval']} FVG | "
-                f"FVG="
-                f"{fvg['fvg_low']:.8f}"
-                f"-"
-                f"{fvg['fvg_high']:.8f} | "
-                f"ratio="
-                f"{fvg['ratio'] * 100:.2f}% | "
-                f"3rd High="
-                f"{fvg['c3_high']:.8f} | "
-                f"Target="
-                f"{fvg['target']:.8f}"
-            )
+            process_symbol(item)
 
         except Exception as e:
 
-            log(
-                f"{symbol}: "
-                f"processing error: {e}"
+            print(
+                f"{symbol}: processing error: {e}"
             )
 
+        # Small pause to reduce API pressure
+        time.sleep(0.05)
 
-# =========================================================
+
+# ============================================================
 # STARTUP
-# =========================================================
+# ============================================================
 
-def startup_message():
+def startup():
 
-    message = (
-        "🤖 Binance FVG Alert Bot Started\n\n"
-
-        "Market Cap: > $300M\n"
-
-        "1H Trend:\n"
-        "CLOSE > EMA20 > EMA50 > EMA100\n\n"
-
-        "FVG:\n"
-        "15M first, 1H fallback\n"
-        "FVG >= 50% of 2nd candle body\n"
-        "FVG fully inside 2nd candle body\n\n"
-
-        "Target:\n"
-        "3% below 3rd candle HIGH\n\n"
-
-        "Cancel:\n"
-        "Price crosses above 3rd candle HIGH\n\n"
-
-        "Scan interval: 60 seconds\n"
-        "CMC cache: 15 minutes"
-    )
+    print()
+    print("==========================================")
+    print("BINANCE SPOT BEAR FVG BOT")
+    print("==========================================")
+    print()
+    print("Conditions:")
+    print()
+    print("1. Binance Spot USDT")
+    print("2. CMC Market Cap > $300M")
+    print("3. 1H: Close > EMA20 > EMA50 > EMA100")
+    print("4. Search 15M Bear FVG first")
+    print("5. If no 15M -> search 1H Bear FVG")
+    print("6. Three candles must be CLOSED")
+    print("7. Candle 1 must be bearish")
+    print("8. Candle 2 must be bearish")
+    print("9. Candle 1 Low > Candle 3 High")
+    print("10. FVG inside Candle 2 Open/Close body")
+    print("11. FVG >= 50% of Candle 2 body")
+    print("12. Target = 1.7% below Candle 3 High")
+    print("13. Candle 3 High crossed -> CANCEL")
+    print("14. One active FVG per coin")
+    print("15. Active FVG blocks new FVG searches")
+    print("16. After Target/Cancel -> return to 1H trend")
+    print("17. Scan every 60 seconds")
+    print("18. CMC refresh every 5 minutes")
+    print()
+    print("No signal cooldown.")
+    print("No RSI / MACD / Volume filters.")
+    print("==========================================")
+    print()
 
     send_telegram(
-        message
+        "🟢 Bear FVG Bot started.\n\n"
+        "Binance Spot USDT\n"
+        "CMC Market Cap > $300M\n"
+        "1H Trend: Close > EMA20 > EMA50 > EMA100\n"
+        "15M FVG → 1H FVG fallback\n"
+        "Bear FVG >= 50% of Candle 2 body\n"
+        "Target: -1.7%\n"
+        "Scan: 60 seconds\n"
+        "CMC: 5 minutes"
     )
 
 
-# =========================================================
+# ============================================================
 # MAIN LOOP
-# =========================================================
+# ============================================================
 
 def main():
 
-    log(
-        "Bot starting..."
-    )
+    startup()
 
-    log(
-        "Scan interval: "
-        f"{SCAN_INTERVAL}s"
-    )
-
-    log(
-        "CMC cache interval: "
-        f"{CMC_CACHE_SECONDS}s"
-    )
-
-    startup_message()
+    last_scan = 0
 
     while True:
 
-        scan_start = time.time()
-
         try:
 
-            market_scan()
+            current_time = time.time()
+
+            if (
+                current_time - last_scan
+                >= SCAN_INTERVAL
+            ):
+
+                market_scan()
+
+                last_scan = current_time
+
+            time.sleep(1)
+
+        except KeyboardInterrupt:
+
+            print()
+            print("Bot stopped.")
+            break
 
         except Exception as e:
 
-            log(
-                f"Main scan error: {e}"
+            print(
+                f"Main loop error: {e}"
             )
 
-        elapsed = (
-            time.time()
-            - scan_start
-        )
-
-        sleep_time = max(
-            1,
-            SCAN_INTERVAL - elapsed
-        )
-
-        log(
-            f"Next scan in "
-            f"{sleep_time:.1f}s"
-        )
-
-        time.sleep(
-            sleep_time
-        )
+            time.sleep(5)
 
 
-# =========================================================
+# ============================================================
 # RUN
-# =========================================================
+# ============================================================
 
 if __name__ == "__main__":
     main()
