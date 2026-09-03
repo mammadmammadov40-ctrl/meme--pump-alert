@@ -20,11 +20,11 @@ from zoneinfo import ZoneInfo
 # FVG MUST BE INSIDE 2ND CANDLE BODY
 # FVG SIZE >= 50% OF 2ND CANDLE BODY
 #
-# TARGET = 3% BELOW 2ND CANDLE CLOSE
+# TARGET = 3% BELOW 3RD CANDLE HIGH
 #
 # ACTIVE FVG:
 # - TARGET HIT -> SIGNAL -> FVG FINISHED
-# - PRICE RETURNS TO 2ND CLOSE -> CANCEL FVG
+# - PRICE CROSSES 3RD CANDLE HIGH -> CANCEL FVG
 #
 # WHILE FVG IS ACTIVE:
 # NEW FVGs ARE IGNORED
@@ -624,11 +624,12 @@ def find_bearish_fvg(
             continue
 
         # ----------------------------------------------------
-        # TARGET = 3% BELOW 2ND CANDLE CLOSE
+        # NEW TARGET:
+        # 3% BELOW 3RD CANDLE HIGH
         # ----------------------------------------------------
 
         target_price = (
-            c2_close
+            c3_high
             * (
                 1
                 - DROP_PERCENT / 100
@@ -845,10 +846,13 @@ def send_signal(
         f"2nd Close: "
         f"{fvg['candle2_close']:.8f}\n"
 
+        f"3rd High: "
+        f"{fvg['candle3_high']:.8f}\n"
+
         f"FVG/Body: "
         f"{fvg['fvg_ratio'] * 100:.2f}%\n\n"
 
-        f"🎯 <b>3% TARGET:</b> "
+        f"🎯 <b>3% TARGET FROM 3RD HIGH:</b> "
         f"{target:.8f}\n"
 
         f"💵 Current Price: "
@@ -917,6 +921,8 @@ def activate_fvg(
         f"{fvg['body_size']:.8f} | "
         f"Ratio="
         f"{fvg['fvg_ratio'] * 100:.2f}% | "
+        f"3rd High="
+        f"{fvg['candle3_high']:.8f} | "
         f"Target="
         f"{fvg['target_price']:.8f}"
     )
@@ -971,8 +977,8 @@ def monitor_active_fvg(
     if price is None:
         return
 
-    close2 = fvg[
-        "candle2_close"
+    c3_high = fvg[
+        "candle3_high"
     ]
 
     target = fvg[
@@ -1006,17 +1012,20 @@ def monitor_active_fvg(
         return
 
     # --------------------------------------------------------
-    # CANCEL IF PRICE RETURNS TO 2ND CLOSE
+    # NEW CANCEL CONDITION:
+    # CANCEL IF PRICE CROSSES 3RD CANDLE HIGH
+    # BEFORE TARGET IS HIT
     # --------------------------------------------------------
 
-    if price >= close2:
+    if price > c3_high:
 
         log(
             f"{symbol}: "
             f"{fvg['interval']} "
             f"FVG CANCELLED - "
-            f"price returned to "
-            f"2nd close."
+            f"price crossed 3rd candle high "
+            f"(price={price:.8f}, "
+            f"3rd_high={c3_high:.8f})"
         )
 
         finish_fvg(
@@ -1244,7 +1253,9 @@ def startup_check():
 
             "FVG ≥ 50% of body\n"
 
-            "3% target from 2nd candle Close\n\n"
+            "3% target from 3rd candle High\n\n"
+
+            "Cancel if price crosses 3rd candle High\n\n"
 
             "Only ONE active FVG per coin\n"
 
