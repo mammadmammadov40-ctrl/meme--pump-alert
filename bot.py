@@ -1,3 +1,4 @@
+import os
 import time
 import requests
 from datetime import datetime, timezone
@@ -7,35 +8,43 @@ from datetime import datetime, timezone
 # CONFIG
 # ============================================================
 
-BINANCE_BASE_URL = "https://api.binance.com"
+# Binance public market-data API
+BINANCE_BASE_URL = "https://data-api.binance.vision"
 
 # ============================================================
 # TELEGRAM SETTINGS
+# Railway Variables-dan oxunur
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+).strip()
 
-# 24H minimum quote volume
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    ""
+).strip()
+
+
+# ============================================================
+# STRATEGY SETTINGS
+# ============================================================
+
 MIN_QUOTE_VOLUME_24H = 20_000_000
 
-# FVG must be at least 50% of Candle 2 body
 FVG_MIN_RATIO = 0.50
 
-# Target = Candle 3 High - 1.7%
 TARGET_PERCENT = 1.7
 
 SCAN_INTERVAL_SECONDS = 60
 
-# FVG priority
 FVG_INTERVALS = ["15m", "1h"]
 
-# EMA
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 100
 
-# Volume cache
 VOLUME_CACHE_SECONDS = 300
 
 
@@ -56,7 +65,6 @@ volume_cache = {
     "symbols": []
 }
 
-# Prevent repeated Telegram messages
 telegram_state = {}
 
 
@@ -90,42 +98,41 @@ def binance_get(endpoint, params=None):
 
 
 # ============================================================
+# TELEGRAM CONFIG CHECK
+# ============================================================
+
+def telegram_config_ok():
+
+    if not TELEGRAM_BOT_TOKEN:
+
+        print(
+            "[TELEGRAM ERROR] "
+            "TELEGRAM_BOT_TOKEN is empty."
+        )
+
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+
+        print(
+            "[TELEGRAM ERROR] "
+            "TELEGRAM_CHAT_ID is empty."
+        )
+
+        return False
+
+    return True
+
+
+# ============================================================
 # TELEGRAM REQUEST
 # ============================================================
 
 def send_telegram(message):
 
-    # --------------------------------------------------------
-    # Check configuration
-    # --------------------------------------------------------
-
-    if (
-        not TELEGRAM_BOT_TOKEN
-        or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN"
-    ):
-
-        print(
-            "[TELEGRAM ERROR] "
-            "TELEGRAM_BOT_TOKEN is not configured."
-        )
+    if not telegram_config_ok():
 
         return False
-
-    if (
-        not TELEGRAM_CHAT_ID
-        or TELEGRAM_CHAT_ID == "YOUR_TELEGRAM_CHAT_ID"
-    ):
-
-        print(
-            "[TELEGRAM ERROR] "
-            "TELEGRAM_CHAT_ID is not configured."
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # Telegram API
-    # --------------------------------------------------------
 
     url = (
         f"https://api.telegram.org/bot"
@@ -157,10 +164,6 @@ def send_telegram(message):
             f"{response.text}"
         )
 
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
-
         if response.status_code == 200:
 
             try:
@@ -186,10 +189,6 @@ def send_telegram(message):
             )
 
             return False
-
-        # ----------------------------------------------------
-        # ERROR
-        # ----------------------------------------------------
 
         print(
             f"[TELEGRAM ERROR] "
@@ -238,7 +237,6 @@ def send_telegram_once(key, message):
 
     success = send_telegram(message)
 
-    # Only mark as sent if Telegram actually accepted it
     if success:
 
         telegram_state[key] = True
@@ -253,6 +251,14 @@ def test_telegram():
     print("=" * 70)
     print("[TELEGRAM TEST] Starting...")
     print("=" * 70)
+
+    if not telegram_config_ok():
+
+        print(
+            "[TELEGRAM TEST] FAILED ❌"
+        )
+
+        return False
 
     result = send_telegram(
         "🧪 TELEGRAM TEST\n\n"
@@ -341,9 +347,7 @@ def get_qualified_symbols():
             ""
         )
 
-        if not symbol.endswith(
-            "USDT"
-        ):
+        if not symbol.endswith("USDT"):
 
             continue
 
@@ -356,7 +360,7 @@ def get_qualified_symbols():
                 )
             )
 
-        except:
+        except Exception:
 
             continue
 
@@ -439,7 +443,7 @@ def get_current_price(symbol):
             data["price"]
         )
 
-    except:
+    except Exception:
 
         return None
 
@@ -499,7 +503,7 @@ def get_24h_volume(symbol):
             data["quoteVolume"]
         )
 
-    except:
+    except Exception:
 
         return None
 
@@ -625,7 +629,6 @@ def find_new_bearish_fvg(
         0
     )
 
-    # Newest pattern first
     for i in range(
         len(candles) - 1,
         1,
@@ -640,7 +643,6 @@ def find_new_bearish_fvg(
         c2_open_time = int(c2[0])
         c3_open_time = int(c3[0])
 
-        # Only NEW FVG
         if c3_open_time <= last_processed:
 
             continue
@@ -649,35 +651,32 @@ def find_new_bearish_fvg(
 
             continue
 
-        # ----------------------------------------------------
+        # ====================================================
         # CANDLE 1
-        # ----------------------------------------------------
+        # ====================================================
 
         c1_open = float(c1[1])
         c1_high = float(c1[2])
         c1_low = float(c1[3])
         c1_close = float(c1[4])
 
-        # C1 bearish
         if c1_close >= c1_open:
 
             continue
 
-        # ----------------------------------------------------
+        # ====================================================
         # CANDLE 2
-        # ----------------------------------------------------
+        # ====================================================
 
         c2_open = float(c2[1])
         c2_high = float(c2[2])
         c2_low = float(c2[3])
         c2_close = float(c2[4])
 
-        # C2 bearish
         if c2_close >= c2_open:
 
             continue
 
-        # Candle 2 BODY
         body_low = min(
             c2_open,
             c2_close
@@ -696,20 +695,18 @@ def find_new_bearish_fvg(
 
             continue
 
-        # ----------------------------------------------------
+        # ====================================================
         # CANDLE 3
-        # ----------------------------------------------------
+        # ====================================================
 
         c3_open = float(c3[1])
         c3_high = float(c3[2])
         c3_low = float(c3[3])
         c3_close = float(c3[4])
 
-        # ----------------------------------------------------
+        # ====================================================
         # BEARISH FVG
-        #
-        # C1 LOW > C3 HIGH
-        # ----------------------------------------------------
+        # ====================================================
 
         if c1_low <= c3_high:
 
@@ -726,10 +723,9 @@ def find_new_bearish_fvg(
 
             continue
 
-        # ----------------------------------------------------
-        # FVG MUST BE COMPLETELY
-        # INSIDE CANDLE 2 BODY
-        # ----------------------------------------------------
+        # ====================================================
+        # FVG INSIDE CANDLE 2 BODY
+        # ====================================================
 
         if fvg_low < body_low:
 
@@ -739,9 +735,9 @@ def find_new_bearish_fvg(
 
             continue
 
-        # ----------------------------------------------------
-        # FVG SIZE >= 50% OF CANDLE 2 BODY
-        # ----------------------------------------------------
+        # ====================================================
+        # FVG >= 50% OF CANDLE 2 BODY
+        # ====================================================
 
         fvg_ratio = (
             fvg_size / body_size
@@ -751,9 +747,9 @@ def find_new_bearish_fvg(
 
             continue
 
-        # ----------------------------------------------------
-        # VALID FVG
-        # ----------------------------------------------------
+        # ====================================================
+        # TARGET
+        # ====================================================
 
         target = (
             c3_high
@@ -822,16 +818,13 @@ def activate_fvg(
     trend
 ):
 
-    active_fvgs[
-        symbol
-    ] = fvg
+    active_fvgs[symbol] = fvg
 
     key = (
         symbol,
         fvg["interval"]
     )
 
-    # Same FVG cannot be selected again
     last_processed_fvg[key] = (
         fvg["c3_open_time"]
     )
@@ -915,7 +908,6 @@ def reset_symbol_cycle(
         None
     )
 
-    # Clear old Telegram cycle states
     keys_to_delete = []
 
     for key in list(telegram_state.keys()):
@@ -936,8 +928,6 @@ def reset_symbol_cycle(
             None
         )
 
-    # Start a fresh cycle.
-    # Old FVGs are ignored.
     initialize_symbol_cycle(
         symbol
     )
@@ -971,6 +961,7 @@ def monitor_active_fvg(symbol):
         return
 
     target = fvg["target"]
+
     c3_high = fvg["c3_high"]
 
     print(
@@ -981,7 +972,7 @@ def monitor_active_fvg(symbol):
     )
 
     # ========================================================
-    # TARGET
+    # TARGET HIT
     # ========================================================
 
     if current_price <= target:
@@ -1199,7 +1190,7 @@ def process_symbol(
 
     # ========================================================
     # STEP 5
-    # FVG FOUND + ACTIVATE
+    # FVG FOUND
     # ========================================================
 
     activate_fvg(
@@ -1234,7 +1225,6 @@ def cleanup_symbols(
             f"{symbol}"
         )
 
-        # Do not destroy an already active FVG.
         if symbol in active_fvgs:
 
             continue
@@ -1255,7 +1245,6 @@ def cleanup_symbols(
                 None
             )
 
-        # Clear Telegram states
         keys_to_delete = []
 
         for key in list(telegram_state.keys()):
@@ -1320,8 +1309,9 @@ def main():
             "\n"
             "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
             "TELEGRAM CONNECTION FAILED\n"
-            "Check BOT TOKEN and CHAT ID.\n"
-            "See [TELEGRAM RESPONSE] above for exact error.\n"
+            "Check Railway Variables:\n"
+            "TELEGRAM_BOT_TOKEN\n"
+            "TELEGRAM_CHAT_ID\n"
             "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
         )
 
@@ -1343,13 +1333,13 @@ def main():
             "Status: RUNNING 🟢"
         )
 
+    # ========================================================
+    # MAIN LOOP
+    # ========================================================
+
     while True:
 
         try:
-
-            # =================================================
-            # GET $20M+ COINS
-            # =================================================
 
             qualified = (
                 get_qualified_symbols()
@@ -1390,10 +1380,6 @@ def main():
                 "=" * 70
             )
 
-            # =================================================
-            # PROCESS
-            # =================================================
-
             for symbol in qualified:
 
                 try:
@@ -1406,8 +1392,6 @@ def main():
 
                         continue
 
-                    # Safety check:
-                    # symbol must still be >= $20M
                     if volume < MIN_QUOTE_VOLUME_24H:
 
                         continue
