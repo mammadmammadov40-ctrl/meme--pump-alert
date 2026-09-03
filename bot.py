@@ -3,41 +3,20 @@ import time
 import requests
 from datetime import datetime, timezone
 
+
 # ============================================================
-# BINANCE BEARISH FVG TELEGRAM BOT
+# BINANCE BEARISH FVG LIVE ALERT BOT
 # ============================================================
-#
-# FLOW:
-#
-# 1) 24H quote volume >= $20M
-# 2) Live bullish trend:
-#       Current Price > EMA20 > EMA50 > EMA100
-#    EMA values are calculated from 120 x 1H candles,
-#    with the current live price used for the current 1H candle.
-#
-# 3) ONLY NEW FVGs are allowed:
-#    - FVG must form AFTER BOT_START_TIME
-#    - FVG must form AFTER bullish trend confirmation
-#
-# 4) FINAL FVG SIGNAL -> Telegram
-#
-# 5) Monitor:
-#    - Target = C3 High - 1.7%
-#    - If target reached -> TARGET
-#    - If price crosses above C3 High -> CANCELLED
-#
-# IMPORTANT:
-# Historical candles are used ONLY for EMA calculation.
-# Historical FVGs are NEVER activated.
-#
-# ============================================================
+
+BINANCE_BASE_URL = "https://data-api.binance.vision"
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 
 # ============================================================
 # SETTINGS
 # ============================================================
-
-BINANCE_BASE_URL = "https://data-api.binance.vision"
 
 MIN_QUOTE_VOLUME_24H = 20_000_000
 
@@ -50,61 +29,47 @@ EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 100
 
-# EMA100 needs at least 100 values.
-# 120 gives a small warm-up buffer.
-TREND_KLINE_LIMIT = 120
+EMA_CANDLES = 120
 
-# FVG does NOT use 100 historical candles.
-# We only need a few recent candles to build C1/C2/C3.
-FVG_KLINE_LIMIT = 6
+SCAN_SECONDS = 60
 
-SCAN_INTERVAL_SECONDS = 60
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-).strip()
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    ""
-).strip()
+# FVG üçün yalnız son bir neçə candle lazımdır.
+# 120 candle FVG üçün istifadə olunmur.
+FVG_LOOKBACK = 6
 
 
 # ============================================================
 # BOT START TIME
 # ============================================================
-#
-# VERY IMPORTANT:
-#
-# Any FVG whose Candle 3 closed BEFORE this moment
-# will NEVER generate a signal.
-#
-# This prevents old/historical FVG signals after restart.
-#
-# ============================================================
 
 BOT_START_TIME = time.time()
+BOT_START_MS = int(BOT_START_TIME * 1000)
 
 
 # ============================================================
-# STATE
+# ACTIVE SETUPS
 # ============================================================
+#
+# Hər symbol üçün eyni anda maksimum 1 aktiv FVG.
+#
+# {
+#     "BTCUSDT": {
+#         "symbol": "BTCUSDT",
+#         "interval": "15m",
+#         "c3_time": ...,
+#         "c3_high": ...,
+#         "fvg_low": ...,
+#         "fvg_high": ...,
+#         "target": ...
+#     }
+# }
+#
 
-# One active FVG per symbol.
-active_fvgs = {}
+active_setups = {}
 
-# Last FVG Candle 3 timestamp already processed.
-last_seen_fvg = {}
 
-# For every symbol we remember when bullish trend
-# was first confirmed during the current bullish phase.
-trend_confirmed_since = {}
+# Eyni FVG-ni təkrar signal etməmək üçün
+processed_fvgs = set()
 
 
 # ============================================================
@@ -114,7 +79,7 @@ trend_confirmed_since = {}
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "Binance-FVG-Telegram-Bot/1.0"
+    "User-Agent": "Mozilla/5.0"
 })
 
 
@@ -149,83 +114,42 @@ def binance_get(endpoint, params=None):
 # TELEGRAM
 # ============================================================
 
-def telegram_request(method, payload=None):
-
+def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN:
-        print("[TELEGRAM ERROR] TELEGRAM_BOT_TOKEN is missing.")
-        return None
+        print("[TELEGRAM] Bot token is missing.")
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        print("[TELEGRAM] Chat ID is missing.")
+        return False
 
     url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/{method}"
+        "https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
 
     try:
         response = session.post(
             url,
-            json=payload or {},
-            timeout=20
+            json=payload,
+            timeout=15
         )
 
         response.raise_for_status()
 
-        return response.json()
+        return True
 
     except Exception as e:
         print(
-            f"[TELEGRAM ERROR] "
-            f"{method}: {e}"
+            f"[TELEGRAM ERROR] {e}"
         )
 
-        return None
-
-
-def send_telegram(message):
-
-    if not TELEGRAM_CHAT_ID:
-        print(
-            "[TELEGRAM ERROR] "
-            "TELEGRAM_CHAT_ID is missing."
-        )
         return False
-
-    result = telegram_request(
-        "sendMessage",
-        {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-    )
-
-    if result and result.get("ok"):
-        return True
-
-    return False
-
-
-def test_telegram_connection():
-
-    result = telegram_request("getMe")
-
-    if result and result.get("ok"):
-
-        bot_name = result["result"].get(
-            "username",
-            "unknown"
-        )
-
-        print(
-            f"[TELEGRAM] Connected: @{bot_name}"
-        )
-
-        return True
-
-    print(
-        "[TELEGRAM] Connection test failed."
-    )
-
-    return False
 
 
 # ============================================================
@@ -233,7 +157,6 @@ def test_telegram_connection():
 # ============================================================
 
 def get_spot_usdt_symbols():
-
     data = binance_get(
         "/api/v3/exchangeInfo"
     )
@@ -261,13 +184,22 @@ def get_spot_usdt_symbols():
 # 24H VOLUME + CURRENT PRICE
 # ============================================================
 
-def get_24h_market_data():
+def get_24h_data():
+    """
+    Bir request ilə bütün Binance Spot ticker-lərini alır.
+
+    quoteVolume:
+        24H USDT volume
+
+    lastPrice:
+        cari canlı qiymət
+    """
 
     data = binance_get(
         "/api/v3/ticker/24hr"
     )
 
-    if not data:
+    if not isinstance(data, list):
         return {}
 
     result = {}
@@ -281,28 +213,24 @@ def get_24h_market_data():
 
         try:
             quote_volume = float(
-                item.get(
-                    "quoteVolume",
-                    0
-                )
+                item["quoteVolume"]
             )
-        except Exception:
-            quote_volume = 0.0
 
-        try:
             last_price = float(
-                item.get(
-                    "lastPrice",
-                    0
-                )
+                item["lastPrice"]
             )
-        except Exception:
-            last_price = 0.0
 
-        result[symbol] = {
-            "quote_volume": quote_volume,
-            "last_price": last_price
-        }
+            result[symbol] = {
+                "quote_volume": quote_volume,
+                "last_price": last_price
+            }
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError
+        ):
+            continue
 
     return result
 
@@ -311,12 +239,7 @@ def get_24h_market_data():
 # KLINES
 # ============================================================
 
-def get_klines(
-    symbol,
-    interval,
-    limit
-):
-
+def get_klines(symbol, interval, limit):
     data = binance_get(
         "/api/v3/klines",
         {
@@ -326,43 +249,10 @@ def get_klines(
         }
     )
 
-    if not data:
+    if not isinstance(data, list):
         return []
 
     return data
-
-
-def get_closed_klines(
-    symbol,
-    interval,
-    limit
-):
-
-    candles = get_klines(
-        symbol,
-        interval,
-        limit + 2
-    )
-
-    if not candles:
-        return []
-
-    now_ms = int(
-        time.time() * 1000
-    )
-
-    closed = []
-
-    for candle in candles:
-
-        close_time = int(
-            candle[6]
-        )
-
-        if close_time <= now_ms:
-            closed.append(candle)
-
-    return closed[-limit:]
 
 
 # ============================================================
@@ -370,29 +260,23 @@ def get_closed_klines(
 # ============================================================
 
 def calculate_ema(values, period):
-
-    if not values:
-        return None
-
     if len(values) < period:
         return None
+
+    # Sadə başlanğıc EMA
+    ema = sum(
+        values[:period]
+    ) / period
 
     multiplier = 2 / (
         period + 1
     )
 
-    # Initial EMA seed = SMA
-    ema = sum(
-        values[:period]
-    ) / period
-
-    for price in values[period:]:
-
+    for value in values[period:]:
         ema = (
-            price * multiplier
-            + ema * (
-                1 - multiplier
-            )
+            (value - ema)
+            * multiplier
+            + ema
         )
 
     return ema
@@ -402,66 +286,51 @@ def calculate_ema(values, period):
 # LIVE 1H TREND
 # ============================================================
 
-def get_bullish_trend(
-    symbol,
-    current_price
-):
+def check_live_trend(symbol, current_price):
     """
-    Uses 120 x 1H candles.
+    120 ədəd 1H candle götürür.
 
-    EMA20 / EMA50 / EMA100 are calculated using:
-        - closed historical 1H closes
-        - current live price replacing the current 1H close
+    Əgər son 1H candle hələ açıqdırsa,
+    onun Close qiyməti əvəzinə CURRENT PRICE
+    istifadə olunur.
 
-    Final condition:
+    Sonra:
 
         Current Price > EMA20 > EMA50 > EMA100
+
     """
 
     candles = get_klines(
         symbol,
         "1h",
-        TREND_KLINE_LIMIT
+        EMA_CANDLES
     )
 
-    if not candles:
-        return None
+    if len(candles) < EMA_CANDLES:
+        return False, None
 
-    if len(candles) < EMA_SLOW:
-        return None
+    closes = []
 
     now_ms = int(
         time.time() * 1000
     )
 
-    closes = []
-
     for candle in candles:
+
+        close = float(
+            candle[4]
+        )
 
         close_time = int(
             candle[6]
         )
 
-        close_price = float(
-            candle[4]
-        )
+        # Son candle hələ açıqdırsa
+        # canlı qiyməti onun close-u kimi istifadə et.
+        if close_time >= now_ms:
+            close = current_price
 
-        # If candle is still open,
-        # use LIVE price instead of old candle close.
-        if close_time > now_ms:
-
-            closes.append(
-                current_price
-            )
-
-        else:
-
-            closes.append(
-                close_price
-            )
-
-    if len(closes) < EMA_SLOW:
-        return None
+        closes.append(close)
 
     ema20 = calculate_ema(
         closes,
@@ -483,17 +352,16 @@ def get_bullish_trend(
         or ema50 is None
         or ema100 is None
     ):
-        return None
+        return False, None
 
-    bullish = (
+    trend_ok = (
         current_price > ema20
         and ema20 > ema50
         and ema50 > ema100
     )
 
-    return {
-        "bullish": bullish,
-        "current_price": current_price,
+    return trend_ok, {
+        "price": current_price,
         "ema20": ema20,
         "ema50": ema50,
         "ema100": ema100
@@ -501,636 +369,668 @@ def get_bullish_trend(
 
 
 # ============================================================
+# CANDLE CLOSED CHECK
+# ============================================================
+
+def candle_is_closed(candle):
+    now_ms = int(
+        time.time() * 1000
+    )
+
+    close_time = int(
+        candle[6]
+    )
+
+    return close_time < now_ms
+
+
+# ============================================================
 # BEARISH FVG DETECTION
 # ============================================================
 
-def detect_bearish_fvg(
-    candles,
-    i
-):
-
+def detect_bearish_fvg(candles):
     """
-    i = Candle 3 index.
+    candles:
+        yalnız son bir neçə candle.
 
-    Uses:
-        C1 = i - 2
-        C2 = i - 1
-        C3 = i
+    Pattern:
 
-    Original FVG rules are unchanged.
+        C1 bearish
+        C2 bearish
+        C1 Low > C3 High
+
+    FVG:
+
+        C3 High -> C1 Low
+
+    FVG tamamilə C2-nin
+    Open-Close BODY-si daxilində olmalıdır.
+
+    FVG body-nin:
+        aşağı hissəsində,
+        ortasında,
+        yuxarı hissəsində
+    ola bilər.
+
+    FVG ölçüsü >= C2 body-nin 50%-i.
+
+    C3 mütləq bağlı olmalıdır.
     """
 
-    if (
-        i < 2
-        or i >= len(candles)
-    ):
+    if len(candles) < 3:
         return None
 
-    c1 = candles[i - 2]
-    c2 = candles[i - 1]
-    c3 = candles[i]
+    # Son 3 candle
+    c1 = candles[-3]
+    c2 = candles[-2]
+    c3 = candles[-1]
 
-    c1_open = float(
-        c1[1]
-    )
+    # --------------------------------------------------------
+    # C3 mütləq bağlı olmalıdır
+    # --------------------------------------------------------
 
-    c1_low = float(
-        c1[3]
-    )
+    if not candle_is_closed(c3):
+        return None
 
-    c1_close = float(
-        c1[4]
-    )
+    # --------------------------------------------------------
+    # Candle values
+    # --------------------------------------------------------
 
-    c2_open = float(
-        c2[1]
-    )
+    c1_open = float(c1[1])
+    c1_high = float(c1[2])
+    c1_low = float(c1[3])
+    c1_close = float(c1[4])
 
-    c2_close = float(
-        c2[4]
-    )
+    c2_open = float(c2[1])
+    c2_high = float(c2[2])
+    c2_low = float(c2[3])
+    c2_close = float(c2[4])
 
-    c3_high = float(
-        c3[2]
-    )
+    c3_open = float(c3[1])
+    c3_high = float(c3[2])
+    c3_low = float(c3[3])
+    c3_close = float(c3[4])
 
     # --------------------------------------------------------
     # C1 bearish
     # --------------------------------------------------------
 
-    if c1_close >= c1_open:
+    if not (
+        c1_close < c1_open
+    ):
         return None
 
     # --------------------------------------------------------
     # C2 bearish
     # --------------------------------------------------------
 
-    if c2_close >= c2_open:
+    if not (
+        c2_close < c2_open
+    ):
         return None
 
     # --------------------------------------------------------
-    # C2 body
-    # --------------------------------------------------------
-
-    body_low = min(
-        c2_open,
-        c2_close
-    )
-
-    body_high = max(
-        c2_open,
-        c2_close
-    )
-
-    body_size = abs(
-        c2_open - c2_close
-    )
-
-    if body_size <= 0:
-        return None
-
-    # --------------------------------------------------------
-    # Bearish FVG
+    # FVG condition
     #
     # C1 Low > C3 High
     # --------------------------------------------------------
 
-    if c1_low <= c3_high:
+    if not (
+        c1_low > c3_high
+    ):
         return None
 
-    fvg_low = c3_high
+    # --------------------------------------------------------
+    # FVG boundaries
+    # --------------------------------------------------------
 
+    fvg_low = c3_high
     fvg_high = c1_low
 
     fvg_size = (
-        fvg_high
-        - fvg_low
+        fvg_high - fvg_low
     )
 
     if fvg_size <= 0:
         return None
 
     # --------------------------------------------------------
-    # FVG completely inside C2 body
+    # C2 BODY
+    #
+    # YALNIZ Open və Close istifadə olunur.
+    #
+    # Wick / High / Low burada istifadə olunmur.
     # --------------------------------------------------------
 
-    if fvg_low < body_low:
-        return None
-
-    if fvg_high > body_high:
-        return None
-
-    # --------------------------------------------------------
-    # FVG >= 50% of C2 body
-    # --------------------------------------------------------
-
-    fvg_ratio = (
-        fvg_size
-        / body_size
+    c2_body_low = min(
+        c2_open,
+        c2_close
     )
 
-    if fvg_ratio < FVG_MIN_RATIO:
+    c2_body_high = max(
+        c2_open,
+        c2_close
+    )
+
+    c2_body_size = (
+        c2_body_high
+        - c2_body_low
+    )
+
+    if c2_body_size <= 0:
         return None
 
     # --------------------------------------------------------
-    # Target
+    # FVG C2 BODY-nin TAM DAXİLİNDƏ olmalıdır
     #
-    # C3 High - 1.7%
+    # FVG aşağıda, ortada və ya yuxarıda ola bilər.
     # --------------------------------------------------------
 
-    target = (
-        c3_high
-        * (
-            1
-            - TARGET_PERCENT / 100
-        )
+    if fvg_low < c2_body_low:
+        return None
+
+    if fvg_high > c2_body_high:
+        return None
+
+    # --------------------------------------------------------
+    # FVG >= 50% of C2 BODY
+    # --------------------------------------------------------
+
+    minimum_fvg_size = (
+        c2_body_size
+        * FVG_MIN_RATIO
+    )
+
+    if fvg_size < minimum_fvg_size:
+        return None
+
+    # --------------------------------------------------------
+    # C3 close time
+    # --------------------------------------------------------
+
+    c3_open_time = int(
+        c3[0]
+    )
+
+    c3_close_time = int(
+        c3[6]
     )
 
     return {
-        "c1_open_time": int(
-            c1[0]
-        ),
+        "c1_open": c1_open,
+        "c1_high": c1_high,
+        "c1_low": c1_low,
+        "c1_close": c1_close,
 
-        "c2_open_time": int(
-            c2[0]
-        ),
+        "c2_open": c2_open,
+        "c2_high": c2_high,
+        "c2_low": c2_low,
+        "c2_close": c2_close,
 
-        "c3_open_time": int(
-            c3[0]
-        ),
+        "c2_body_low": c2_body_low,
+        "c2_body_high": c2_body_high,
+        "c2_body_size": c2_body_size,
 
-        "c3_close_time": int(
-            c3[6]
-        ),
-
+        "c3_open": c3_open,
         "c3_high": c3_high,
+        "c3_low": c3_low,
+        "c3_close": c3_close,
 
         "fvg_low": fvg_low,
-
         "fvg_high": fvg_high,
-
         "fvg_size": fvg_size,
 
-        "fvg_ratio": fvg_ratio,
+        "minimum_fvg_size": minimum_fvg_size,
 
-        "target": target
+        "c3_open_time": c3_open_time,
+        "c3_close_time": c3_close_time
     }
 
 
 # ============================================================
-# FIND NEW FVG
+# RECENT FVG SEARCH
 # ============================================================
 
-def find_new_bearish_fvg(
-    symbol,
-    interval,
-    eligible_after
-):
-
+def find_new_fvg(symbol, interval):
     """
-    IMPORTANT:
+    Yalnız son bir neçə candle yoxlanılır.
 
-    We do NOT scan 100 historical candles.
+    Tarixi 100/120 candle FVG üçün istifadə olunmur.
 
-    Only the latest few candles are used to construct
-    a possible C1/C2/C3 FVG.
-
-    C3 MUST close after eligible_after.
-
-    eligible_after is:
-        max(
-            BOT_START_TIME,
-            trend confirmation time
-        )
+    C3 bot startından əvvəl bağlanıbsa:
+        IGNORE
     """
 
-    candles = get_closed_klines(
+    candles = get_klines(
         symbol,
         interval,
-        FVG_KLINE_LIMIT
+        FVG_LOOKBACK
     )
 
     if len(candles) < 3:
         return None
 
-    # Latest possible C3
-    # is the last closed candle.
-    latest_index = len(candles) - 1
+    # Son 3 closed candle üzərində yoxla.
+    fvg = detect_bearish_fvg(
+        candles
+    )
 
-    # Check newest first.
-    for i in range(
-        latest_index,
-        1 - 1,
-        -1
+    if not fvg:
+        return None
+
+    # --------------------------------------------------------
+    # BOT START FILTER
+    # --------------------------------------------------------
+    #
+    # C3 bot başladıqdan sonra bağlanmalıdır.
+    #
+
+    if (
+        fvg["c3_close_time"]
+        < BOT_START_MS
     ):
+        return None
 
-        fvg = detect_bearish_fvg(
-            candles,
-            i
-        )
+    # Eyni FVG-ni ikinci dəfə signal etmə.
+    fvg_id = (
+        symbol,
+        interval,
+        fvg["c3_open_time"]
+    )
 
-        if not fvg:
-            continue
+    if fvg_id in processed_fvgs:
+        return None
 
-        c3_close_time = (
-            fvg["c3_close_time"]
-        )
+    fvg["fvg_id"] = fvg_id
 
-        # ----------------------------------------------------
-        # CRITICAL:
-        # Ignore all FVGs formed before bot/trend eligibility.
-        # ----------------------------------------------------
-
-        if (
-            c3_close_time / 1000
-            <= eligible_after
-        ):
-            continue
-
-        # ----------------------------------------------------
-        # Avoid duplicate detection.
-        # ----------------------------------------------------
-
-        fvg_id = (
-            interval,
-            fvg["c3_open_time"]
-        )
-
-        if (
-            last_seen_fvg.get(symbol)
-            == fvg_id
-        ):
-            continue
-
-        last_seen_fvg[
-            symbol
-        ] = fvg_id
-
-        return fvg
-
-    return None
+    return fvg
 
 
 # ============================================================
-# FVG SIGNAL MESSAGE
+# CREATE SIGNAL
 # ============================================================
 
-def build_signal_message(
+def create_signal(
     symbol,
     interval,
     fvg,
-    trend
+    current_price,
+    trend_data,
+    volume
 ):
+    c3_high = fvg["c3_high"]
 
-    now = datetime.now(
+    target = (
+        c3_high
+        * (1 - TARGET_PERCENT / 100)
+    )
+
+    setup = {
+        "symbol": symbol,
+        "interval": interval,
+
+        "c3_high": c3_high,
+
+        "fvg_low": fvg["fvg_low"],
+        "fvg_high": fvg["fvg_high"],
+        "fvg_size": fvg["fvg_size"],
+
+        "c2_open": fvg["c2_open"],
+        "c2_close": fvg["c2_close"],
+        "c2_body_size": fvg["c2_body_size"],
+
+        "target": target,
+
+        "signal_price": current_price,
+
+        "c3_open_time": fvg["c3_open_time"],
+        "c3_close_time": fvg["c3_close_time"],
+
+        "fvg_id": fvg["fvg_id"]
+    }
+
+    active_setups[symbol] = setup
+
+    processed_fvgs.add(
+        fvg["fvg_id"]
+    )
+
+    message = (
+        "🔔 BEARISH FVG SIGNAL\n\n"
+        f"Symbol: {symbol}\n"
+        f"Interval: {interval}\n\n"
+
+        f"Price: {current_price:.8g}\n"
+        f"C3 High: {c3_high:.8g}\n\n"
+
+        f"FVG: {fvg['fvg_low']:.8g}"
+        f" - {fvg['fvg_high']:.8g}\n"
+
+        f"C2 Body: "
+        f"{fvg['c2_body_low']:.8g}"
+        f" - {fvg['c2_body_high']:.8g}\n"
+
+        f"C2 Body Size: "
+        f"{fvg['c2_body_size']:.8g}\n"
+
+        f"FVG Size: "
+        f"{fvg['fvg_size']:.8g}\n"
+
+        f"FVG Min (50%): "
+        f"{fvg['minimum_fvg_size']:.8g}\n\n"
+
+        f"Target (-{TARGET_PERCENT}%): "
+        f"{target:.8g}"
+    )
+
+    send_telegram(message)
+
+    print(
+        f"[SIGNAL] "
+        f"{symbol} {interval} "
+        f"FVG={fvg['fvg_low']:.8g}-"
+        f"{fvg['fvg_high']:.8g} "
+        f"Target={target:.8g}"
+    )
+
+
+# ============================================================
+# MONITOR ACTIVE SETUPS
+# ============================================================
+
+def monitor_active_setups(price_data):
+    """
+    Aktiv FVG artıq yaranıbsa,
+    onun target/cancel vəziyyəti
+    Volume və Trend-dən asılı deyil.
+
+    Target:
+        Current Price <= Target
+
+    Cancel:
+        Current Price > C3 High
+    """
+
+    if not active_setups:
+        return
+
+    completed = []
+
+    for symbol, setup in list(
+        active_setups.items()
+    ):
+
+        item = price_data.get(symbol)
+
+        if not item:
+            continue
+
+        current_price = item["last_price"]
+
+        target = setup["target"]
+        c3_high = setup["c3_high"]
+
+        # ----------------------------------------------------
+        # TARGET
+        # ----------------------------------------------------
+
+        if current_price <= target:
+
+            message = (
+                "🎯 TARGET HIT\n\n"
+                f"Symbol: {symbol}\n"
+                f"Interval: {setup['interval']}\n"
+                f"Target: {target:.8g}\n"
+                f"Current Price: {current_price:.8g}"
+            )
+
+            send_telegram(message)
+
+            print(
+                f"[TARGET HIT] "
+                f"{symbol} "
+                f"Price={current_price:.8g}"
+            )
+
+            completed.append(
+                symbol
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # CANCEL
+        # ----------------------------------------------------
+
+        if current_price > c3_high:
+
+            message = (
+                "❌ FVG CANCELLED\n\n"
+                f"Symbol: {symbol}\n"
+                f"Interval: {setup['interval']}\n"
+                f"C3 High: {c3_high:.8g}\n"
+                f"Current Price: {current_price:.8g}"
+            )
+
+            send_telegram(message)
+
+            print(
+                f"[CANCELLED] "
+                f"{symbol} "
+                f"Price={current_price:.8g}"
+            )
+
+            completed.append(
+                symbol
+            )
+
+    for symbol in completed:
+        active_setups.pop(
+            symbol,
+            None
+        )
+
+
+# ============================================================
+# SCAN
+# ============================================================
+
+def scan():
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    now_text = datetime.now(
         timezone.utc
     ).strftime(
         "%Y-%m-%d %H:%M:%S UTC"
     )
 
-    return (
-        f"🔴 <b>BEARISH FVG SIGNAL</b>\n\n"
-
-        f"<b>Symbol:</b> {symbol}\n"
-        f"<b>Timeframe:</b> {interval}\n"
-        f"<b>Time:</b> {now}\n\n"
-
-        f"<b>Current Price:</b> "
-        f"{trend['current_price']:.12g}\n"
-
-        f"<b>EMA20:</b> "
-        f"{trend['ema20']:.12g}\n"
-
-        f"<b>EMA50:</b> "
-        f"{trend['ema50']:.12g}\n"
-
-        f"<b>EMA100:</b> "
-        f"{trend['ema100']:.12g}\n\n"
-
-        f"<b>C3 High:</b> "
-        f"{fvg['c3_high']:.12g}\n"
-
-        f"<b>FVG Low:</b> "
-        f"{fvg['fvg_low']:.12g}\n"
-
-        f"<b>FVG High:</b> "
-        f"{fvg['fvg_high']:.12g}\n"
-
-        f"<b>FVG Ratio:</b> "
-        f"{fvg['fvg_ratio'] * 100:.2f}%\n\n"
-
-        f"🎯 <b>Target:</b> "
-        f"{fvg['target']:.12g}\n"
-
-        f"⚠️ <b>Cancel if price crosses C3 High:</b> "
-        f"{fvg['c3_high']:.12g}"
+    print(
+        f"[SCAN] {now_text}"
     )
-
-
-# ============================================================
-# ACTIVATE FVG
-# ============================================================
-
-def activate_fvg(
-    symbol,
-    interval,
-    fvg,
-    trend
-):
-
-    active_fvgs[symbol] = {
-        "symbol": symbol,
-        "interval": interval,
-        "c3_high": fvg["c3_high"],
-        "target": fvg["target"],
-        "fvg_low": fvg["fvg_low"],
-        "fvg_high": fvg["fvg_high"],
-        "fvg_ratio": fvg["fvg_ratio"],
-        "c3_open_time": fvg["c3_open_time"],
-        "c3_close_time": fvg["c3_close_time"]
-    }
-
-    message = build_signal_message(
-        symbol,
-        interval,
-        fvg,
-        trend
-    )
-
-    sent = send_telegram(
-        message
-    )
-
-    if sent:
-        print(
-            f"[FINAL SIGNAL] "
-            f"{symbol} | {interval} | "
-            f"C3 High={fvg['c3_high']:.12g} | "
-            f"Target={fvg['target']:.12g}"
-        )
-    else:
-        print(
-            f"[SIGNAL ERROR] "
-            f"{symbol} | {interval}"
-        )
-
-
-# ============================================================
-# MONITOR ACTIVE FVG
-# ============================================================
-
-def monitor_active_fvg(
-    symbol,
-    current_price
-):
-
-    active = active_fvgs.get(
-        symbol
-    )
-
-    if not active:
-        return False
-
-    c3_high = active[
-        "c3_high"
-    ]
-
-    target = active[
-        "target"
-    ]
 
     # --------------------------------------------------------
-    # TARGET HIT
+    # GET SYMBOLS
     # --------------------------------------------------------
 
-    if current_price <= target:
+    symbols = get_spot_usdt_symbols()
 
-        message = (
-            f"🎯 <b>TARGET HIT</b>\n\n"
-            f"<b>Symbol:</b> {symbol}\n"
-            f"<b>Interval:</b> "
-            f"{active['interval']}\n"
-            f"<b>Target:</b> "
-            f"{target:.12g}\n"
-            f"<b>Price:</b> "
-            f"{current_price:.12g}"
-        )
-
-        send_telegram(
-            message
-        )
-
+    if not symbols:
         print(
-            f"[TARGET HIT] "
-            f"{symbol} | "
-            f"Price={current_price:.12g} | "
-            f"Target={target:.12g}"
+            "[SCAN] No Spot USDT symbols."
         )
-
-        del active_fvgs[
-            symbol
-        ]
-
-        return True
-
-    # --------------------------------------------------------
-    # CANCEL
-    #
-    # Price crosses above C3 High.
-    # --------------------------------------------------------
-
-    if current_price > c3_high:
-
-        message = (
-            f"❌ <b>FVG CANCELLED</b>\n\n"
-            f"<b>Symbol:</b> {symbol}\n"
-            f"<b>Interval:</b> "
-            f"{active['interval']}\n"
-            f"<b>C3 High:</b> "
-            f"{c3_high:.12g}\n"
-            f"<b>Price:</b> "
-            f"{current_price:.12g}"
-        )
-
-        send_telegram(
-            message
-        )
-
-        print(
-            f"[CANCELLED] "
-            f"{symbol} | "
-            f"Price={current_price:.12g} | "
-            f"C3 High={c3_high:.12g}"
-        )
-
-        del active_fvgs[
-            symbol
-        ]
-
-        return True
-
-    return False
-
-
-# ============================================================
-# PROCESS ONE SYMBOL
-# ============================================================
-
-def process_symbol(
-    symbol,
-    market_data
-):
-
-    market = market_data.get(
-        symbol
-    )
-
-    if not market:
         return
 
-    volume = market[
-        "quote_volume"
-    ]
-
-    current_price = market[
-        "last_price"
-    ]
+    print(
+        f"[SYMBOLS] "
+        f"{len(symbols)} Spot USDT symbols"
+    )
 
     # --------------------------------------------------------
-    # Volume filter
+    # GET ALL 24H VOLUME + CURRENT PRICE
     # --------------------------------------------------------
 
-    if volume < MIN_QUOTE_VOLUME_24H:
+    ticker_data = get_24h_data()
+
+    if not ticker_data:
+        print(
+            "[SCAN] Could not get 24H ticker data."
+        )
         return
 
     # --------------------------------------------------------
-    # If active FVG exists, monitor it first.
-    # --------------------------------------------------------
-
-    if symbol in active_fvgs:
-
-        monitor_active_fvg(
-            symbol,
-            current_price
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # LIVE TREND
+    # ACTIVE SETUPS
     #
-    # Current Price > EMA20 > EMA50 > EMA100
+    # Bunlar yeni signal filtrlərindən asılı deyil.
+    # Hər scan monitor olunur.
     # --------------------------------------------------------
 
-    trend = get_bullish_trend(
-        symbol,
-        current_price
-    )
-
-    if not trend:
-        return
-
-    # --------------------------------------------------------
-    # TREND NOT BULLISH
-    #
-    # Reset trend confirmation.
-    # Therefore an FVG from the previous bullish phase
-    # cannot be used later.
-    # --------------------------------------------------------
-
-    if not trend["bullish"]:
-
-        if symbol in trend_confirmed_since:
-            del trend_confirmed_since[
-                symbol
-            ]
-
-        return
-
-    # --------------------------------------------------------
-    # FIRST MOMENT OF CURRENT BULLISH TREND
-    # --------------------------------------------------------
-
-    if symbol not in trend_confirmed_since:
-
-        trend_confirmed_since[
-            symbol
-        ] = time.time()
-
-        print(
-            f"[TREND CONFIRMED] "
-            f"{symbol} | "
-            f"Price={current_price:.12g} | "
-            f"EMA20={trend['ema20']:.12g} | "
-            f"EMA50={trend['ema50']:.12g} | "
-            f"EMA100={trend['ema100']:.12g}"
-        )
-
-    # --------------------------------------------------------
-    # FVG eligibility begins ONLY after:
-    #
-    # 1) Bot started
-    # 2) Current bullish trend was confirmed
-    #
-    # --------------------------------------------------------
-
-    eligible_after = max(
-        BOT_START_TIME,
-        trend_confirmed_since[
-            symbol
-        ]
+    monitor_active_setups(
+        ticker_data
     )
 
     # --------------------------------------------------------
-    # Check 15m then 1h
+    # NEW SIGNAL PIPELINE
+    #
+    # 1. VOLUME
+    # 2. TREND
+    # 3. FVG
+    #
+    # ƏLAVƏ trend_confirmed_since YOXDUR.
     # --------------------------------------------------------
 
-    for interval in FVG_INTERVALS:
+    for symbol in symbols:
 
-        fvg = find_new_bearish_fvg(
-            symbol,
-            interval,
-            eligible_after
-        )
+        # ----------------------------------------------------
+        # Bir symbol üçün artıq aktiv FVG varsa,
+        # yeni FVG açma.
+        # ----------------------------------------------------
 
-        if not fvg:
+        if symbol in active_setups:
             continue
 
-        # ----------------------------------------------------
-        # FINAL SIGNAL
-        # ----------------------------------------------------
-
-        activate_fvg(
-            symbol,
-            interval,
-            fvg,
-            trend
+        ticker = ticker_data.get(
+            symbol
         )
 
-        # Only one active FVG per symbol.
-        break
+        if not ticker:
+            continue
+
+        volume = ticker[
+            "quote_volume"
+        ]
+
+        current_price = ticker[
+            "last_price"
+        ]
+
+        # ====================================================
+        # 1. VOLUME
+        # ====================================================
+
+        if volume < MIN_QUOTE_VOLUME_24H:
+            continue
+
+        # ====================================================
+        # 2. LIVE TREND
+        # ====================================================
+
+        trend_ok, trend_data = (
+            check_live_trend(
+                symbol,
+                current_price
+            )
+        )
+
+        if not trend_ok:
+            continue
+
+        # ====================================================
+        # 3. FVG
+        # ====================================================
+
+        for interval in FVG_INTERVALS:
+
+            # Bir interval-də FVG tapılıbsa,
+            # digər intervalə keçməyə ehtiyac yoxdur.
+            if symbol in active_setups:
+                break
+
+            fvg = find_new_fvg(
+                symbol,
+                interval
+            )
+
+            if not fvg:
+                continue
+
+            # =================================================
+            # FINAL SIGNAL
+            # =================================================
+
+            create_signal(
+                symbol=symbol,
+                interval=interval,
+                fvg=fvg,
+                current_price=current_price,
+                trend_data=trend_data,
+                volume=volume
+            )
+
+            break
 
 
 # ============================================================
-# MAIN
+# STARTUP INFO
 # ============================================================
 
-def main():
-
-    print("=" * 70)
-    print(
-        "BINANCE BEARISH FVG TELEGRAM BOT"
+def print_startup_info():
+    bot_start_text = datetime.fromtimestamp(
+        BOT_START_TIME,
+        tz=timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
     )
+
+    print()
+    print("=" * 70)
+    print("BINANCE BEARISH FVG BOT")
     print("=" * 70)
 
     print(
-        f"Min 24H volume: "
+        f"Bot start: {bot_start_text}"
+    )
+
+    print(
+        f"Volume >= "
         f"${MIN_QUOTE_VOLUME_24H:,.0f}"
     )
 
     print(
-        f"FVG minimum ratio: "
-        f"{FVG_MIN_RATIO * 100:.0f}%"
+        "Trend: "
+        "Current Price > EMA20 > EMA50 > EMA100"
+    )
+
+    print(
+        f"EMA candles: {EMA_CANDLES}"
+    )
+
+    print(
+        f"FVG intervals: "
+        f"{', '.join(FVG_INTERVALS)}"
+    )
+
+    print(
+        f"FVG minimum: "
+        f"{FVG_MIN_RATIO * 100:.0f}% "
+        "of C2 Open-Close body"
+    )
+
+    print(
+        "FVG position: "
+        "anywhere inside C2 body"
     )
 
     print(
@@ -1139,205 +1039,72 @@ def main():
     )
 
     print(
-        f"FVG intervals: "
-        f"{FVG_INTERVALS}"
+        f"Scan: every {SCAN_SECONDS} seconds"
     )
 
     print(
-        f"Trend candles: "
-        f"{TREND_KLINE_LIMIT} x 1H"
+        "Trend-confirmation timestamp: DISABLED"
     )
 
     print(
-        "Trend condition: "
-        "Current Price > EMA20 > EMA50 > EMA100"
-    )
-
-    print(
-        "Historical FVGs: BLOCKED"
-    )
-
-    print(
-        "FVG eligibility: "
-        "AFTER BOT START + AFTER TREND CONFIRMATION"
-    )
-
-    print(
-        f"Scan interval: "
-        f"{SCAN_INTERVAL_SECONDS}s"
-    )
-
-    print(
-        f"Bot start: "
-        f"{datetime.fromtimestamp("
-        f"BOT_START_TIME, "
-        f"tz=timezone.utc"
-        f").strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        "Historical FVG protection: ENABLED"
     )
 
     print("=" * 70)
+    print()
 
-    # --------------------------------------------------------
-    # Telegram connection test
-    # Does NOT send a Telegram message.
-    # --------------------------------------------------------
 
-    test_telegram_connection()
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
-    # --------------------------------------------------------
-    # Get symbols
-    # --------------------------------------------------------
+def main():
 
-    symbols = get_spot_usdt_symbols()
+    print_startup_info()
 
-    if not symbols:
-
+    if not TELEGRAM_BOT_TOKEN:
         print(
-            "[FATAL] "
-            "No Spot USDT symbols found."
+            "[WARNING] "
+            "TELEGRAM_BOT_TOKEN is not set."
         )
 
-        return
-
-    print(
-        f"[SYMBOLS] "
-        f"{len(symbols)} Spot USDT symbols found."
-    )
-
-    # --------------------------------------------------------
-    # Main loop
-    # --------------------------------------------------------
+    if not TELEGRAM_CHAT_ID:
+        print(
+            "[WARNING] "
+            "TELEGRAM_CHAT_ID is not set."
+        )
 
     while True:
 
-        cycle_start = time.time()
+        start_time = time.time()
 
-        print(
-            "\n"
-            + "=" * 70
-        )
+        try:
+            scan()
 
-        print(
-            f"[SCAN] "
-            f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
-        )
-
-        # ----------------------------------------------------
-        # One bulk 24H request
-        # Gives:
-        #   volume
-        #   current price
-        # ----------------------------------------------------
-
-        market_data = (
-            get_24h_market_data()
-        )
-
-        if not market_data:
+        except Exception as e:
 
             print(
-                "[SCAN ERROR] "
-                "Could not get market data."
+                f"[SCAN ERROR] {e}"
             )
-
-            time.sleep(
-                SCAN_INTERVAL_SECONDS
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # Process symbols
-        # ----------------------------------------------------
-
-        qualified_count = 0
-
-        for symbol in symbols:
-
-            market = market_data.get(
-                symbol
-            )
-
-            if not market:
-                continue
-
-            volume = market[
-                "quote_volume"
-            ]
-
-            if volume < MIN_QUOTE_VOLUME_24H:
-                continue
-
-            qualified_count += 1
-
-            try:
-
-                process_symbol(
-                    symbol,
-                    market_data
-                )
-
-            except Exception as e:
-
-                print(
-                    f"[SYMBOL ERROR] "
-                    f"{symbol}: {e}"
-                )
-
-            # Small delay helps avoid API bursts.
-            time.sleep(0.03)
-
-        print(
-            f"[VOLUME QUALIFIED COUNT] "
-            f"{qualified_count}"
-        )
-
-        # ----------------------------------------------------
-        # Cycle timing
-        # ----------------------------------------------------
 
         elapsed = (
             time.time()
-            - cycle_start
+            - start_time
         )
 
-        sleep_for = max(
+        sleep_time = max(
             1,
-            SCAN_INTERVAL_SECONDS
-            - elapsed
-        )
-
-        print(
-            f"[SCAN COMPLETE] "
-            f"{elapsed:.1f}s | "
-            f"Next scan in {sleep_for:.1f}s"
+            SCAN_SECONDS - elapsed
         )
 
         time.sleep(
-            sleep_for
+            sleep_time
         )
 
 
 # ============================================================
-# ENTRY
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
-
-    try:
-
-        main()
-
-    except KeyboardInterrupt:
-
-        print(
-            "\n[BOT] Stopped by user."
-        )
-
-    except Exception as e:
-
-        print(
-            f"[FATAL ERROR] {e}"
-        )
-
-        raise
+    main()
