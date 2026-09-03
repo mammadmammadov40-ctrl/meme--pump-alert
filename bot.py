@@ -1,400 +1,167 @@
-import os
 import time
-import json
 import requests
 from datetime import datetime, timezone
 
-
 # ============================================================
-# BINANCE SPOT BEAR FVG ALERT BOT
-#
-# BINANCE VOLUME FILTER VERSION
-#
-# CMC has been completely removed.
-#
-# STRATEGY
-#
-# 1) Binance Spot USDT pairs
-# 2) 24H quote volume > $10,000,000
-# 3) 1H trend:
-#       Close > EMA20 > EMA50 > EMA100
-# 4) First search 15M Bear FVG
-#    If no valid NEW 15M FVG -> search NEW 1H Bear FVG
-# 5) Bear FVG:
-#       Candle 1 Low > Candle 3 High
-#       Candle 1 bearish
-#       Candle 2 bearish
-#       FVG completely inside Candle 2 Open/Close body
-#       FVG size >= 50% of Candle 2 body
-# 6) FVG becomes active AFTER Candle 3 closes
-# 7) Active FVG:
-#       Price <= Candle 3 High - 1.7%
-#           -> Telegram signal
-#       Price > Candle 3 High
-#           -> FVG CANCEL
-# 8) After TARGET or CANCEL:
-#       Forget old FVG
-#       Return to 1H trend
-#       Search for NEW FVG
-# 9) Scan every 60 seconds
-# 10) Binance 24H volume data refreshes every 5 minutes
-#
-# IMPORTANT:
-#   - No CMC API key is required.
-#   - Binance public market-data endpoints are used.
+# CONFIG
 # ============================================================
-
-
-# ============================================================
-# API SETTINGS
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
 
-# ============================================================
-# STRATEGY SETTINGS
-# ============================================================
+# 24H minimum quote volume
+MIN_QUOTE_VOLUME_24H = 20_000_000
 
-MIN_24H_QUOTE_VOLUME = 10_000_000
-
+# Bearish FVG minimum size
 FVG_MIN_RATIO = 0.50
 
-TARGET_DROP_PERCENT = 1.7
+# Target: Candle 3 High - 1.7%
+TARGET_PERCENT = 1.7
 
-SCAN_INTERVAL = 60
+# Scan interval
+SCAN_INTERVAL_SECONDS = 60
+
+# 15M first, then 1H
+FVG_INTERVALS = ["15m", "1h"]
+
+# EMA settings
+EMA_FAST = 20
+EMA_MID = 50
+EMA_SLOW = 100
 
 
 # ============================================================
-# BINANCE VOLUME SETTINGS
+# SESSION STATE
 # ============================================================
 
-# The 24H ticker changes continuously, but it is unnecessary to
-# request it every scan. Refresh every 5 minutes.
-VOLUME_CACHE_SECONDS = 5 * 60
-
-BINANCE_TIMEOUT = 15
-
-
-# ============================================================
-# BINANCE SETTINGS / BOT STATE
-# ============================================================
-
-SYMBOL_CACHE_SECONDS = 60 * 60
-
+# Active FVG:
+# {
+#     "symbol": ...,
+#     "interval": ...,
+#     "c1_open_time": ...,
+#     "c2_open_time": ...,
+#     "c3_open_time": ...,
+#     "c1_low": ...,
+#     "c2_open": ...,
+#     "c2_close": ...,
+#     "c3_high": ...,
+#     "fvg_low": ...,
+#     "fvg_high": ...,
+#     "target": ...
+# }
 active_fvgs = {}
+
+# Last processed Candle 3 for each symbol/timeframe.
+# This prevents re-using an old FVG.
 last_processed_fvg = {}
 
-volume_cache = {}
-volume_cache_time = 0
+# Search baseline for each symbol/timeframe.
+# Only FVGs formed after this point are considered NEW.
+fvg_search_start = {}
 
-binance_symbols_cache = []
-binance_symbols_cache_time = 0
+# Symbols that have already passed the $20M qualification.
+qualified_symbols = set()
 
-# Symbols that have already received the startup/new-entry FVG
-# baseline. This prevents newly-qualified coins from triggering
-# on an old historical FVG.
-baseline_symbols = set()
+# Cache for 24H volume
+volume_cache = {
+    "timestamp": 0,
+    "symbols": []
+}
 
-
-# ============================================================
-# SESSION
-# ============================================================
-
-session = requests.Session()
-
-session.headers.update({
-    "User-Agent": "Bear-FVG-Bot/4.0",
-    "Accept": "application/json",
-    "Accept-Encoding": "gzip, deflate",
-})
+VOLUME_CACHE_SECONDS = 300
 
 
 # ============================================================
-# TIME
-# ============================================================
-
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-def format_time(timestamp_ms):
-    dt = datetime.fromtimestamp(
-        timestamp_ms / 1000,
-        tz=timezone.utc
-    )
-
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-def log(message=""):
-    print(message, flush=True)
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("[TELEGRAM] Credentials missing.")
-        return False
-
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
-
-    try:
-        response = session.post(
-            url,
-            json=payload,
-            timeout=15
-        )
-
-        response.raise_for_status()
-
-        return True
-
-    except Exception as e:
-        log(f"[TELEGRAM] Error: {e}")
-        return False
-
-
-# ============================================================
-# BINANCE REQUEST
+# BINANCE HELPERS
 # ============================================================
 
 def binance_get(endpoint, params=None):
-
     url = BINANCE_BASE_URL + endpoint
 
     try:
-        response = session.get(
+        response = requests.get(
             url,
             params=params,
-            timeout=BINANCE_TIMEOUT
+            timeout=15
         )
-
-        if response.status_code == 429:
-            retry_after = response.headers.get(
-                "Retry-After",
-                "unknown"
-            )
-
-            log(
-                f"[BINANCE] Rate limit 429 | "
-                f"{endpoint} | Retry-After={retry_after}"
-            )
-
-            return None
-
         response.raise_for_status()
-
         return response.json()
 
-    except requests.exceptions.Timeout:
-        log(f"[BINANCE] Timeout | {endpoint}")
-        return None
-
     except Exception as e:
-        log(f"[BINANCE] Error | {endpoint} | {e}")
+        print(f"[BINANCE ERROR] {endpoint}: {e}")
         return None
 
 
 # ============================================================
-# BINANCE SPOT USDT SYMBOLS
+# GET ALL SPOT USDT SYMBOLS
 # ============================================================
 
-def get_binance_spot_symbols():
-
-    global binance_symbols_cache
-    global binance_symbols_cache_time
-
-    current_time = time.time()
-
-    if (
-        binance_symbols_cache
-        and current_time - binance_symbols_cache_time
-        < SYMBOL_CACHE_SECONDS
-    ):
-        return binance_symbols_cache
-
-    log("[BINANCE] Updating Spot USDT symbols...")
-
+def get_spot_usdt_symbols():
     data = binance_get("/api/v3/exchangeInfo")
 
     if not data:
-        log(
-            "[BINANCE] exchangeInfo failed. "
-            "Using old symbol cache."
-        )
-        return binance_symbols_cache
+        return []
 
     symbols = []
 
     for item in data.get("symbols", []):
-
-        if item.get("status") != "TRADING":
-            continue
-
-        if item.get("quoteAsset") != "USDT":
-            continue
-
-        if not item.get("isSpotTradingAllowed", False):
-            continue
-
-        symbol = item.get("symbol")
-        base_asset = item.get("baseAsset")
-
-        if not symbol or not base_asset:
-            continue
-
-        symbols.append({
-            "symbol": symbol,
-            "base_asset": base_asset
-        })
-
-    binance_symbols_cache = symbols
-    binance_symbols_cache_time = current_time
-
-    log(
-        f"[BINANCE] Spot USDT pairs: {len(symbols)}"
-    )
+        if (
+            item.get("status") == "TRADING"
+            and item.get("quoteAsset") == "USDT"
+            and item.get("isSpotTradingAllowed") is True
+        ):
+            symbols.append(item["symbol"])
 
     return symbols
 
 
 # ============================================================
-# BINANCE 24H VOLUME
-# ============================================================
-
-def get_24h_volumes():
-    global volume_cache
-    global volume_cache_time
-
-    current_time = time.time()
-
-    # Use cache between refreshes.
-    if (
-        volume_cache
-        and current_time - volume_cache_time < VOLUME_CACHE_SECONDS
-    ):
-        age = (current_time - volume_cache_time) / 60
-        log(
-            f"[VOLUME] Using cache ({age:.1f} min old) | "
-            f"Qualified > ${MIN_24H_QUOTE_VOLUME:,.0f}"
-        )
-        return volume_cache
-
-    log("[VOLUME] Updating Binance 24H ticker data...")
-
-    data = binance_get("/api/v3/ticker/24hr")
-
-    if not data or not isinstance(data, list):
-        log("[VOLUME] 24H ticker request failed.")
-        if volume_cache:
-            log("[VOLUME] Keeping previous valid volume cache.")
-        return volume_cache
-
-    new_cache = {}
-
-    for ticker in data:
-        symbol = ticker.get("symbol")
-        if not symbol:
-            continue
-
-        try:
-            quote_volume = float(ticker.get("quoteVolume", 0))
-        except (TypeError, ValueError):
-            continue
-
-        if quote_volume <= 0:
-            continue
-
-        new_cache[str(symbol).upper()] = quote_volume
-
-    if not new_cache:
-        log("[VOLUME] Empty 24H volume response.")
-        return volume_cache
-
-    volume_cache = new_cache
-    volume_cache_time = time.time()
-
-    log(
-        f"[VOLUME] Updated: {len(volume_cache)} symbols | "
-        f"Qualified > ${MIN_24H_QUOTE_VOLUME:,.0f} will be selected."
-    )
-
-    return volume_cache
-
-
-# ============================================================
-# FILTER QUALIFIED COINS
+# $20M VOLUME FILTER
 # ============================================================
 
 def get_qualified_symbols():
-    log("[FILTER] Getting Binance Spot USDT pairs...")
+    global volume_cache
 
-    binance_symbols = get_binance_spot_symbols()
+    now = time.time()
 
-    if not binance_symbols:
-        log("[FILTER] No Binance symbols available.")
-        return []
+    if now - volume_cache["timestamp"] < VOLUME_CACHE_SECONDS:
+        return volume_cache["symbols"]
 
-    volumes = get_24h_volumes()
+    data = binance_get("/api/v3/ticker/24hr")
 
-    if not volumes:
-        log("[FILTER] NO 24H VOLUME DATA.")
-        log("[FILTER] Signals are blocked until valid Binance volume data is available.")
-        return []
+    if not data:
+        return volume_cache["symbols"]
 
     qualified = []
 
-    for item in binance_symbols:
-        symbol = item["symbol"]
-        base_asset = item["base_asset"].upper()
+    for item in data:
 
-        quote_volume = volumes.get(symbol.upper(), 0)
+        symbol = item.get("symbol", "")
 
-        if quote_volume > MIN_24H_QUOTE_VOLUME:
-            qualified.append({
-                "symbol": symbol,
-                "base_asset": base_asset,
-                "quote_volume": quote_volume
-            })
+        if not symbol.endswith("USDT"):
+            continue
 
-    qualified.sort(
-        key=lambda x: x["quote_volume"],
-        reverse=True
-    )
+        try:
+            quote_volume = float(item.get("quoteVolume", 0))
+        except:
+            continue
 
-    log(
-        f"[FILTER] Qualified > ${MIN_24H_QUOTE_VOLUME:,.0f} "
-        f"24H volume: {len(qualified)}"
-    )
+        if quote_volume >= MIN_QUOTE_VOLUME_24H:
+            qualified.append(symbol)
+
+    volume_cache["timestamp"] = now
+    volume_cache["symbols"] = qualified
 
     return qualified
 
 
 # ============================================================
-# KLINES
+# CLOSED KLINES
 # ============================================================
 
-def get_klines(symbol, interval, limit=100):
+def get_closed_klines(symbol, interval, limit=150):
 
     data = binance_get(
         "/api/v3/klines",
@@ -408,289 +175,19 @@ def get_klines(symbol, interval, limit=100):
     if not data:
         return []
 
-    return data
-
-
-# ============================================================
-# CLOSED KLINES
-# ============================================================
-
-def get_closed_klines(symbol, interval, limit=100):
-
-    klines = get_klines(
-        symbol,
-        interval,
-        limit
-    )
-
-    if len(klines) < 3:
-        return []
-
-    current_time_ms = int(time.time() * 1000)
+    now_ms = int(time.time() * 1000)
 
     closed = []
 
-    for candle in klines:
+    for candle in data:
 
-        close_time = candle[6]
+        close_time = int(candle[6])
 
-        if close_time <= current_time_ms:
+        # Candle must be completely closed
+        if close_time < now_ms:
             closed.append(candle)
 
     return closed
-
-
-# ============================================================
-# EMA
-# ============================================================
-
-def calculate_ema(values, period):
-
-    if len(values) < period:
-        return None
-
-    multiplier = 2 / (period + 1)
-
-    ema = sum(values[:period]) / period
-
-    for price in values[period:]:
-        ema = (
-            (price - ema)
-            * multiplier
-            + ema
-        )
-
-    return ema
-
-
-# ============================================================
-# 1H TREND
-# ============================================================
-
-def check_1h_trend(symbol):
-
-    klines = get_closed_klines(
-        symbol,
-        "1h",
-        150
-    )
-
-    if len(klines) < 101:
-
-        log(
-            f"[TREND] {symbol}: "
-            "not enough closed candles."
-        )
-
-        return False
-
-    closes = [
-        float(candle[4])
-        for candle in klines
-    ]
-
-    current_close = closes[-1]
-
-    ema20 = calculate_ema(
-        closes,
-        20
-    )
-
-    ema50 = calculate_ema(
-        closes,
-        50
-    )
-
-    ema100 = calculate_ema(
-        closes,
-        100
-    )
-
-    if (
-        ema20 is None
-        or ema50 is None
-        or ema100 is None
-    ):
-        return False
-
-    trend_ok = (
-        current_close > ema20
-        and ema20 > ema50
-        and ema50 > ema100
-    )
-
-    if trend_ok:
-
-        log(
-            f"[TREND] {symbol}: PASS | "
-            f"Close={current_close} | "
-            f"EMA20={ema20:.8f} | "
-            f"EMA50={ema50:.8f} | "
-            f"EMA100={ema100:.8f}"
-        )
-
-    return trend_ok
-
-
-# ============================================================
-# BEAR FVG DETECTION
-# ============================================================
-
-def find_new_bearish_fvg(symbol, interval):
-
-    klines = get_closed_klines(
-        symbol,
-        interval,
-        100
-    )
-
-    if len(klines) < 3:
-        return None
-
-    last_processed = last_processed_fvg.get(
-        (symbol, interval),
-        0
-    )
-
-    # Newest -> oldest
-    for i in range(
-        len(klines) - 3,
-        -1,
-        -1
-    ):
-
-        c1 = klines[i]
-        c2 = klines[i + 1]
-        c3 = klines[i + 2]
-
-        c3_open_time = c3[0]
-
-        if c3_open_time <= last_processed:
-            continue
-
-        # Candle 1
-        c1_open = float(c1[1])
-        c1_close = float(c1[4])
-        c1_low = float(c1[3])
-
-        if c1_close >= c1_open:
-            continue
-
-        # Candle 2
-        c2_open = float(c2[1])
-        c2_close = float(c2[4])
-
-        if c2_close >= c2_open:
-            continue
-
-        body_low = min(c2_open, c2_close)
-        body_high = max(c2_open, c2_close)
-
-        body_size = body_high - body_low
-
-        if body_size <= 0:
-            continue
-
-        # Candle 3
-        c3_high = float(c3[2])
-
-        # Bear FVG
-        if c1_low <= c3_high:
-            continue
-
-        fvg_low = c3_high
-        fvg_high = c1_low
-
-        fvg_size = fvg_high - fvg_low
-
-        if fvg_size <= 0:
-            continue
-
-        # FVG inside Candle 2 body
-        if fvg_low < body_low:
-            continue
-
-        if fvg_high > body_high:
-            continue
-
-        # FVG >= 50% body
-        fvg_ratio = fvg_size / body_size
-
-        if fvg_ratio < FVG_MIN_RATIO:
-            continue
-
-        # Target
-        target_price = (
-            c3_high
-            * (1 - TARGET_DROP_PERCENT / 100)
-        )
-
-        log(
-            f"[FVG] {symbol} {interval}: "
-            f"NEW VALID FVG | "
-            f"C3 High={c3_high} | "
-            f"FVG={fvg_low}-{fvg_high} | "
-            f"Ratio={fvg_ratio * 100:.2f}%"
-        )
-
-        return {
-            "symbol": symbol,
-            "interval": interval,
-            "candle1_time": c1[0],
-            "candle2_time": c2[0],
-            "candle3_time": c3[0],
-            "candle1_low": c1_low,
-            "candle2_open": c2_open,
-            "candle2_close": c2_close,
-            "candle2_body": body_size,
-            "candle3_high": c3_high,
-            "fvg_low": fvg_low,
-            "fvg_high": fvg_high,
-            "fvg_size": fvg_size,
-            "fvg_ratio": fvg_ratio,
-            "target": target_price,
-            "activated_at": time.time()
-        }
-
-    return None
-
-
-# ============================================================
-# SEARCH NEW FVG
-# ============================================================
-
-def search_new_fvg(symbol):
-
-    fvg_15m = find_new_bearish_fvg(
-        symbol,
-        "15m"
-    )
-
-    if fvg_15m:
-
-        log(
-            f"[FVG] {symbol}: "
-            "15M FVG selected."
-        )
-
-        return fvg_15m
-
-    fvg_1h = find_new_bearish_fvg(
-        symbol,
-        "1h"
-    )
-
-    if fvg_1h:
-
-        log(
-            f"[FVG] {symbol}: "
-            "No new 15M FVG. "
-            "1H FVG selected."
-        )
-
-        return fvg_1h
-
-    return None
 
 
 # ============================================================
@@ -711,85 +208,428 @@ def get_current_price(symbol):
 
     try:
         return float(data["price"])
-    except Exception:
+    except:
         return None
+
+
+# ============================================================
+# EMA
+# ============================================================
+
+def calculate_ema(values, period):
+
+    if len(values) < period:
+        return None
+
+    multiplier = 2 / (period + 1)
+
+    ema = sum(values[:period]) / period
+
+    for price in values[period:]:
+        ema = (price - ema) * multiplier + ema
+
+    return ema
+
+
+# ============================================================
+# 1H BULLISH TREND
+# ============================================================
+
+def is_bullish_1h_trend(symbol):
+
+    candles = get_closed_klines(
+        symbol,
+        "1h",
+        150
+    )
+
+    if len(candles) < EMA_SLOW:
+        return False
+
+    closes = [
+        float(candle[4])
+        for candle in candles
+    ]
+
+    current_close = closes[-1]
+
+    ema20 = calculate_ema(
+        closes,
+        EMA_FAST
+    )
+
+    ema50 = calculate_ema(
+        closes,
+        EMA_MID
+    )
+
+    ema100 = calculate_ema(
+        closes,
+        EMA_SLOW
+    )
+
+    if None in (ema20, ema50, ema100):
+        return False
+
+    bullish = (
+        current_close > ema20
+        and ema20 > ema50
+        and ema50 > ema100
+    )
+
+    print(
+        f"[TREND] {symbol} | "
+        f"Close={current_close:.8f} | "
+        f"EMA20={ema20:.8f} | "
+        f"EMA50={ema50:.8f} | "
+        f"EMA100={ema100:.8f} | "
+        f"BULLISH={bullish}"
+    )
+
+    return bullish
+
+
+# ============================================================
+# FVG BASELINE
+# ============================================================
+
+def get_latest_closed_candle_open_time(symbol, interval):
+
+    candles = get_closed_klines(
+        symbol,
+        interval,
+        5
+    )
+
+    if not candles:
+        return None
+
+    return int(candles[-1][0])
+
+
+def initialize_symbol_cycle(symbol):
+
+    """
+    Called when a symbol newly enters the $20M filter
+    or when the previous FVG cycle has finished.
+
+    Important:
+    Old FVGs are ignored.
+
+    The bot waits for a NEW FVG after this point.
+    """
+
+    for interval in FVG_INTERVALS:
+
+        latest_open = get_latest_closed_candle_open_time(
+            symbol,
+            interval
+        )
+
+        if latest_open is not None:
+
+            fvg_search_start[
+                (symbol, interval)
+            ] = latest_open
+
+            last_processed_fvg[
+                (symbol, interval)
+            ] = latest_open
+
+
+# ============================================================
+# BEARISH FVG DETECTION
+# ============================================================
+
+def find_new_bearish_fvg(symbol, interval):
+
+    candles = get_closed_klines(
+        symbol,
+        interval,
+        100
+    )
+
+    if len(candles) < 3:
+        return None
+
+    last_processed = last_processed_fvg.get(
+        (symbol, interval),
+        0
+    )
+
+    search_start = fvg_search_start.get(
+        (symbol, interval),
+        0
+    )
+
+    # --------------------------------------------------------
+    # Search from newest 3-candle formation backwards
+    # --------------------------------------------------------
+
+    for i in range(len(candles) - 1, 1, -1):
+
+        c1 = candles[i - 2]
+        c2 = candles[i - 1]
+        c3 = candles[i]
+
+        c1_open_time = int(c1[0])
+        c2_open_time = int(c2[0])
+        c3_open_time = int(c3[0])
+
+        # Only NEW FVGs are allowed
+        if c3_open_time <= last_processed:
+            continue
+
+        if c3_open_time <= search_start:
+            continue
+
+        # ----------------------------------------------------
+        # Candle 1
+        # ----------------------------------------------------
+
+        c1_open = float(c1[1])
+        c1_high = float(c1[2])
+        c1_low = float(c1[3])
+        c1_close = float(c1[4])
+
+        # Candle 1 must be bearish
+        if c1_close >= c1_open:
+            continue
+
+        # ----------------------------------------------------
+        # Candle 2
+        # ----------------------------------------------------
+
+        c2_open = float(c2[1])
+        c2_high = float(c2[2])
+        c2_low = float(c2[3])
+        c2_close = float(c2[4])
+
+        # Candle 2 must be bearish
+        if c2_close >= c2_open:
+            continue
+
+        # Candle 2 BODY only
+        body_low = min(
+            c2_open,
+            c2_close
+        )
+
+        body_high = max(
+            c2_open,
+            c2_close
+        )
+
+        body_size = abs(
+            c2_open - c2_close
+        )
+
+        if body_size <= 0:
+            continue
+
+        # ----------------------------------------------------
+        # Candle 3
+        # ----------------------------------------------------
+
+        c3_open = float(c3[1])
+        c3_high = float(c3[2])
+        c3_low = float(c3[3])
+        c3_close = float(c3[4])
+
+        # ----------------------------------------------------
+        # Bearish FVG
+        #
+        # C1 Low > C3 High
+        # ----------------------------------------------------
+
+        if c1_low <= c3_high:
+            continue
+
+        fvg_low = c3_high
+        fvg_high = c1_low
+
+        fvg_size = fvg_high - fvg_low
+
+        if fvg_size <= 0:
+            continue
+
+        # ----------------------------------------------------
+        # FVG MUST BE COMPLETELY INSIDE CANDLE 2 BODY
+        #
+        # It may be anywhere inside the body:
+        # upper part / middle / lower part.
+        # ----------------------------------------------------
+
+        if fvg_low < body_low:
+            continue
+
+        if fvg_high > body_high:
+            continue
+
+        # ----------------------------------------------------
+        # FVG SIZE MUST BE AT LEAST 50% OF CANDLE 2 BODY
+        #
+        # This is NOT "above the upper half".
+        #
+        # The FVG can be anywhere inside the Open-Close body.
+        # Its SIZE must simply be >= 50% of the body.
+        # ----------------------------------------------------
+
+        fvg_ratio = fvg_size / body_size
+
+        if fvg_ratio < FVG_MIN_RATIO:
+            continue
+
+        # ----------------------------------------------------
+        # VALID NEW BEARISH FVG
+        # ----------------------------------------------------
+
+        return {
+            "symbol": symbol,
+            "interval": interval,
+
+            "c1_open_time": c1_open_time,
+            "c2_open_time": c2_open_time,
+            "c3_open_time": c3_open_time,
+
+            "c1_low": c1_low,
+
+            "c2_open": c2_open,
+            "c2_close": c2_close,
+
+            "c3_high": c3_high,
+
+            "fvg_low": fvg_low,
+            "fvg_high": fvg_high,
+
+            "fvg_size": fvg_size,
+            "c2_body_size": body_size,
+            "fvg_ratio": fvg_ratio,
+
+            "target": c3_high * (
+                1 - TARGET_PERCENT / 100
+            )
+        }
+
+    return None
+
+
+# ============================================================
+# FIND BEARISH FVG
+#
+# 15M FIRST
+# THEN 1H
+# ============================================================
+
+def find_bearish_fvg(symbol):
+
+    for interval in FVG_INTERVALS:
+
+        fvg = find_new_bearish_fvg(
+            symbol,
+            interval
+        )
+
+        if fvg:
+
+            print(
+                f"[FVG FOUND] {symbol} | "
+                f"{interval} | "
+                f"FVG={fvg['fvg_low']:.8f} - "
+                f"{fvg['fvg_high']:.8f} | "
+                f"Ratio={fvg['fvg_ratio'] * 100:.2f}%"
+            )
+
+            return fvg
+
+    return None
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(message):
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+
+    try:
+
+        requests.post(
+            url,
+            data=payload,
+            timeout=10
+        )
+
+    except Exception as e:
+
+        print(
+            f"[TELEGRAM ERROR] {e}"
+        )
 
 
 # ============================================================
 # ACTIVATE FVG
 # ============================================================
 
-def activate_fvg(fvg):
-
-    symbol = fvg["symbol"]
-    interval = fvg["interval"]
+def activate_fvg(symbol, fvg):
 
     active_fvgs[symbol] = fvg
 
-    last_processed_fvg[
-        (symbol, interval)
-    ] = fvg["candle3_time"]
-
-    log()
-    log("==========================================")
-    log("FVG ACTIVATED")
-    log("==========================================")
-
-    log(f"Symbol        : {symbol}")
-    log(f"Timeframe     : {interval}")
-
-    log(
-        f"Candle 3      : "
-        f"{format_time(fvg['candle3_time'])}"
+    key = (
+        symbol,
+        fvg["interval"]
     )
 
-    log(
-        f"Candle 3 High : "
-        f"{fvg['candle3_high']}"
+    # Mark Candle 3 as processed immediately.
+    # This prevents the same FVG from being selected again.
+    last_processed_fvg[key] = (
+        fvg["c3_open_time"]
     )
 
-    log(
-        f"FVG           : "
-        f"{fvg['fvg_low']} - "
-        f"{fvg['fvg_high']}"
+    print(
+        f"[FVG ACTIVE] {symbol} | "
+        f"TF={fvg['interval']} | "
+        f"FVG={fvg['fvg_low']:.8f} - "
+        f"{fvg['fvg_high']:.8f} | "
+        f"Target={fvg['target']:.8f}"
     )
-
-    log(
-        f"FVG Size      : "
-        f"{fvg['fvg_size']}"
-    )
-
-    log(
-        f"Body Size     : "
-        f"{fvg['candle2_body']}"
-    )
-
-    log(
-        f"FVG Ratio     : "
-        f"{fvg['fvg_ratio'] * 100:.2f}%"
-    )
-
-    log(
-        f"Target        : "
-        f"{fvg['target']}"
-    )
-
-    log("==========================================")
-    log()
 
 
 # ============================================================
-# FINISH FVG
+# RESET AFTER TARGET / CANCEL
 # ============================================================
 
-def finish_fvg(symbol):
+def reset_symbol_cycle(symbol):
 
-    if symbol in active_fvgs:
-        del active_fvgs[symbol]
+    active_fvgs.pop(
+        symbol,
+        None
+    )
 
-    log(
-        f"[FVG] {symbol}: Finished. "
-        "Returning to 1H trend."
+    # Start completely from a fresh cycle.
+    #
+    # Old FVGs are ignored.
+    # The next process begins again with:
+    #
+    # $20M -> 1H trend -> NEW FVG
+    #
+
+    initialize_symbol_cycle(
+        symbol
+    )
+
+    print(
+        f"[RESET] {symbol} -> "
+        f"1H trend check from fresh cycle"
     )
 
 
@@ -802,343 +642,310 @@ def monitor_active_fvg(symbol):
     fvg = active_fvgs.get(symbol)
 
     if not fvg:
-        return
+        return False
 
-    price = get_current_price(symbol)
+    current_price = get_current_price(
+        symbol
+    )
 
-    if price is None:
-
-        log(
-            f"[PRICE] {symbol}: "
-            "Could not get current price."
-        )
-
-        return
+    if current_price is None:
+        return True
 
     target = fvg["target"]
-    third_high = fvg["candle3_high"]
+    c3_high = fvg["c3_high"]
 
-    # TARGET
-    if price <= target:
+    print(
+        f"[MONITOR] {symbol} | "
+        f"Price={current_price:.8f} | "
+        f"Target={target:.8f} | "
+        f"C3 High={c3_high:.8f}"
+    )
+
+    # --------------------------------------------------------
+    # TARGET HIT
+    # --------------------------------------------------------
+
+    if current_price <= target:
 
         message = (
-            "🔴 BEAR FVG SIGNAL\n\n"
+            "🔻 BEARISH FVG TARGET\n\n"
             f"Symbol: {symbol}\n"
-            f"Timeframe: {fvg['interval']}\n\n"
-            f"3rd Candle High: {third_high}\n"
-            f"Target (-1.7%): {target}\n"
-            f"Current Price: {price}\n\n"
-            "Bear FVG target reached."
+            f"Timeframe: {fvg['interval']}\n"
+            f"FVG: {fvg['fvg_low']:.8f} - "
+            f"{fvg['fvg_high']:.8f}\n"
+            f"Candle 3 High: {c3_high:.8f}\n"
+            f"Target: {target:.8f}\n"
+            f"Current: {current_price:.8f}\n"
+            f"Target: -{TARGET_PERCENT}%"
         )
-
-        log()
-        log("==========================================")
-        log("🎯 TARGET REACHED")
-        log(message)
-        log("==========================================")
 
         send_telegram(message)
 
-        finish_fvg(symbol)
+        print(
+            f"[TARGET HIT] {symbol}"
+        )
 
-        return
+        reset_symbol_cycle(
+            symbol
+        )
 
-    # CANCEL
-    if price > third_high:
+        return True
 
-        log()
-        log("==========================================")
-        log(f"❌ {symbol}: FVG CANCELLED")
-        log(f"Current Price : {price}")
-        log(f"Candle 3 High: {third_high}")
-        log("==========================================")
+    # --------------------------------------------------------
+    # CANDLE 3 HIGH BROKEN
+    # --------------------------------------------------------
 
-        finish_fvg(symbol)
+    if current_price > c3_high:
 
-        return
+        print(
+            f"[FVG CANCELLED] {symbol} | "
+            f"Price broke Candle 3 High"
+        )
 
-    # STILL ACTIVE
-    distance_to_target = (
-        (third_high - price)
-        / third_high
-    ) * 100
+        reset_symbol_cycle(
+            symbol
+        )
 
-    log(
-        f"[ACTIVE] {symbol} | "
-        f"Price={price} | "
-        f"C3 High={third_high} | "
-        f"Target={target} | "
-        f"Drop={distance_to_target:.3f}%"
-    )
+        return True
+
+    # --------------------------------------------------------
+    # FVG STILL ACTIVE
+    # --------------------------------------------------------
+
+    return True
 
 
 # ============================================================
-# PROCESS ONE COIN
+# PROCESS ONE SYMBOL
 # ============================================================
 
-def process_symbol(item):
+def process_symbol(symbol):
 
-    symbol = item["symbol"]
+    # ========================================================
+    # STEP 1
+    # $20M QUALIFICATION
+    # ========================================================
 
-    # Active FVG blocks new searches.
+    if symbol not in qualified_symbols:
+
+        print(
+            f"[NEW $20M COIN] {symbol}"
+        )
+
+        qualified_symbols.add(
+            symbol
+        )
+
+        # Ignore old historical FVGs.
+        # Start waiting for a NEW FVG.
+        initialize_symbol_cycle(
+            symbol
+        )
+
+    # ========================================================
+    # STEP 2
+    # ACTIVE FVG?
+    #
+    # If yes, do NOT search for another FVG.
+    # ========================================================
+
     if symbol in active_fvgs:
 
-        monitor_active_fvg(symbol)
+        monitor_active_fvg(
+            symbol
+        )
 
         return
 
-    # 1H trend
-    trend_ok = check_1h_trend(symbol)
+    # ========================================================
+    # STEP 3
+    # 1H BULLISH TREND
+    #
+    # IMPORTANT:
+    # FVG SEARCH DOES NOT HAPPEN BEFORE THIS.
+    # ========================================================
 
-    if not trend_ok:
+    bullish = is_bullish_1h_trend(
+        symbol
+    )
+
+    if not bullish:
+
+        print(
+            f"[WAIT TREND] {symbol} | "
+            f"1H bullish trend not confirmed"
+        )
+
         return
 
-    # Search FVG
-    fvg = search_new_fvg(symbol)
+    # ========================================================
+    # STEP 4
+    # ONLY AFTER BULLISH TREND:
+    # SEARCH FOR BEARISH FVG
+    # ========================================================
+
+    fvg = find_bearish_fvg(
+        symbol
+    )
 
     if not fvg:
+
+        print(
+            f"[NO NEW BEARISH FVG] {symbol}"
+        )
+
         return
 
-    # Activate
-    activate_fvg(fvg)
+    # ========================================================
+    # STEP 5
+    # ACTIVATE FVG
+    # ========================================================
 
-
-# ============================================================
-# MARKET SCAN
-# ============================================================
-
-def market_scan():
-    log()
-    log("==========================================")
-    log(
-        f"MARKET SCAN "
-        f"{now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}"
-    )
-    log("==========================================")
-
-    qualified = get_qualified_symbols()
-
-    log(
-        f"[MARKET] Qualified coins "
-        f"(24H volume > ${MIN_24H_QUOTE_VOLUME:,.0f}): "
-        f"{len(qualified)}"
-    )
-
-    if not qualified:
-        log("[MARKET] No qualified coins.")
-        return []
-
-    for index, item in enumerate(
-        qualified,
-        start=1
-    ):
-        symbol = item["symbol"]
-        quote_volume = item["quote_volume"]
-
-        try:
-            log(
-                f"[{index}/{len(qualified)}] "
-                f"{symbol} | "
-                f"24H Volume ${quote_volume:,.0f}"
-            )
-
-            process_symbol(item)
-
-        except Exception as e:
-            log(
-                f"[ERROR] {symbol}: "
-                f"processing error: {e}"
-            )
-
-        time.sleep(0.05)
-
-    return qualified
-
-
-# ============================================================
-# INITIALIZE FVG BASELINE
-# ============================================================
-
-def initialize_fvg_baseline():
-
-    current_ms = int(time.time() * 1000)
-
-    interval_15m_ms = 15 * 60 * 1000
-
-    latest_closed_15m = (
-        current_ms // interval_15m_ms
-    ) * interval_15m_ms - interval_15m_ms
-
-    interval_1h_ms = 60 * 60 * 1000
-
-    latest_closed_1h = (
-        current_ms // interval_1h_ms
-    ) * interval_1h_ms - interval_1h_ms
-
-    log("[STARTUP] FVG historical baseline:")
-
-    log(
-        f"[STARTUP] Latest closed 15M: "
-        f"{format_time(latest_closed_15m)}"
-    )
-
-    log(
-        f"[STARTUP] Latest closed 1H: "
-        f"{format_time(latest_closed_1h)}"
-    )
-
-    return latest_closed_15m, latest_closed_1h
-
-
-# ============================================================
-# APPLY BASELINE
-# ============================================================
-
-def apply_fvg_baseline(
-    qualified,
-    latest_15m,
-    latest_1h
-):
-    newly_added = 0
-
-    for item in qualified:
-        symbol = item["symbol"]
-
-        if symbol in baseline_symbols:
-            continue
-
-        last_processed_fvg[
-            (symbol, "15m")
-        ] = latest_15m
-
-        last_processed_fvg[
-            (symbol, "1h")
-        ] = latest_1h
-
-        baseline_symbols.add(symbol)
-        newly_added += 1
-
-    log(
-        f"[STARTUP] FVG baseline applied to "
-        f"{newly_added} new qualified coins."
+    activate_fvg(
+        symbol,
+        fvg
     )
 
 
 # ============================================================
-# STARTUP
+# REMOVE SYMBOLS THAT NO LONGER QUALIFY
 # ============================================================
 
-def startup():
-    log()
-    log("==========================================")
-    log("BINANCE SPOT BEAR FVG BOT v5.0")
-    log("==========================================")
-    log()
+def cleanup_symbols(current_qualified):
 
-    log("Conditions:")
-    log()
-
-    log("1. Binance Spot USDT")
-    log("2. 24H quote volume > $10M")
-    log("3. 1H: Close > EMA20 > EMA50 > EMA100")
-    log("4. Search NEW 15M Bear FVG first")
-    log("5. Only if no 15M -> search NEW 1H")
-    log("6. Three candles must be CLOSED")
-    log("7. Candle 1 must be bearish")
-    log("8. Candle 2 must be bearish")
-    log("9. Candle 1 Low > Candle 3 High")
-    log("10. FVG inside Candle 2 body")
-    log("11. FVG >= 50% of Candle 2 body")
-    log("12. Target = 1.7% below Candle 3 High")
-    log("13. Candle 3 High crossed -> CANCEL")
-    log("14. One active FVG per coin")
-    log("15. Active FVG blocks new FVG searches")
-    log("16. After Target/Cancel -> return to 1H")
-    log("17. Scan every 60 seconds")
-    log("18. Binance 24H volume refresh = 5 minutes")
-    log("19. CMC completely removed")
-    log("20. Old startup FVGs are ignored")
-    log()
-    log("No RSI / MACD / extra volume filter.")
-    log("==========================================")
-    log()
-
-    send_telegram(
-        "🟢 Bear FVG Bot started.\n\n"
-        "Binance Spot USDT\n"
-        "24H quote volume > $10M\n"
-        "1H: Close > EMA20 > EMA50 > EMA100\n"
-        "15M FVG → 1H fallback\n"
-        "Bear FVG >= 50% of Candle 2 body\n"
-        "Target: -1.7%\n"
-        "Scan: 60 seconds\n"
-        "Volume refresh: 5 minutes\n"
-        "CMC: OFF"
+    current_set = set(
+        current_qualified
     )
 
+    old_symbols = (
+        qualified_symbols
+        - current_set
+    )
+
+    for symbol in old_symbols:
+
+        print(
+            f"[REMOVED < $20M] {symbol}"
+        )
+
+        qualified_symbols.discard(
+            symbol
+        )
+
+        # If there is no active FVG,
+        # clear its cycle state.
+        if symbol not in active_fvgs:
+
+            for interval in FVG_INTERVALS:
+
+                fvg_search_start.pop(
+                    (symbol, interval),
+                    None
+                )
+
+                last_processed_fvg.pop(
+                    (symbol, interval),
+                    None
+                )
+
 
 # ============================================================
-# MAIN
+# MAIN LOOP
 # ============================================================
 
 def main():
-    startup()
 
-    # FVG baseline timestamps.
-    latest_15m, latest_1h = initialize_fvg_baseline()
+    print("=" * 70)
+    print("BINANCE SPOT BEARISH FVG ALERT BOT")
+    print("=" * 70)
 
-    # Initial market data.
-    log("[STARTUP] Loading initial Binance market data...")
+    print(
+        f"Minimum 24H Volume: "
+        f"${MIN_QUOTE_VOLUME_24H:,.0f}"
+    )
 
-    qualified = get_qualified_symbols()
+    print(
+        f"FVG Minimum Body Ratio: "
+        f"{FVG_MIN_RATIO * 100:.0f}%"
+    )
 
-    if qualified:
-        apply_fvg_baseline(
-            qualified,
-            latest_15m,
-            latest_1h
-        )
+    print(
+        f"Target: "
+        f"{TARGET_PERCENT}% below Candle 3 High"
+    )
 
-    log("[STARTUP] Initialization complete.")
-    log()
+    print(
+        "FVG Priority: 15M -> 1H"
+    )
 
-    last_scan = 0
+    print("=" * 70)
 
     while True:
+
         try:
-            current_time = time.time()
 
-            if (
-                current_time - last_scan
-                >= SCAN_INTERVAL
-            ):
-                qualified = market_scan()
+            # =================================================
+            # GET CURRENT $20M+ COINS
+            # =================================================
 
-                # Baseline any symbols that became qualified
-                # after a volume refresh.
-                if qualified:
-                    apply_fvg_baseline(
-                        qualified,
-                        latest_15m,
-                        latest_1h
+            qualified = get_qualified_symbols()
+
+            if not qualified:
+
+                print(
+                    "[NO QUALIFIED SYMBOLS]"
+                )
+
+                time.sleep(
+                    SCAN_INTERVAL_SECONDS
+                )
+
+                continue
+
+            cleanup_symbols(
+                qualified
+            )
+
+            print(
+                f"\n[SCAN] "
+                f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} | "
+                f"Qualified={len(qualified)}"
+            )
+
+            # =================================================
+            # PROCESS SYMBOLS
+            # =================================================
+
+            for symbol in qualified:
+
+                try:
+
+                    process_symbol(
+                        symbol
                     )
 
-                last_scan = current_time
+                except Exception as e:
 
-            time.sleep(1)
+                    print(
+                        f"[SYMBOL ERROR] "
+                        f"{symbol}: {e}"
+                    )
 
-        except KeyboardInterrupt:
-            log()
-            log("Bot stopped.")
-            break
+                time.sleep(0.05)
 
         except Exception as e:
-            log(f"[MAIN ERROR] {e}")
-            time.sleep(5)
+
+            print(
+                f"[MAIN LOOP ERROR] {e}"
+            )
+
+        time.sleep(
+            SCAN_INTERVAL_SECONDS
+        )
 
 
 # ============================================================
-# RUN
+# START
 # ============================================================
 
 if __name__ == "__main__":
