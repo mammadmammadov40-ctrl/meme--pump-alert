@@ -8,25 +8,14 @@ from datetime import datetime, timezone
 # ============================================================
 # BINANCE SPOT BEAR FVG ALERT BOT
 #
-# CMC FIXED VERSION
+# BINANCE VOLUME FILTER VERSION
 #
-# Main fixes:
-#   - Uses current CMC v3 listings endpoint
-#   - Requests only coins with market cap >= $300M
-#   - Uses a smaller CMC page size to reduce credits
-#   - Correctly distinguishes CMC 429 minute-limit from
-#     monthly-credit-limit errors
-#   - Does NOT impose an unnecessary 30-minute cooldown on
-#     a normal per-minute 429
-#   - Prints CMC error_code + error_message
-#   - Preserves the last valid CMC cache after temporary errors
-#   - Applies the FVG startup baseline once market-cap data
-#     becomes available
+# CMC has been completely removed.
 #
 # STRATEGY
 #
 # 1) Binance Spot USDT pairs
-# 2) CoinMarketCap Market Cap > $300M
+# 2) 24H quote volume > $10,000,000
 # 3) 1H trend:
 #       Close > EMA20 > EMA50 > EMA100
 # 4) First search 15M Bear FVG
@@ -48,19 +37,17 @@ from datetime import datetime, timezone
 #       Return to 1H trend
 #       Search for NEW FVG
 # 9) Scan every 60 seconds
-# 10) CMC cache refresh every 30 minutes
+# 10) Binance 24H volume data refreshes every 5 minutes
 #
 # IMPORTANT:
-#   - Never put API keys directly in this file.
-#   - Set them in Railway Variables.
+#   - No CMC API key is required.
+#   - Binance public market-data endpoints are used.
 # ============================================================
 
 
 # ============================================================
 # API SETTINGS
 # ============================================================
-
-CMC_API_KEY = os.getenv("CMC_API_KEY")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -72,7 +59,7 @@ BINANCE_BASE_URL = "https://api.binance.com"
 # STRATEGY SETTINGS
 # ============================================================
 
-MIN_MARKET_CAP = 300_000_000
+MIN_24H_QUOTE_VOLUME = 10_000_000
 
 FVG_MIN_RATIO = 0.50
 
@@ -82,58 +69,35 @@ SCAN_INTERVAL = 60
 
 
 # ============================================================
-# CMC SETTINGS
+# BINANCE VOLUME SETTINGS
 # ============================================================
 
-# Market cap data does not need to be requested every minute.
-CMC_CACHE_SECONDS = 30 * 60
-
-CMC_TIMEOUT = 10
-
-# Normal temporary backoff after network/server problems.
-CMC_ERROR_COOLDOWN = 5 * 60
-
-# Per-minute 429 should normally clear after ~60 seconds.
-CMC_MINUTE_RATE_LIMIT_COOLDOWN = 75
-
-# Persistent cache file.
-CMC_CACHE_FILE = "market_cap_cache.json"
-
-# Keep the response reasonably small. The server-side market cap
-# filter means this should normally contain all qualifying assets.
-CMC_PAGE_LIMIT = 500
-
-
-# ============================================================
-# BINANCE SETTINGS
-# ============================================================
-
-SYMBOL_CACHE_SECONDS = 60 * 60
+# The 24H ticker changes continuously, but it is unnecessary to
+# request it every scan. Refresh every 5 minutes.
+VOLUME_CACHE_SECONDS = 5 * 60
 
 BINANCE_TIMEOUT = 15
 
 
 # ============================================================
-# BOT STATE
+# BINANCE SETTINGS / BOT STATE
 # ============================================================
 
-active_fvgs = {}
+SYMBOL_CACHE_SECONDS = 60 * 60
 
+active_fvgs = {}
 last_processed_fvg = {}
 
-market_cap_cache = {}
-
-market_cap_cache_time = 0
-
-cmc_blocked_until = 0
+volume_cache = {}
+volume_cache_time = 0
 
 binance_symbols_cache = []
-
 binance_symbols_cache_time = 0
 
-# Startup FVG baseline is applied when the first valid market-cap
-# list becomes available.
-fvg_baseline_applied = False
+# Symbols that have already received the startup/new-entry FVG
+# baseline. This prevents newly-qualified coins from triggering
+# on an old historical FVG.
+baseline_symbols = set()
 
 
 # ============================================================
@@ -315,516 +279,67 @@ def get_binance_spot_symbols():
 
 
 # ============================================================
-# LOAD CMC CACHE FROM FILE
+# BINANCE 24H VOLUME
 # ============================================================
 
-def load_cmc_cache():
-
-    global market_cap_cache
-    global market_cap_cache_time
-
-    if not os.path.exists(CMC_CACHE_FILE):
-        log("[CMC] No local cache file found.")
-        return
-
-    try:
-        with open(
-            CMC_CACHE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-            saved = json.load(f)
-
-        cache = saved.get("market_caps", {})
-        cache_time = saved.get("timestamp", 0)
-
-        if not isinstance(cache, dict):
-            log("[CMC] Cache file invalid.")
-            return
-
-        market_cap_cache = {
-            str(k).upper(): float(v)
-            for k, v in cache.items()
-        }
-
-        market_cap_cache_time = float(cache_time)
-
-        log(
-            f"[CMC] Local cache loaded: "
-            f"{len(market_cap_cache)} coins"
-        )
-
-        if market_cap_cache_time:
-            age_minutes = (
-                time.time() - market_cap_cache_time
-            ) / 60
-
-            log(
-                f"[CMC] Cache age: "
-                f"{age_minutes:.1f} minutes"
-            )
-
-    except Exception as e:
-        log(f"[CMC] Failed to load cache: {e}")
-
-
-# ============================================================
-# SAVE CMC CACHE
-# ============================================================
-
-def save_cmc_cache():
-
-    try:
-        payload = {
-            "timestamp": market_cap_cache_time,
-            "market_caps": market_cap_cache
-        }
-
-        temp_file = CMC_CACHE_FILE + ".tmp"
-
-        with open(
-            temp_file,
-            "w",
-            encoding="utf-8"
-        ) as f:
-            json.dump(
-                payload,
-                f,
-                separators=(",", ":")
-            )
-
-        os.replace(
-            temp_file,
-            CMC_CACHE_FILE
-        )
-
-        log("[CMC] Cache saved to disk.")
-
-    except Exception as e:
-        log(f"[CMC] Cache save error: {e}")
-
-
-# ============================================================
-# CMC COOLDOWN
-# ============================================================
-
-def block_cmc(seconds):
-    global cmc_blocked_until
-
-    cmc_blocked_until = time.time() + seconds
-
-
-def is_cmc_blocked():
-    return time.time() < cmc_blocked_until
-
-
-def cmc_remaining_cooldown():
-
-    remaining = cmc_blocked_until - time.time()
-
-    return max(0, remaining)
-
-
-# ============================================================
-# CMC ERROR DETAILS
-# ============================================================
-
-def get_cmc_status(response):
-
-    try:
-        data = response.json()
-    except Exception:
-        return {}, {}
-
-    status = data.get("status", {})
-
-    if not isinstance(status, dict):
-        status = {}
-
-    return data, status
-
-
-# ============================================================
-# COINMARKETCAP
-# ============================================================
-
-def get_market_caps():
-
-    global market_cap_cache
-    global market_cap_cache_time
-    global cmc_blocked_until
+def get_24h_volumes():
+    global volume_cache
+    global volume_cache_time
 
     current_time = time.time()
 
-    # --------------------------------------------------------
-    # Temporary cooldown
-    # --------------------------------------------------------
-
-    if is_cmc_blocked():
-
-        remaining = cmc_remaining_cooldown()
-
-        log(
-            f"[CMC] Cooldown active. "
-            f"Remaining: {remaining / 60:.1f} min"
-        )
-
-        if market_cap_cache:
-            log("[CMC] Using previous valid cache.")
-
-        return market_cap_cache
-
-    # --------------------------------------------------------
-    # Normal cache
-    # --------------------------------------------------------
-
+    # Use cache between refreshes.
     if (
-        market_cap_cache
-        and current_time - market_cap_cache_time
-        < CMC_CACHE_SECONDS
+        volume_cache
+        and current_time - volume_cache_time < VOLUME_CACHE_SECONDS
     ):
-
-        age = (
-            current_time - market_cap_cache_time
-        ) / 60
-
+        age = (current_time - volume_cache_time) / 60
         log(
-            f"[CMC] Using cache ({age:.1f} min old)."
+            f"[VOLUME] Using cache ({age:.1f} min old) | "
+            f"Qualified > ${MIN_24H_QUOTE_VOLUME:,.0f}"
         )
+        return volume_cache
 
-        return market_cap_cache
+    log("[VOLUME] Updating Binance 24H ticker data...")
 
-    # --------------------------------------------------------
-    # API key
-    # --------------------------------------------------------
+    data = binance_get("/api/v3/ticker/24hr")
 
-    if not CMC_API_KEY:
+    if not data or not isinstance(data, list):
+        log("[VOLUME] 24H ticker request failed.")
+        if volume_cache:
+            log("[VOLUME] Keeping previous valid volume cache.")
+        return volume_cache
 
-        log("[CMC] ERROR: CMC_API_KEY is missing.")
+    new_cache = {}
 
-        if market_cap_cache:
-            log("[CMC] Using previous valid cache.")
+    for ticker in data:
+        symbol = ticker.get("symbol")
+        if not symbol:
+            continue
 
-        return market_cap_cache
+        try:
+            quote_volume = float(ticker.get("quoteVolume", 0))
+        except (TypeError, ValueError):
+            continue
 
-    # --------------------------------------------------------
-    # CURRENT CMC LISTINGS ENDPOINT
-    # --------------------------------------------------------
+        if quote_volume <= 0:
+            continue
 
-    url = (
-        "https://pro-api.coinmarketcap.com/"
-        "v3/cryptocurrency/listings/latest"
-    )
+        new_cache[str(symbol).upper()] = quote_volume
 
-    headers = {
-        "X-CMC_PRO_API_KEY": CMC_API_KEY
-    }
+    if not new_cache:
+        log("[VOLUME] Empty 24H volume response.")
+        return volume_cache
 
-    # CMC filters on the server, so we don't need to download
-    # thousands of unrelated low-cap coins.
-    params = {
-        "start": 1,
-        "limit": CMC_PAGE_LIMIT,
-        "market_cap_min": MIN_MARKET_CAP,
-        "sort": "market_cap",
-        "sort_dir": "desc",
-        "convert": "USD"
-    }
+    volume_cache = new_cache
+    volume_cache_time = time.time()
 
     log(
-        "[CMC] Updating market-cap data..."
+        f"[VOLUME] Updated: {len(volume_cache)} symbols | "
+        f"Qualified > ${MIN_24H_QUOTE_VOLUME:,.0f} will be selected."
     )
 
-    request_start = time.time()
-
-    try:
-
-        response = session.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=CMC_TIMEOUT
-        )
-
-        elapsed = time.time() - request_start
-
-        data, status = get_cmc_status(response)
-
-        error_code = status.get("error_code", 0)
-        error_message = status.get(
-            "error_message",
-            ""
-        )
-
-        log(
-            f"[CMC] HTTP {response.status_code} "
-            f"after {elapsed:.2f}s"
-        )
-
-        if error_code not in (0, None):
-            log(
-                f"[CMC] error_code={error_code} | "
-                f"{error_message}"
-            )
-
-        # ----------------------------------------------------
-        # RATE LIMIT
-        # ----------------------------------------------------
-
-        if response.status_code == 429:
-
-            # Current CMC error-code mapping:
-            # 1008 = per-minute rate limit
-            # 1009 = daily credit limit
-            # 1010 = monthly credit limit
-            #
-            # Also handle older/unknown 429 responses safely.
-
-            if error_code == 1008:
-
-                retry_seconds = CMC_MINUTE_RATE_LIMIT_COOLDOWN
-
-                log(
-                    "[CMC] Per-minute rate limit reached."
-                )
-
-                log(
-                    f"[CMC] Short cooldown: "
-                    f"{retry_seconds}s"
-                )
-
-                block_cmc(retry_seconds)
-
-            elif error_code in (1009, 1010):
-
-                # A daily/monthly credit limit cannot be fixed
-                # by retrying every few minutes.
-                # Keep the cache and wait several hours.
-                retry_seconds = 6 * 60 * 60
-
-                log(
-                    "[CMC] Credit limit reached. "
-                    "Keeping cache and waiting."
-                )
-
-                block_cmc(retry_seconds)
-
-            else:
-
-                # Unknown 429: use Retry-After when possible,
-                # but never force a 30-minute delay.
-                retry_after = response.headers.get(
-                    "Retry-After"
-                )
-
-                try:
-                    retry_seconds = int(
-                        float(retry_after)
-                    ) if retry_after else (
-                        CMC_MINUTE_RATE_LIMIT_COOLDOWN
-                    )
-                except Exception:
-                    retry_seconds = (
-                        CMC_MINUTE_RATE_LIMIT_COOLDOWN
-                    )
-
-                retry_seconds = max(
-                    60,
-                    min(retry_seconds, 10 * 60)
-                )
-
-                log(
-                    f"[CMC] Unknown 429. "
-                    f"Cooldown: {retry_seconds}s"
-                )
-
-                block_cmc(retry_seconds)
-
-            if market_cap_cache:
-                log("[CMC] Keeping old valid cache.")
-            else:
-                log("[CMC] No old cache available.")
-
-            return market_cap_cache
-
-        # ----------------------------------------------------
-        # AUTHENTICATION / PLAN ERRORS
-        # ----------------------------------------------------
-
-        if response.status_code in (401, 402, 403):
-
-            log(
-                "[CMC] Authentication/plan error. "
-                "Check CMC_API_KEY and CMC plan."
-            )
-
-            if market_cap_cache:
-                log("[CMC] Keeping old valid cache.")
-
-            return market_cap_cache
-
-        # ----------------------------------------------------
-        # BAD REQUEST
-        # ----------------------------------------------------
-
-        if response.status_code == 400:
-
-            log(
-                "[CMC] Bad request. "
-                "Check CMC endpoint parameters."
-            )
-
-            if market_cap_cache:
-                log("[CMC] Keeping old valid cache.")
-
-            return market_cap_cache
-
-        # ----------------------------------------------------
-        # SERVER ERROR
-        # ----------------------------------------------------
-
-        if response.status_code >= 500:
-
-            log(
-                f"[CMC] Server error "
-                f"{response.status_code}."
-            )
-
-            block_cmc(CMC_ERROR_COOLDOWN)
-
-            return market_cap_cache
-
-        # ----------------------------------------------------
-        # HTTP STATUS
-        # ----------------------------------------------------
-
-        response.raise_for_status()
-
-        # ----------------------------------------------------
-        # CMC STATUS OBJECT
-        # ----------------------------------------------------
-
-        if error_code not in (0, None):
-
-            log(
-                f"[CMC] API error "
-                f"{error_code}: "
-                f"{error_message}"
-            )
-
-            return market_cap_cache
-
-        # ----------------------------------------------------
-        # BUILD CACHE
-        # ----------------------------------------------------
-
-        new_cache = {}
-
-        records = data.get("data", [])
-
-        for coin in records:
-
-            symbol = coin.get("symbol")
-
-            if not symbol:
-                continue
-
-            quote = coin.get("quote", {})
-            usd = quote.get("USD", {})
-
-            market_cap = usd.get("market_cap")
-
-            if market_cap is None:
-                continue
-
-            try:
-                market_cap = float(market_cap)
-            except Exception:
-                continue
-
-            symbol = str(symbol).upper()
-
-            # Keep the largest value if CMC ever returns
-            # duplicate symbols.
-            if (
-                symbol not in new_cache
-                or market_cap > new_cache[symbol]
-            ):
-                new_cache[symbol] = market_cap
-
-        # ----------------------------------------------------
-        # VALIDATION
-        # ----------------------------------------------------
-
-        if not new_cache:
-
-            log(
-                "[CMC] Empty market-cap response."
-            )
-
-            log("[CMC] Keeping old valid cache.")
-
-            return market_cap_cache
-
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
-
-        market_cap_cache = new_cache
-        market_cap_cache_time = time.time()
-        cmc_blocked_until = 0
-
-        save_cmc_cache()
-
-        log(
-            f"[CMC] Updated successfully: "
-            f"{len(market_cap_cache)} coins"
-        )
-
-        return market_cap_cache
-
-    # --------------------------------------------------------
-    # TIMEOUT
-    # --------------------------------------------------------
-
-    except requests.exceptions.Timeout:
-
-        log(
-            f"[CMC] Request timeout "
-            f"after {CMC_TIMEOUT}s."
-        )
-
-        log("[CMC] Keeping old valid cache.")
-
-        block_cmc(CMC_ERROR_COOLDOWN)
-
-        return market_cap_cache
-
-    # --------------------------------------------------------
-    # CONNECTION ERROR
-    # --------------------------------------------------------
-
-    except requests.exceptions.ConnectionError as e:
-
-        log(f"[CMC] Connection error: {e}")
-        log("[CMC] Keeping old valid cache.")
-
-        block_cmc(CMC_ERROR_COOLDOWN)
-
-        return market_cap_cache
-
-    # --------------------------------------------------------
-    # OTHER ERROR
-    # --------------------------------------------------------
-
-    except Exception as e:
-
-        log(f"[CMC] Error: {e}")
-        log("[CMC] Keeping old valid cache.")
-
-        block_cmc(CMC_ERROR_COOLDOWN)
-
-        return market_cap_cache
+    return volume_cache
 
 
 # ============================================================
@@ -832,63 +347,44 @@ def get_market_caps():
 # ============================================================
 
 def get_qualified_symbols():
-
-    log(
-        "[FILTER] Getting Binance Spot pairs..."
-    )
+    log("[FILTER] Getting Binance Spot USDT pairs...")
 
     binance_symbols = get_binance_spot_symbols()
 
     if not binance_symbols:
-
-        log(
-            "[FILTER] No Binance symbols available."
-        )
-
+        log("[FILTER] No Binance symbols available.")
         return []
 
-    log(
-        "[FILTER] Getting CMC market caps..."
-    )
+    volumes = get_24h_volumes()
 
-    market_caps = get_market_caps()
-
-    if not market_caps:
-
-        log(
-            "[FILTER] NO MARKET-CAP DATA."
-        )
-
-        log(
-            "[FILTER] Signals are BLOCKED "
-            "until valid CMC data is available."
-        )
-
+    if not volumes:
+        log("[FILTER] NO 24H VOLUME DATA.")
+        log("[FILTER] Signals are blocked until valid Binance volume data is available.")
         return []
 
     qualified = []
 
     for item in binance_symbols:
-
         symbol = item["symbol"]
         base_asset = item["base_asset"].upper()
 
-        market_cap = market_caps.get(base_asset)
+        quote_volume = volumes.get(symbol.upper(), 0)
 
-        if market_cap is None:
-            continue
-
-        if market_cap > MIN_MARKET_CAP:
-
+        if quote_volume > MIN_24H_QUOTE_VOLUME:
             qualified.append({
                 "symbol": symbol,
                 "base_asset": base_asset,
-                "market_cap": market_cap
+                "quote_volume": quote_volume
             })
 
+    qualified.sort(
+        key=lambda x: x["quote_volume"],
+        reverse=True
+    )
+
     log(
-        f"[FILTER] Qualified > $300M: "
-        f"{len(qualified)}"
+        f"[FILTER] Qualified > ${MIN_24H_QUOTE_VOLUME:,.0f} "
+        f"24H volume: {len(qualified)}"
     )
 
     return qualified
@@ -1412,7 +908,6 @@ def process_symbol(item):
 # ============================================================
 
 def market_scan():
-
     log()
     log("==========================================")
     log(
@@ -1425,35 +920,31 @@ def market_scan():
 
     log(
         f"[MARKET] Qualified coins "
-        f"(> $300M): {len(qualified)}"
+        f"(24H volume > ${MIN_24H_QUOTE_VOLUME:,.0f}): "
+        f"{len(qualified)}"
     )
 
     if not qualified:
-
         log("[MARKET] No qualified coins.")
-
         return []
 
     for index, item in enumerate(
         qualified,
         start=1
     ):
-
         symbol = item["symbol"]
-        market_cap = item["market_cap"]
+        quote_volume = item["quote_volume"]
 
         try:
-
             log(
                 f"[{index}/{len(qualified)}] "
                 f"{symbol} | "
-                f"MC ${market_cap:,.0f}"
+                f"24H Volume ${quote_volume:,.0f}"
             )
 
             process_symbol(item)
 
         except Exception as e:
-
             log(
                 f"[ERROR] {symbol}: "
                 f"processing error: {e}"
@@ -1508,12 +999,13 @@ def apply_fvg_baseline(
     latest_15m,
     latest_1h
 ):
-
-    global fvg_baseline_applied
+    newly_added = 0
 
     for item in qualified:
-
         symbol = item["symbol"]
+
+        if symbol in baseline_symbols:
+            continue
 
         last_processed_fvg[
             (symbol, "15m")
@@ -1523,11 +1015,12 @@ def apply_fvg_baseline(
             (symbol, "1h")
         ] = latest_1h
 
-    fvg_baseline_applied = True
+        baseline_symbols.add(symbol)
+        newly_added += 1
 
     log(
-        f"[STARTUP] Baseline applied to "
-        f"{len(qualified)} qualified coins."
+        f"[STARTUP] FVG baseline applied to "
+        f"{newly_added} new qualified coins."
     )
 
 
@@ -1536,17 +1029,17 @@ def apply_fvg_baseline(
 # ============================================================
 
 def startup():
-
     log()
     log("==========================================")
-    log("BINANCE SPOT BEAR FVG BOT v4.0")
+    log("BINANCE SPOT BEAR FVG BOT v5.0")
     log("==========================================")
     log()
 
     log("Conditions:")
     log()
+
     log("1. Binance Spot USDT")
-    log("2. CMC Market Cap > $300M")
+    log("2. 24H quote volume > $10M")
     log("3. 1H: Close > EMA20 > EMA50 > EMA100")
     log("4. Search NEW 15M Bear FVG first")
     log("5. Only if no 15M -> search NEW 1H")
@@ -1562,28 +1055,25 @@ def startup():
     log("15. Active FVG blocks new FVG searches")
     log("16. After Target/Cancel -> return to 1H")
     log("17. Scan every 60 seconds")
-    log("18. CMC cache refresh every 30 minutes")
-    log("19. CMC timeout = 10 seconds")
-    log("20. CMC 429 minute-limit cooldown ≈ 75 seconds")
-    log("21. CMC persistent local cache")
-    log("22. Old startup FVGs are ignored")
+    log("18. Binance 24H volume refresh = 5 minutes")
+    log("19. CMC completely removed")
+    log("20. Old startup FVGs are ignored")
     log()
-
-    log("No RSI / MACD / Volume filters.")
+    log("No RSI / MACD / extra volume filter.")
     log("==========================================")
     log()
 
     send_telegram(
         "🟢 Bear FVG Bot started.\n\n"
         "Binance Spot USDT\n"
-        "CMC Market Cap > $300M\n"
+        "24H quote volume > $10M\n"
         "1H: Close > EMA20 > EMA50 > EMA100\n"
         "15M FVG → 1H fallback\n"
         "Bear FVG >= 50% of Candle 2 body\n"
         "Target: -1.7%\n"
         "Scan: 60 seconds\n"
-        "CMC cache: 30 minutes\n"
-        "CMC rate-limit protection: ON"
+        "Volume refresh: 5 minutes\n"
+        "CMC: OFF"
     )
 
 
@@ -1592,24 +1082,17 @@ def startup():
 # ============================================================
 
 def main():
-
     startup()
 
-    # Load local CMC cache.
-    log("[STARTUP] Loading local CMC cache...")
-    load_cmc_cache()
-
-    # FVG baseline.
+    # FVG baseline timestamps.
     latest_15m, latest_1h = initialize_fvg_baseline()
 
     # Initial market data.
-    log("[STARTUP] Loading initial market data...")
+    log("[STARTUP] Loading initial Binance market data...")
 
     qualified = get_qualified_symbols()
 
-    # Apply baseline immediately if CMC worked.
-    if qualified and not fvg_baseline_applied:
-
+    if qualified:
         apply_fvg_baseline(
             qualified,
             latest_15m,
@@ -1622,25 +1105,18 @@ def main():
     last_scan = 0
 
     while True:
-
         try:
-
             current_time = time.time()
 
             if (
                 current_time - last_scan
                 >= SCAN_INTERVAL
             ):
-
                 qualified = market_scan()
 
-                # If CMC was unavailable at startup, apply the
-                # baseline the first time valid market data arrives.
-                if (
-                    qualified
-                    and not fvg_baseline_applied
-                ):
-
+                # Baseline any symbols that became qualified
+                # after a volume refresh.
+                if qualified:
                     apply_fvg_baseline(
                         qualified,
                         latest_15m,
@@ -1652,13 +1128,11 @@ def main():
             time.sleep(1)
 
         except KeyboardInterrupt:
-
             log()
             log("Bot stopped.")
             break
 
         except Exception as e:
-
             log(f"[MAIN ERROR] {e}")
             time.sleep(5)
 
