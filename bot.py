@@ -8,9 +8,20 @@ from datetime import datetime, timezone
 # ============================================================
 # BINANCE SPOT BEAR FVG ALERT BOT
 #
-# CMC ROBUST CACHE VERSION
+# CMC FIXED VERSION
 #
-# ============================================================
+# Main fixes:
+#   - Uses current CMC v3 listings endpoint
+#   - Requests only coins with market cap >= $300M
+#   - Uses a smaller CMC page size to reduce credits
+#   - Correctly distinguishes CMC 429 minute-limit from
+#     monthly-credit-limit errors
+#   - Does NOT impose an unnecessary 30-minute cooldown on
+#     a normal per-minute 429
+#   - Prints CMC error_code + error_message
+#   - Preserves the last valid CMC cache after temporary errors
+#   - Applies the FVG startup baseline once market-cap data
+#     becomes available
 #
 # STRATEGY
 #
@@ -20,42 +31,28 @@ from datetime import datetime, timezone
 #       Close > EMA20 > EMA50 > EMA100
 # 4) First search 15M Bear FVG
 #    If no valid NEW 15M FVG -> search NEW 1H Bear FVG
-#
 # 5) Bear FVG:
 #       Candle 1 Low > Candle 3 High
 #       Candle 1 bearish
 #       Candle 2 bearish
 #       FVG completely inside Candle 2 Open/Close body
 #       FVG size >= 50% of Candle 2 body
-#
 # 6) FVG becomes active AFTER Candle 3 closes
-#
 # 7) Active FVG:
-#
 #       Price <= Candle 3 High - 1.7%
 #           -> Telegram signal
-#
 #       Price > Candle 3 High
 #           -> FVG CANCEL
-#
 # 8) After TARGET or CANCEL:
 #       Forget old FVG
 #       Return to 1H trend
 #       Search for NEW FVG
-#
 # 9) Scan every 60 seconds
-#
-# 10) CMC cache refresh every 15 minutes
-#
-# 11) CMC 429 protection:
-#       Cooldown + Retry-After
-#
-# 12) Persistent CMC cache:
-#       market_cap_cache.json
+# 10) CMC cache refresh every 30 minutes
 #
 # IMPORTANT:
-#       Old FVGs from before bot startup are NOT activated.
-#
+#   - Never put API keys directly in this file.
+#   - Set them in Railway Variables.
 # ============================================================
 
 
@@ -88,20 +85,23 @@ SCAN_INTERVAL = 60
 # CMC SETTINGS
 # ============================================================
 
-# Normal cache lifetime
-CMC_CACHE_SECONDS = 15 * 60
+# Market cap data does not need to be requested every minute.
+CMC_CACHE_SECONDS = 30 * 60
 
-# Maximum time to wait for CMC
 CMC_TIMEOUT = 10
 
-# If CMC returns 429, don't request again for this period
-CMC_BASE_COOLDOWN = 30 * 60
+# Normal temporary backoff after network/server problems.
+CMC_ERROR_COOLDOWN = 5 * 60
 
-# Maximum cooldown
-CMC_MAX_COOLDOWN = 2 * 60 * 60
+# Per-minute 429 should normally clear after ~60 seconds.
+CMC_MINUTE_RATE_LIMIT_COOLDOWN = 75
 
-# Persistent cache file
+# Persistent cache file.
 CMC_CACHE_FILE = "market_cap_cache.json"
+
+# Keep the response reasonably small. The server-side market cap
+# filter means this should normally contain all qualifying assets.
+CMC_PAGE_LIMIT = 500
 
 
 # ============================================================
@@ -117,48 +117,23 @@ BINANCE_TIMEOUT = 15
 # BOT STATE
 # ============================================================
 
-# One active FVG per symbol
 active_fvgs = {}
 
-
-# ------------------------------------------------------------
-# Last processed FVG
-#
-# Key:
-#     (symbol, interval)
-#
-# Value:
-#     Candle 3 open time
-# ------------------------------------------------------------
-
 last_processed_fvg = {}
-
-
-# ------------------------------------------------------------
-# CMC cache
-# ------------------------------------------------------------
 
 market_cap_cache = {}
 
 market_cap_cache_time = 0
 
-
-# ------------------------------------------------------------
-# CMC protection
-# ------------------------------------------------------------
-
 cmc_blocked_until = 0
-
-cmc_backoff_level = 0
-
-
-# ------------------------------------------------------------
-# Binance symbol cache
-# ------------------------------------------------------------
 
 binance_symbols_cache = []
 
 binance_symbols_cache_time = 0
+
+# Startup FVG baseline is applied when the first valid market-cap
+# list becomes available.
+fvg_baseline_applied = False
 
 
 # ============================================================
@@ -168,7 +143,9 @@ binance_symbols_cache_time = 0
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "Bear-FVG-Bot/3.0"
+    "User-Agent": "Bear-FVG-Bot/4.0",
+    "Accept": "application/json",
+    "Accept-Encoding": "gzip, deflate",
 })
 
 
@@ -177,20 +154,16 @@ session.headers.update({
 # ============================================================
 
 def now_utc():
-
     return datetime.now(timezone.utc)
 
 
 def format_time(timestamp_ms):
-
     dt = datetime.fromtimestamp(
         timestamp_ms / 1000,
         tz=timezone.utc
     )
 
-    return dt.strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 # ============================================================
@@ -198,11 +171,7 @@ def format_time(timestamp_ms):
 # ============================================================
 
 def log(message=""):
-
-    print(
-        message,
-        flush=True
-    )
+    print(message, flush=True)
 
 
 # ============================================================
@@ -211,16 +180,8 @@ def log(message=""):
 
 def send_telegram(message):
 
-    if (
-        not TELEGRAM_BOT_TOKEN
-        or
-        not TELEGRAM_CHAT_ID
-    ):
-
-        log(
-            "[TELEGRAM] Credentials missing."
-        )
-
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("[TELEGRAM] Credentials missing.")
         return False
 
     url = (
@@ -234,7 +195,6 @@ def send_telegram(message):
     }
 
     try:
-
         response = session.post(
             url,
             json=payload,
@@ -246,11 +206,7 @@ def send_telegram(message):
         return True
 
     except Exception as e:
-
-        log(
-            f"[TELEGRAM] Error: {e}"
-        )
-
+        log(f"[TELEGRAM] Error: {e}")
         return False
 
 
@@ -258,15 +214,11 @@ def send_telegram(message):
 # BINANCE REQUEST
 # ============================================================
 
-def binance_get(
-    endpoint,
-    params=None
-):
+def binance_get(endpoint, params=None):
 
     url = BINANCE_BASE_URL + endpoint
 
     try:
-
         response = session.get(
             url,
             params=params,
@@ -274,7 +226,6 @@ def binance_get(
         )
 
         if response.status_code == 429:
-
             retry_after = response.headers.get(
                 "Retry-After",
                 "unknown"
@@ -282,8 +233,7 @@ def binance_get(
 
             log(
                 f"[BINANCE] Rate limit 429 | "
-                f"{endpoint} | "
-                f"Retry-After={retry_after}"
+                f"{endpoint} | Retry-After={retry_after}"
             )
 
             return None
@@ -293,20 +243,11 @@ def binance_get(
         return response.json()
 
     except requests.exceptions.Timeout:
-
-        log(
-            f"[BINANCE] Timeout | {endpoint}"
-        )
-
+        log(f"[BINANCE] Timeout | {endpoint}")
         return None
 
     except Exception as e:
-
-        log(
-            f"[BINANCE] Error | "
-            f"{endpoint} | {e}"
-        )
-
+        log(f"[BINANCE] Error | {endpoint} | {e}")
         return None
 
 
@@ -321,42 +262,27 @@ def get_binance_spot_symbols():
 
     current_time = time.time()
 
-    # --------------------------------------------------------
-    # Cache
-    # --------------------------------------------------------
-
     if (
         binance_symbols_cache
-        and
-        current_time - binance_symbols_cache_time
+        and current_time - binance_symbols_cache_time
         < SYMBOL_CACHE_SECONDS
     ):
-
         return binance_symbols_cache
 
-    log(
-        "[BINANCE] Updating Spot USDT symbols..."
-    )
+    log("[BINANCE] Updating Spot USDT symbols...")
 
-    data = binance_get(
-        "/api/v3/exchangeInfo"
-    )
+    data = binance_get("/api/v3/exchangeInfo")
 
     if not data:
-
         log(
             "[BINANCE] exchangeInfo failed. "
             "Using old symbol cache."
         )
-
         return binance_symbols_cache
 
     symbols = []
 
-    for item in data.get(
-        "symbols",
-        []
-    ):
+    for item in data.get("symbols", []):
 
         if item.get("status") != "TRADING":
             continue
@@ -364,19 +290,11 @@ def get_binance_spot_symbols():
         if item.get("quoteAsset") != "USDT":
             continue
 
-        if not item.get(
-            "isSpotTradingAllowed",
-            False
-        ):
+        if not item.get("isSpotTradingAllowed", False):
             continue
 
-        symbol = item.get(
-            "symbol"
-        )
-
-        base_asset = item.get(
-            "baseAsset"
-        )
+        symbol = item.get("symbol")
+        base_asset = item.get("baseAsset")
 
         if not symbol or not base_asset:
             continue
@@ -387,12 +305,10 @@ def get_binance_spot_symbols():
         })
 
     binance_symbols_cache = symbols
-
     binance_symbols_cache_time = current_time
 
     log(
-        f"[BINANCE] Spot USDT pairs: "
-        f"{len(symbols)}"
+        f"[BINANCE] Spot USDT pairs: {len(symbols)}"
     )
 
     return symbols
@@ -407,55 +323,31 @@ def load_cmc_cache():
     global market_cap_cache
     global market_cap_cache_time
 
-    if not os.path.exists(
-        CMC_CACHE_FILE
-    ):
-
-        log(
-            "[CMC] No local cache file found."
-        )
-
+    if not os.path.exists(CMC_CACHE_FILE):
+        log("[CMC] No local cache file found.")
         return
 
     try:
-
         with open(
             CMC_CACHE_FILE,
             "r",
             encoding="utf-8"
         ) as f:
-
             saved = json.load(f)
 
-        cache = saved.get(
-            "market_caps",
-            {}
-        )
+        cache = saved.get("market_caps", {})
+        cache_time = saved.get("timestamp", 0)
 
-        cache_time = saved.get(
-            "timestamp",
-            0
-        )
-
-        if not isinstance(
-            cache,
-            dict
-        ):
-
-            log(
-                "[CMC] Cache file invalid."
-            )
-
+        if not isinstance(cache, dict):
+            log("[CMC] Cache file invalid.")
             return
 
         market_cap_cache = {
-            str(k): float(v)
+            str(k).upper(): float(v)
             for k, v in cache.items()
         }
 
-        market_cap_cache_time = float(
-            cache_time
-        )
+        market_cap_cache_time = float(cache_time)
 
         log(
             f"[CMC] Local cache loaded: "
@@ -463,10 +355,8 @@ def load_cmc_cache():
         )
 
         if market_cap_cache_time:
-
             age_minutes = (
-                time.time()
-                - market_cap_cache_time
+                time.time() - market_cap_cache_time
             ) / 60
 
             log(
@@ -475,39 +365,32 @@ def load_cmc_cache():
             )
 
     except Exception as e:
-
-        log(
-            f"[CMC] Failed to load cache: {e}"
-        )
+        log(f"[CMC] Failed to load cache: {e}")
 
 
 # ============================================================
-# SAVE CMC CACHE TO FILE
+# SAVE CMC CACHE
 # ============================================================
 
 def save_cmc_cache():
 
     try:
-
         payload = {
             "timestamp": market_cap_cache_time,
             "market_caps": market_cap_cache
         }
 
-        temp_file = (
-            CMC_CACHE_FILE
-            + ".tmp"
-        )
+        temp_file = CMC_CACHE_FILE + ".tmp"
 
         with open(
             temp_file,
             "w",
             encoding="utf-8"
         ) as f:
-
             json.dump(
                 payload,
-                f
+                f,
+                separators=(",", ":")
             )
 
         os.replace(
@@ -515,66 +398,50 @@ def save_cmc_cache():
             CMC_CACHE_FILE
         )
 
-        log(
-            "[CMC] Cache saved to disk."
-        )
+        log("[CMC] Cache saved to disk.")
 
     except Exception as e:
-
-        log(
-            f"[CMC] Cache save error: {e}"
-        )
+        log(f"[CMC] Cache save error: {e}")
 
 
 # ============================================================
 # CMC COOLDOWN
 # ============================================================
 
-def get_cmc_cooldown_seconds():
-
-    global cmc_backoff_level
-
-    cooldown = (
-        CMC_BASE_COOLDOWN
-        *
-        (2 ** cmc_backoff_level)
-    )
-
-    return min(
-        cooldown,
-        CMC_MAX_COOLDOWN
-    )
-
-
 def block_cmc(seconds):
-
     global cmc_blocked_until
 
-    cmc_blocked_until = (
-        time.time()
-        + seconds
-    )
+    cmc_blocked_until = time.time() + seconds
 
 
 def is_cmc_blocked():
-
-    return (
-        time.time()
-        < cmc_blocked_until
-    )
+    return time.time() < cmc_blocked_until
 
 
 def cmc_remaining_cooldown():
 
-    remaining = (
-        cmc_blocked_until
-        - time.time()
-    )
+    remaining = cmc_blocked_until - time.time()
 
-    return max(
-        0,
-        remaining
-    )
+    return max(0, remaining)
+
+
+# ============================================================
+# CMC ERROR DETAILS
+# ============================================================
+
+def get_cmc_status(response):
+
+    try:
+        data = response.json()
+    except Exception:
+        return {}, {}
+
+    status = data.get("status", {})
+
+    if not isinstance(status, dict):
+        status = {}
+
+    return data, status
 
 
 # ============================================================
@@ -585,98 +452,88 @@ def get_market_caps():
 
     global market_cap_cache
     global market_cap_cache_time
-    global cmc_backoff_level
     global cmc_blocked_until
 
     current_time = time.time()
 
-    # ========================================================
-    # CMC COOLDOWN
-    # ========================================================
+    # --------------------------------------------------------
+    # Temporary cooldown
+    # --------------------------------------------------------
 
     if is_cmc_blocked():
 
-        remaining = (
-            cmc_remaining_cooldown()
-        )
+        remaining = cmc_remaining_cooldown()
 
         log(
             f"[CMC] Cooldown active. "
-            f"Remaining: "
-            f"{remaining / 60:.1f} min"
+            f"Remaining: {remaining / 60:.1f} min"
         )
 
         if market_cap_cache:
-
-            log(
-                "[CMC] Using previous cache."
-            )
+            log("[CMC] Using previous valid cache.")
 
         return market_cap_cache
 
-    # ========================================================
-    # NORMAL CACHE
-    # ========================================================
+    # --------------------------------------------------------
+    # Normal cache
+    # --------------------------------------------------------
 
     if (
         market_cap_cache
-        and
-        current_time - market_cap_cache_time
+        and current_time - market_cap_cache_time
         < CMC_CACHE_SECONDS
     ):
 
         age = (
-            current_time
-            - market_cap_cache_time
+            current_time - market_cap_cache_time
         ) / 60
 
         log(
-            f"[CMC] Using cache "
-            f"({age:.1f} min old)."
+            f"[CMC] Using cache ({age:.1f} min old)."
         )
 
         return market_cap_cache
 
-    # ========================================================
-    # API KEY
-    # ========================================================
+    # --------------------------------------------------------
+    # API key
+    # --------------------------------------------------------
 
     if not CMC_API_KEY:
 
-        log(
-            "[CMC] ERROR: CMC_API_KEY is missing."
-        )
+        log("[CMC] ERROR: CMC_API_KEY is missing.")
 
         if market_cap_cache:
-
-            log(
-                "[CMC] Using previous cache."
-            )
+            log("[CMC] Using previous valid cache.")
 
         return market_cap_cache
 
-    # ========================================================
-    # REQUEST
-    # ========================================================
-
-    log(
-        "[CMC] Updating market-cap data..."
-    )
+    # --------------------------------------------------------
+    # CURRENT CMC LISTINGS ENDPOINT
+    # --------------------------------------------------------
 
     url = (
         "https://pro-api.coinmarketcap.com/"
-        "v1/cryptocurrency/listings/latest"
+        "v3/cryptocurrency/listings/latest"
     )
 
     headers = {
         "X-CMC_PRO_API_KEY": CMC_API_KEY
     }
 
+    # CMC filters on the server, so we don't need to download
+    # thousands of unrelated low-cap coins.
     params = {
         "start": 1,
-        "limit": 1000,
+        "limit": CMC_PAGE_LIMIT,
+        "market_cap_min": MIN_MARKET_CAP,
+        "sort": "market_cap",
+        "sort_dir": "desc",
         "convert": "USD"
     }
+
+    log(
+        "[CMC] Updating market-cap data..."
+    )
 
     request_start = time.time()
 
@@ -689,9 +546,14 @@ def get_market_caps():
             timeout=CMC_TIMEOUT
         )
 
-        elapsed = (
-            time.time()
-            - request_start
+        elapsed = time.time() - request_start
+
+        data, status = get_cmc_status(response)
+
+        error_code = status.get("error_code", 0)
+        error_message = status.get(
+            "error_message",
+            ""
         )
 
         log(
@@ -699,84 +561,127 @@ def get_market_caps():
             f"after {elapsed:.2f}s"
         )
 
-        # ====================================================
+        if error_code not in (0, None):
+            log(
+                f"[CMC] error_code={error_code} | "
+                f"{error_message}"
+            )
+
+        # ----------------------------------------------------
         # RATE LIMIT
-        # ====================================================
+        # ----------------------------------------------------
 
         if response.status_code == 429:
 
-            retry_after = (
-                response.headers.get(
+            # Current CMC error-code mapping:
+            # 1008 = per-minute rate limit
+            # 1009 = daily credit limit
+            # 1010 = monthly credit limit
+            #
+            # Also handle older/unknown 429 responses safely.
+
+            if error_code == 1008:
+
+                retry_seconds = CMC_MINUTE_RATE_LIMIT_COOLDOWN
+
+                log(
+                    "[CMC] Per-minute rate limit reached."
+                )
+
+                log(
+                    f"[CMC] Short cooldown: "
+                    f"{retry_seconds}s"
+                )
+
+                block_cmc(retry_seconds)
+
+            elif error_code in (1009, 1010):
+
+                # A daily/monthly credit limit cannot be fixed
+                # by retrying every few minutes.
+                # Keep the cache and wait several hours.
+                retry_seconds = 6 * 60 * 60
+
+                log(
+                    "[CMC] Credit limit reached. "
+                    "Keeping cache and waiting."
+                )
+
+                block_cmc(retry_seconds)
+
+            else:
+
+                # Unknown 429: use Retry-After when possible,
+                # but never force a 30-minute delay.
+                retry_after = response.headers.get(
                     "Retry-After"
                 )
-            )
-
-            if retry_after:
 
                 try:
-
                     retry_seconds = int(
                         float(retry_after)
+                    ) if retry_after else (
+                        CMC_MINUTE_RATE_LIMIT_COOLDOWN
                     )
-
                 except Exception:
-
                     retry_seconds = (
-                        get_cmc_cooldown_seconds()
+                        CMC_MINUTE_RATE_LIMIT_COOLDOWN
                     )
 
-            else:
-
-                retry_seconds = (
-                    get_cmc_cooldown_seconds()
+                retry_seconds = max(
+                    60,
+                    min(retry_seconds, 10 * 60)
                 )
 
-            # Don't use a ridiculously small retry
-            retry_seconds = max(
-                retry_seconds,
-                CMC_BASE_COOLDOWN
-            )
+                log(
+                    f"[CMC] Unknown 429. "
+                    f"Cooldown: {retry_seconds}s"
+                )
 
-            retry_seconds = min(
-                retry_seconds,
-                CMC_MAX_COOLDOWN
-            )
-
-            block_cmc(
-                retry_seconds
-            )
-
-            cmc_backoff_level = min(
-                cmc_backoff_level + 1,
-                3
-            )
-
-            log(
-                f"[CMC] RATE LIMIT 429."
-            )
-
-            log(
-                f"[CMC] CMC blocked for "
-                f"{retry_seconds / 60:.1f} minutes."
-            )
+                block_cmc(retry_seconds)
 
             if market_cap_cache:
-
-                log(
-                    "[CMC] Keeping old cache."
-                )
-
+                log("[CMC] Keeping old valid cache.")
             else:
-
-                log(
-                    "[CMC] No old cache available."
-                )
+                log("[CMC] No old cache available.")
 
             return market_cap_cache
 
-        # ====================================================
-        # OTHER HTTP ERRORS
-        # ====================================================
+        # ----------------------------------------------------
+        # AUTHENTICATION / PLAN ERRORS
+        # ----------------------------------------------------
+
+        if response.status_code in (401, 402, 403):
+
+            log(
+                "[CMC] Authentication/plan error. "
+                "Check CMC_API_KEY and CMC plan."
+            )
+
+            if market_cap_cache:
+                log("[CMC] Keeping old valid cache.")
+
+            return market_cap_cache
+
+        # ----------------------------------------------------
+        # BAD REQUEST
+        # ----------------------------------------------------
+
+        if response.status_code == 400:
+
+            log(
+                "[CMC] Bad request. "
+                "Check CMC endpoint parameters."
+            )
+
+            if market_cap_cache:
+                log("[CMC] Keeping old valid cache.")
+
+            return market_cap_cache
+
+        # ----------------------------------------------------
+        # SERVER ERROR
+        # ----------------------------------------------------
 
         if response.status_code >= 500:
 
@@ -785,44 +690,21 @@ def get_market_caps():
                 f"{response.status_code}."
             )
 
-            # Short cooldown for server problems
-            block_cmc(
-                5 * 60
-            )
+            block_cmc(CMC_ERROR_COOLDOWN)
 
             return market_cap_cache
 
+        # ----------------------------------------------------
+        # HTTP STATUS
+        # ----------------------------------------------------
+
         response.raise_for_status()
 
-        # ====================================================
-        # JSON
-        # ====================================================
-
-        data = response.json()
-
         # ----------------------------------------------------
-        # CMC sometimes returns status information
+        # CMC STATUS OBJECT
         # ----------------------------------------------------
 
-        status = data.get(
-            "status",
-            {}
-        )
-
-        error_code = status.get(
-            "error_code",
-            0
-        )
-
-        if error_code not in (
-            0,
-            None
-        ):
-
-            error_message = status.get(
-                "error_message",
-                "Unknown CMC error"
-            )
+        if error_code not in (0, None):
 
             log(
                 f"[CMC] API error "
@@ -832,71 +714,47 @@ def get_market_caps():
 
             return market_cap_cache
 
-        # ====================================================
-        # BUILD NEW CACHE
-        # ====================================================
+        # ----------------------------------------------------
+        # BUILD CACHE
+        # ----------------------------------------------------
 
         new_cache = {}
 
-        for coin in data.get(
-            "data",
-            []
-        ):
+        records = data.get("data", [])
 
-            symbol = coin.get(
-                "symbol"
-            )
+        for coin in records:
 
-            quote = coin.get(
-                "quote",
-                {}
-            )
-
-            usd = quote.get(
-                "USD",
-                {}
-            )
-
-            market_cap = usd.get(
-                "market_cap"
-            )
+            symbol = coin.get("symbol")
 
             if not symbol:
                 continue
+
+            quote = coin.get("quote", {})
+            usd = quote.get("USD", {})
+
+            market_cap = usd.get("market_cap")
 
             if market_cap is None:
                 continue
 
             try:
-
-                market_cap = float(
-                    market_cap
-                )
-
+                market_cap = float(market_cap)
             except Exception:
-
                 continue
 
-            # ------------------------------------------------
-            # If duplicate symbols exist,
-            # keep largest market cap.
-            # ------------------------------------------------
+            symbol = str(symbol).upper()
 
+            # Keep the largest value if CMC ever returns
+            # duplicate symbols.
             if (
                 symbol not in new_cache
-                or
-                market_cap
-                >
-                new_cache[symbol]
+                or market_cap > new_cache[symbol]
             ):
+                new_cache[symbol] = market_cap
 
-                new_cache[symbol] = (
-                    market_cap
-                )
-
-        # ====================================================
-        # VALIDATE
-        # ====================================================
+        # ----------------------------------------------------
+        # VALIDATION
+        # ----------------------------------------------------
 
         if not new_cache:
 
@@ -904,28 +762,19 @@ def get_market_caps():
                 "[CMC] Empty market-cap response."
             )
 
-            log(
-                "[CMC] Keeping old cache."
-            )
+            log("[CMC] Keeping old valid cache.")
 
             return market_cap_cache
 
-        # ====================================================
+        # ----------------------------------------------------
         # SUCCESS
-        # ====================================================
+        # ----------------------------------------------------
 
         market_cap_cache = new_cache
-
-        market_cap_cache_time = (
-            time.time()
-        )
+        market_cap_cache_time = time.time()
+        cmc_blocked_until = 0
 
         save_cmc_cache()
-
-        # Successful request -> reset backoff
-        cmc_backoff_level = 0
-
-        cmc_blocked_until = 0
 
         log(
             f"[CMC] Updated successfully: "
@@ -934,9 +783,9 @@ def get_market_caps():
 
         return market_cap_cache
 
-    # ========================================================
+    # --------------------------------------------------------
     # TIMEOUT
-    # ========================================================
+    # --------------------------------------------------------
 
     except requests.exceptions.Timeout:
 
@@ -945,54 +794,35 @@ def get_market_caps():
             f"after {CMC_TIMEOUT}s."
         )
 
-        log(
-            "[CMC] Keeping old cache."
-        )
+        log("[CMC] Keeping old valid cache.")
 
-        # Prevent repeated timeout requests
-        block_cmc(
-            5 * 60
-        )
+        block_cmc(CMC_ERROR_COOLDOWN)
 
         return market_cap_cache
 
-    # ========================================================
+    # --------------------------------------------------------
     # CONNECTION ERROR
-    # ========================================================
+    # --------------------------------------------------------
 
     except requests.exceptions.ConnectionError as e:
 
-        log(
-            f"[CMC] Connection error: {e}"
-        )
+        log(f"[CMC] Connection error: {e}")
+        log("[CMC] Keeping old valid cache.")
 
-        log(
-            "[CMC] Keeping old cache."
-        )
-
-        block_cmc(
-            5 * 60
-        )
+        block_cmc(CMC_ERROR_COOLDOWN)
 
         return market_cap_cache
 
-    # ========================================================
+    # --------------------------------------------------------
     # OTHER ERROR
-    # ========================================================
+    # --------------------------------------------------------
 
     except Exception as e:
 
-        log(
-            f"[CMC] Error: {e}"
-        )
+        log(f"[CMC] Error: {e}")
+        log("[CMC] Keeping old valid cache.")
 
-        log(
-            "[CMC] Keeping old cache."
-        )
-
-        block_cmc(
-            5 * 60
-        )
+        block_cmc(CMC_ERROR_COOLDOWN)
 
         return market_cap_cache
 
@@ -1007,9 +837,7 @@ def get_qualified_symbols():
         "[FILTER] Getting Binance Spot pairs..."
     )
 
-    binance_symbols = (
-        get_binance_spot_symbols()
-    )
+    binance_symbols = get_binance_spot_symbols()
 
     if not binance_symbols:
 
@@ -1023,9 +851,7 @@ def get_qualified_symbols():
         "[FILTER] Getting CMC market caps..."
     )
 
-    market_caps = (
-        get_market_caps()
-    )
+    market_caps = get_market_caps()
 
     if not market_caps:
 
@@ -1045,12 +871,9 @@ def get_qualified_symbols():
     for item in binance_symbols:
 
         symbol = item["symbol"]
+        base_asset = item["base_asset"].upper()
 
-        base_asset = item["base_asset"]
-
-        market_cap = market_caps.get(
-            base_asset
-        )
+        market_cap = market_caps.get(base_asset)
 
         if market_cap is None:
             continue
@@ -1075,11 +898,7 @@ def get_qualified_symbols():
 # KLINES
 # ============================================================
 
-def get_klines(
-    symbol,
-    interval,
-    limit=100
-):
+def get_klines(symbol, interval, limit=100):
 
     data = binance_get(
         "/api/v3/klines",
@@ -1091,7 +910,6 @@ def get_klines(
     )
 
     if not data:
-
         return []
 
     return data
@@ -1101,11 +919,7 @@ def get_klines(
 # CLOSED KLINES
 # ============================================================
 
-def get_closed_klines(
-    symbol,
-    interval,
-    limit=100
-):
+def get_closed_klines(symbol, interval, limit=100):
 
     klines = get_klines(
         symbol,
@@ -1114,12 +928,9 @@ def get_closed_klines(
     )
 
     if len(klines) < 3:
-
         return []
 
-    current_time_ms = int(
-        time.time() * 1000
-    )
+    current_time_ms = int(time.time() * 1000)
 
     closed = []
 
@@ -1128,10 +939,7 @@ def get_closed_klines(
         close_time = candle[6]
 
         if close_time <= current_time_ms:
-
-            closed.append(
-                candle
-            )
+            closed.append(candle)
 
     return closed
 
@@ -1140,25 +948,16 @@ def get_closed_klines(
 # EMA
 # ============================================================
 
-def calculate_ema(
-    values,
-    period
-):
+def calculate_ema(values, period):
 
     if len(values) < period:
-
         return None
 
-    multiplier = (
-        2 / (period + 1)
-    )
+    multiplier = 2 / (period + 1)
 
-    ema = sum(
-        values[:period]
-    ) / period
+    ema = sum(values[:period]) / period
 
     for price in values[period:]:
-
         ema = (
             (price - ema)
             * multiplier
@@ -1170,8 +969,6 @@ def calculate_ema(
 
 # ============================================================
 # 1H TREND
-#
-# Close > EMA20 > EMA50 > EMA100
 # ============================================================
 
 def check_1h_trend(symbol):
@@ -1215,20 +1012,15 @@ def check_1h_trend(symbol):
 
     if (
         ema20 is None
-        or
-        ema50 is None
-        or
-        ema100 is None
+        or ema50 is None
+        or ema100 is None
     ):
-
         return False
 
     trend_ok = (
         current_close > ema20
-        and
-        ema20 > ema50
-        and
-        ema50 > ema100
+        and ema20 > ema50
+        and ema50 > ema100
     )
 
     if trend_ok:
@@ -1248,10 +1040,7 @@ def check_1h_trend(symbol):
 # BEAR FVG DETECTION
 # ============================================================
 
-def find_new_bearish_fvg(
-    symbol,
-    interval
-):
+def find_new_bearish_fvg(symbol, interval):
 
     klines = get_closed_klines(
         symbol,
@@ -1260,14 +1049,11 @@ def find_new_bearish_fvg(
     )
 
     if len(klines) < 3:
-
         return None
 
-    last_processed = (
-        last_processed_fvg.get(
-            (symbol, interval),
-            0
-        )
+    last_processed = last_processed_fvg.get(
+        (symbol, interval),
+        0
     )
 
     # Newest -> oldest
@@ -1283,123 +1069,65 @@ def find_new_bearish_fvg(
 
         c3_open_time = c3[0]
 
-        if (
-            c3_open_time
-            <= last_processed
-        ):
-
+        if c3_open_time <= last_processed:
             continue
 
-        # ====================================================
-        # CANDLE 1
-        # ====================================================
-
+        # Candle 1
         c1_open = float(c1[1])
         c1_close = float(c1[4])
         c1_low = float(c1[3])
 
         if c1_close >= c1_open:
-
             continue
 
-        # ====================================================
-        # CANDLE 2
-        # ====================================================
-
+        # Candle 2
         c2_open = float(c2[1])
         c2_close = float(c2[4])
 
         if c2_close >= c2_open:
-
             continue
 
-        body_low = min(
-            c2_open,
-            c2_close
-        )
+        body_low = min(c2_open, c2_close)
+        body_high = max(c2_open, c2_close)
 
-        body_high = max(
-            c2_open,
-            c2_close
-        )
-
-        body_size = (
-            body_high
-            - body_low
-        )
+        body_size = body_high - body_low
 
         if body_size <= 0:
-
             continue
 
-        # ====================================================
-        # CANDLE 3
-        # ====================================================
-
+        # Candle 3
         c3_high = float(c3[2])
 
-        # ====================================================
-        # BEAR FVG
-        # ====================================================
-
+        # Bear FVG
         if c1_low <= c3_high:
-
             continue
 
         fvg_low = c3_high
-
         fvg_high = c1_low
 
-        fvg_size = (
-            fvg_high
-            - fvg_low
-        )
+        fvg_size = fvg_high - fvg_low
 
         if fvg_size <= 0:
-
             continue
 
-        # ====================================================
-        # FVG INSIDE CANDLE 2 BODY
-        # ====================================================
-
+        # FVG inside Candle 2 body
         if fvg_low < body_low:
-
             continue
 
         if fvg_high > body_high:
-
             continue
 
-        # ====================================================
-        # FVG >= 50% BODY
-        # ====================================================
-
-        fvg_ratio = (
-            fvg_size
-            / body_size
-        )
+        # FVG >= 50% body
+        fvg_ratio = fvg_size / body_size
 
         if fvg_ratio < FVG_MIN_RATIO:
-
             continue
 
-        # ====================================================
-        # TARGET
-        # ====================================================
-
+        # Target
         target_price = (
             c3_high
-            *
-            (
-                1
-                - TARGET_DROP_PERCENT / 100
-            )
+            * (1 - TARGET_DROP_PERCENT / 100)
         )
-
-        # ====================================================
-        # VALID FVG
-        # ====================================================
 
         log(
             f"[FVG] {symbol} {interval}: "
@@ -1410,37 +1138,21 @@ def find_new_bearish_fvg(
         )
 
         return {
-
             "symbol": symbol,
-
             "interval": interval,
-
             "candle1_time": c1[0],
-
             "candle2_time": c2[0],
-
             "candle3_time": c3[0],
-
             "candle1_low": c1_low,
-
             "candle2_open": c2_open,
-
             "candle2_close": c2_close,
-
             "candle2_body": body_size,
-
             "candle3_high": c3_high,
-
             "fvg_low": fvg_low,
-
             "fvg_high": fvg_high,
-
             "fvg_size": fvg_size,
-
             "fvg_ratio": fvg_ratio,
-
             "target": target_price,
-
             "activated_at": time.time()
         }
 
@@ -1449,9 +1161,6 @@ def find_new_bearish_fvg(
 
 # ============================================================
 # SEARCH NEW FVG
-#
-# 15M FIRST
-# 1H SECOND
 # ============================================================
 
 def search_new_fvg(symbol):
@@ -1502,17 +1211,11 @@ def get_current_price(symbol):
     )
 
     if not data:
-
         return None
 
     try:
-
-        return float(
-            data["price"]
-        )
-
+        return float(data["price"])
     except Exception:
-
         return None
 
 
@@ -1523,7 +1226,6 @@ def get_current_price(symbol):
 def activate_fvg(fvg):
 
     symbol = fvg["symbol"]
-
     interval = fvg["interval"]
 
     active_fvgs[symbol] = fvg
@@ -1533,26 +1235,12 @@ def activate_fvg(fvg):
     ] = fvg["candle3_time"]
 
     log()
+    log("==========================================")
+    log("FVG ACTIVATED")
+    log("==========================================")
 
-    log(
-        "=========================================="
-    )
-
-    log(
-        "FVG ACTIVATED"
-    )
-
-    log(
-        "=========================================="
-    )
-
-    log(
-        f"Symbol        : {symbol}"
-    )
-
-    log(
-        f"Timeframe     : {interval}"
-    )
+    log(f"Symbol        : {symbol}")
+    log(f"Timeframe     : {interval}")
 
     log(
         f"Candle 3      : "
@@ -1590,10 +1278,7 @@ def activate_fvg(fvg):
         f"{fvg['target']}"
     )
 
-    log(
-        "=========================================="
-    )
-
+    log("==========================================")
     log()
 
 
@@ -1604,12 +1289,10 @@ def activate_fvg(fvg):
 def finish_fvg(symbol):
 
     if symbol in active_fvgs:
-
         del active_fvgs[symbol]
 
     log(
-        f"[FVG] {symbol}: "
-        "Finished. "
+        f"[FVG] {symbol}: Finished. "
         "Returning to 1H trend."
     )
 
@@ -1620,17 +1303,12 @@ def finish_fvg(symbol):
 
 def monitor_active_fvg(symbol):
 
-    fvg = active_fvgs.get(
-        symbol
-    )
+    fvg = active_fvgs.get(symbol)
 
     if not fvg:
-
         return
 
-    price = get_current_price(
-        symbol
-    )
+    price = get_current_price(symbol)
 
     if price is None:
 
@@ -1642,108 +1320,51 @@ def monitor_active_fvg(symbol):
         return
 
     target = fvg["target"]
-
     third_high = fvg["candle3_high"]
 
-    # ========================================================
     # TARGET
-    # ========================================================
-
     if price <= target:
 
         message = (
             "🔴 BEAR FVG SIGNAL\n\n"
-
             f"Symbol: {symbol}\n"
-
-            f"Timeframe: "
-            f"{fvg['interval']}\n\n"
-
-            f"3rd Candle High: "
-            f"{third_high}\n"
-
-            f"Target (-1.7%): "
-            f"{target}\n"
-
-            f"Current Price: "
-            f"{price}\n\n"
-
+            f"Timeframe: {fvg['interval']}\n\n"
+            f"3rd Candle High: {third_high}\n"
+            f"Target (-1.7%): {target}\n"
+            f"Current Price: {price}\n\n"
             "Bear FVG target reached."
         )
 
         log()
+        log("==========================================")
+        log("🎯 TARGET REACHED")
+        log(message)
+        log("==========================================")
 
-        log(
-            "=========================================="
-        )
+        send_telegram(message)
 
-        log(
-            "🎯 TARGET REACHED"
-        )
-
-        log(
-            message
-        )
-
-        log(
-            "=========================================="
-        )
-
-        send_telegram(
-            message
-        )
-
-        finish_fvg(
-            symbol
-        )
+        finish_fvg(symbol)
 
         return
 
-    # ========================================================
     # CANCEL
-    # ========================================================
-
     if price > third_high:
 
         log()
+        log("==========================================")
+        log(f"❌ {symbol}: FVG CANCELLED")
+        log(f"Current Price : {price}")
+        log(f"Candle 3 High: {third_high}")
+        log("==========================================")
 
-        log(
-            "=========================================="
-        )
-
-        log(
-            f"❌ {symbol}: FVG CANCELLED"
-        )
-
-        log(
-            f"Current Price : {price}"
-        )
-
-        log(
-            f"Candle 3 High: {third_high}"
-        )
-
-        log(
-            "=========================================="
-        )
-
-        finish_fvg(
-            symbol
-        )
+        finish_fvg(symbol)
 
         return
 
-    # ========================================================
     # STILL ACTIVE
-    # ========================================================
-
     distance_to_target = (
-        (
-            third_high
-            - price
-        )
-        /
-        third_high
+        (third_high - price)
+        / third_high
     ) * 100
 
     log(
@@ -1763,49 +1384,27 @@ def process_symbol(item):
 
     symbol = item["symbol"]
 
-    # ========================================================
-    # ACTIVE FVG
-    # ========================================================
-
+    # Active FVG blocks new searches.
     if symbol in active_fvgs:
 
-        monitor_active_fvg(
-            symbol
-        )
+        monitor_active_fvg(symbol)
 
         return
 
-    # ========================================================
-    # 1H TREND
-    # ========================================================
-
-    trend_ok = check_1h_trend(
-        symbol
-    )
+    # 1H trend
+    trend_ok = check_1h_trend(symbol)
 
     if not trend_ok:
-
         return
 
-    # ========================================================
-    # SEARCH FVG
-    # ========================================================
-
-    fvg = search_new_fvg(
-        symbol
-    )
+    # Search FVG
+    fvg = search_new_fvg(symbol)
 
     if not fvg:
-
         return
 
-    # ========================================================
-    # ACTIVATE
-    # ========================================================
-
-    activate_fvg(
-        fvg
-    )
+    # Activate
+    activate_fvg(fvg)
 
 
 # ============================================================
@@ -1815,23 +1414,14 @@ def process_symbol(item):
 def market_scan():
 
     log()
-
-    log(
-        "=========================================="
-    )
-
+    log("==========================================")
     log(
         f"MARKET SCAN "
         f"{now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
+    log("==========================================")
 
-    log(
-        "=========================================="
-    )
-
-    qualified = (
-        get_qualified_symbols()
-    )
+    qualified = get_qualified_symbols()
 
     log(
         f"[MARKET] Qualified coins "
@@ -1840,11 +1430,9 @@ def market_scan():
 
     if not qualified:
 
-        log(
-            "[MARKET] No qualified coins."
-        )
+        log("[MARKET] No qualified coins.")
 
-        return
+        return []
 
     for index, item in enumerate(
         qualified,
@@ -1852,7 +1440,6 @@ def market_scan():
     ):
 
         symbol = item["symbol"]
-
         market_cap = item["market_cap"]
 
         try:
@@ -1863,9 +1450,7 @@ def market_scan():
                 f"MC ${market_cap:,.0f}"
             )
 
-            process_symbol(
-                item
-            )
+            process_symbol(item)
 
         except Exception as e:
 
@@ -1874,9 +1459,9 @@ def market_scan():
                 f"processing error: {e}"
             )
 
-        time.sleep(
-            0.05
-        )
+        time.sleep(0.05)
+
+    return qualified
 
 
 # ============================================================
@@ -1885,31 +1470,21 @@ def market_scan():
 
 def initialize_fvg_baseline():
 
-    current_ms = int(
-        time.time() * 1000
-    )
+    current_ms = int(time.time() * 1000)
 
-    interval_15m_ms = (
-        15 * 60 * 1000
-    )
+    interval_15m_ms = 15 * 60 * 1000
 
     latest_closed_15m = (
-        current_ms
-        // interval_15m_ms
+        current_ms // interval_15m_ms
     ) * interval_15m_ms - interval_15m_ms
 
-    interval_1h_ms = (
-        60 * 60 * 1000
-    )
+    interval_1h_ms = 60 * 60 * 1000
 
     latest_closed_1h = (
-        current_ms
-        // interval_1h_ms
+        current_ms // interval_1h_ms
     ) * interval_1h_ms - interval_1h_ms
 
-    log(
-        "[STARTUP] FVG historical baseline:"
-    )
+    log("[STARTUP] FVG historical baseline:")
 
     log(
         f"[STARTUP] Latest closed 15M: "
@@ -1921,10 +1496,7 @@ def initialize_fvg_baseline():
         f"{format_time(latest_closed_1h)}"
     )
 
-    return (
-        latest_closed_15m,
-        latest_closed_1h
-    )
+    return latest_closed_15m, latest_closed_1h
 
 
 # ============================================================
@@ -1937,6 +1509,8 @@ def apply_fvg_baseline(
     latest_1h
 ):
 
+    global fvg_baseline_applied
+
     for item in qualified:
 
         symbol = item["symbol"]
@@ -1948,6 +1522,8 @@ def apply_fvg_baseline(
         last_processed_fvg[
             (symbol, "1h")
         ] = latest_1h
+
+    fvg_baseline_applied = True
 
     log(
         f"[STARTUP] Baseline applied to "
@@ -1962,151 +1538,52 @@ def apply_fvg_baseline(
 def startup():
 
     log()
-
-    log(
-        "=========================================="
-    )
-
-    log(
-        "BINANCE SPOT BEAR FVG BOT v3.0"
-    )
-
-    log(
-        "=========================================="
-    )
-
+    log("==========================================")
+    log("BINANCE SPOT BEAR FVG BOT v4.0")
+    log("==========================================")
     log()
 
-    log(
-        "Conditions:"
-    )
-
+    log("Conditions:")
+    log()
+    log("1. Binance Spot USDT")
+    log("2. CMC Market Cap > $300M")
+    log("3. 1H: Close > EMA20 > EMA50 > EMA100")
+    log("4. Search NEW 15M Bear FVG first")
+    log("5. Only if no 15M -> search NEW 1H")
+    log("6. Three candles must be CLOSED")
+    log("7. Candle 1 must be bearish")
+    log("8. Candle 2 must be bearish")
+    log("9. Candle 1 Low > Candle 3 High")
+    log("10. FVG inside Candle 2 body")
+    log("11. FVG >= 50% of Candle 2 body")
+    log("12. Target = 1.7% below Candle 3 High")
+    log("13. Candle 3 High crossed -> CANCEL")
+    log("14. One active FVG per coin")
+    log("15. Active FVG blocks new FVG searches")
+    log("16. After Target/Cancel -> return to 1H")
+    log("17. Scan every 60 seconds")
+    log("18. CMC cache refresh every 30 minutes")
+    log("19. CMC timeout = 10 seconds")
+    log("20. CMC 429 minute-limit cooldown ≈ 75 seconds")
+    log("21. CMC persistent local cache")
+    log("22. Old startup FVGs are ignored")
     log()
 
-    log(
-        "1. Binance Spot USDT"
-    )
-
-    log(
-        "2. CMC Market Cap > $300M"
-    )
-
-    log(
-        "3. 1H: Close > EMA20 > EMA50 > EMA100"
-    )
-
-    log(
-        "4. Search NEW 15M Bear FVG first"
-    )
-
-    log(
-        "5. Only if no 15M -> search NEW 1H"
-    )
-
-    log(
-        "6. Three candles must be CLOSED"
-    )
-
-    log(
-        "7. Candle 1 must be bearish"
-    )
-
-    log(
-        "8. Candle 2 must be bearish"
-    )
-
-    log(
-        "9. Candle 1 Low > Candle 3 High"
-    )
-
-    log(
-        "10. FVG inside Candle 2 body"
-    )
-
-    log(
-        "11. FVG >= 50% of Candle 2 body"
-    )
-
-    log(
-        "12. Target = 1.7% below Candle 3 High"
-    )
-
-    log(
-        "13. Candle 3 High crossed -> CANCEL"
-    )
-
-    log(
-        "14. One active FVG per coin"
-    )
-
-    log(
-        "15. Active FVG blocks new FVG searches"
-    )
-
-    log(
-        "16. After Target/Cancel -> return to 1H"
-    )
-
-    log(
-        "17. Scan every 60 seconds"
-    )
-
-    log(
-        "18. CMC cache refresh every 15 minutes"
-    )
-
-    log(
-        "19. CMC timeout = 10 seconds"
-    )
-
-    log(
-        "20. CMC 429 cooldown = 30 minutes+"
-    )
-
-    log(
-        "21. CMC persistent local cache"
-    )
-
-    log(
-        "22. Old startup FVGs are ignored"
-    )
-
-    log()
-
-    log(
-        "No signal cooldown."
-    )
-
-    log(
-        "No RSI / MACD / Volume filters."
-    )
-
-    log(
-        "=========================================="
-    )
-
+    log("No RSI / MACD / Volume filters.")
+    log("==========================================")
     log()
 
     send_telegram(
         "🟢 Bear FVG Bot started.\n\n"
-
         "Binance Spot USDT\n"
-
         "CMC Market Cap > $300M\n"
-
         "1H: Close > EMA20 > EMA50 > EMA100\n"
-
         "15M FVG → 1H fallback\n"
-
         "Bear FVG >= 50% of Candle 2 body\n"
-
         "Target: -1.7%\n"
-
         "Scan: 60 seconds\n"
-
-        "CMC cache: 15 minutes\n"
-
-        "CMC 429 protection: ON"
+        "CMC cache: 30 minutes\n"
+        "CMC rate-limit protection: ON"
     )
 
 
@@ -2118,55 +1595,29 @@ def main():
 
     startup()
 
-    # --------------------------------------------------------
-    # FIRST: Load local CMC cache
-    # --------------------------------------------------------
-
-    log(
-        "[STARTUP] Loading local CMC cache..."
-    )
-
+    # Load local CMC cache.
+    log("[STARTUP] Loading local CMC cache...")
     load_cmc_cache()
 
-    # --------------------------------------------------------
-    # FVG baseline
-    # --------------------------------------------------------
+    # FVG baseline.
+    latest_15m, latest_1h = initialize_fvg_baseline()
 
-    latest_15m, latest_1h = (
-        initialize_fvg_baseline()
-    )
+    # Initial market data.
+    log("[STARTUP] Loading initial market data...")
 
-    # --------------------------------------------------------
-    # Initial market data
-    # --------------------------------------------------------
+    qualified = get_qualified_symbols()
 
-    log(
-        "[STARTUP] Loading initial market data..."
-    )
+    # Apply baseline immediately if CMC worked.
+    if qualified and not fvg_baseline_applied:
 
-    qualified = (
-        get_qualified_symbols()
-    )
+        apply_fvg_baseline(
+            qualified,
+            latest_15m,
+            latest_1h
+        )
 
-    # --------------------------------------------------------
-    # Apply baseline
-    # --------------------------------------------------------
-
-    apply_fvg_baseline(
-        qualified,
-        latest_15m,
-        latest_1h
-    )
-
-    log(
-        "[STARTUP] Initialization complete."
-    )
-
+    log("[STARTUP] Initialization complete.")
     log()
-
-    # --------------------------------------------------------
-    # Main loop
-    # --------------------------------------------------------
 
     last_scan = 0
 
@@ -2181,7 +1632,20 @@ def main():
                 >= SCAN_INTERVAL
             ):
 
-                market_scan()
+                qualified = market_scan()
+
+                # If CMC was unavailable at startup, apply the
+                # baseline the first time valid market data arrives.
+                if (
+                    qualified
+                    and not fvg_baseline_applied
+                ):
+
+                    apply_fvg_baseline(
+                        qualified,
+                        latest_15m,
+                        latest_1h
+                    )
 
                 last_scan = current_time
 
@@ -2190,19 +1654,12 @@ def main():
         except KeyboardInterrupt:
 
             log()
-
-            log(
-                "Bot stopped."
-            )
-
+            log("Bot stopped.")
             break
 
         except Exception as e:
 
-            log(
-                f"[MAIN ERROR] {e}"
-            )
-
+            log(f"[MAIN ERROR] {e}")
             time.sleep(5)
 
 
@@ -2211,5 +1668,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
