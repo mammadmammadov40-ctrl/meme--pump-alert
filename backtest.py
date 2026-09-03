@@ -18,15 +18,22 @@ from datetime import datetime, timezone
 #   5) FVG >= 50% of Candle 2 body
 #   6) Target = Candle 3 High - 1.7%
 #
+# Historical trend timing uses only a 1H candle that was already closed
+# when Candle 3 closed, avoiding look-ahead from an unfinished 1H candle.
+#
 # It then looks forward candle-by-candle:
 #   - TARGET: price reaches target
 #   - CANCELLED: price breaks above Candle 3 High
+#
+# Public market-data endpoint:
+#   https://data-api.binance.vision
+#   (official Binance market-data-only endpoint)
 #
 # Run:
 #   python backtest.py
 # ============================================================
 
-BINANCE_BASE_URL = "https://api.binance.com"
+BINANCE_BASE_URL = "https://data-api.binance.vision"
 
 # -------------------- SETTINGS ------------------------------
 
@@ -72,7 +79,9 @@ def binance_get(endpoint, params=None):
 
     except Exception as e:
         print(f"[BINANCE ERROR] {endpoint}: {e}")
-        return None
+        raise RuntimeError(
+            f"Binance request failed for {endpoint}: {e}"
+        ) from e
 
 
 # ============================================================
@@ -234,28 +243,30 @@ def build_hourly_trend(hourly_candles):
 # 24H VOLUME
 # ============================================================
 
-def get_current_24h_volume(symbol):
-    data = binance_get(
-        "/api/v3/ticker/24hr",
-        {"symbol": symbol}
-    )
+def get_current_24h_volumes():
+    """
+    Downloads all current 24H tickers in one public market-data request.
+    This is much faster and uses less API weight than requesting one
+    ticker per symbol.
+    """
+    data = binance_get("/api/v3/ticker/24hr")
 
-    if not data:
-        return None
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected Binance /ticker/24hr response.")
 
-    try:
-        return float(data["quoteVolume"])
-    except Exception:
-        return None
+    volumes = {}
 
+    for item in data:
+        symbol = item.get("symbol")
+        if not symbol:
+            continue
 
-def volume_passes(symbol):
-    volume = get_current_24h_volume(symbol)
+        try:
+            volumes[symbol] = float(item["quoteVolume"])
+        except (KeyError, TypeError, ValueError):
+            continue
 
-    if volume is None:
-        return False, None
-
-    return volume >= MIN_QUOTE_VOLUME_24H, volume
+    return volumes
 
 
 # ============================================================
@@ -538,17 +549,14 @@ def backtest_symbol(symbol, start_ms, end_ms):
                 continue
 
             # ------------------------------------------------
-            # 1H bullish trend at the latest CLOSED 1H candle
+            # 1H bullish trend using the latest CLOSED 1H candle
+            # available when Candle 3 closes.
             # ------------------------------------------------
-            hour_ms = 60 * 60 * 1000
-            hour_key = (
-                c3_time // hour_ms
-            ) * hour_ms
+            c3_close_time = int(candles[i][6])
 
-            # Use latest 1H candle whose open time is <= signal time.
             trend_keys = [
                 k for k in trend.keys()
-                if k <= hour_key
+                if (k + 60 * 60 * 1000 - 1) <= c3_close_time
             ]
 
             if not trend_keys:
@@ -846,6 +854,7 @@ def main():
     print(f"Target:              {TARGET_PERCENT}%")
     print(f"Intervals:           {FVG_INTERVALS}")
     print(f"Fee per side:        {FEE_PER_SIDE * 100:.3f}%")
+    print(f"Data endpoint:       {BINANCE_BASE_URL}")
     print("=" * 78)
 
     now_ms = int(time.time() * 1000)
@@ -861,36 +870,44 @@ def main():
     # Historical delisted symbols are intentionally excluded.
     # --------------------------------------------------------
 
-    symbols = get_spot_usdt_symbols()
+    try:
+        symbols = get_spot_usdt_symbols()
+    except Exception as e:
+        print(f"FATAL: Could not get Binance symbols: {e}")
+        raise SystemExit(1)
 
     if not symbols:
-        print("Could not get Binance symbols.")
-        return
+        print("FATAL: Could not get Binance symbols.")
+        raise SystemExit(1)
 
     print(
         f"Current Spot USDT symbols: {len(symbols)}"
     )
 
-    # To avoid huge API usage, identify symbols currently
-    # above the volume threshold first.
+    # Identify symbols currently above the volume threshold
+    # with one bulk public-market-data request.
+    try:
+        current_volumes = get_current_24h_volumes()
+    except Exception as e:
+        print(f"FATAL: Could not get 24H volumes: {e}")
+        raise SystemExit(1)
+
     qualified = []
 
     for index, symbol in enumerate(symbols, 1):
-        ok, volume = volume_passes(symbol)
+        volume = current_volumes.get(symbol)
 
-        if ok:
+        if volume is not None and volume >= MIN_QUOTE_VOLUME_24H:
             qualified.append(symbol)
             print(
                 f"[QUALIFIED] {symbol} "
                 f"${volume:,.0f}"
             )
 
-        if index % 50 == 0:
+        if index % 100 == 0:
             print(
                 f"Volume scan: {index}/{len(symbols)}"
             )
-
-        time.sleep(0.03)
 
     if MAX_SYMBOLS > 0:
         qualified = qualified[:MAX_SYMBOLS]
