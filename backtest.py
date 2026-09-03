@@ -48,7 +48,7 @@ EMA_MID = 50
 EMA_SLOW = 100
 
 # Backtest period in days.
-BACKTEST_DAYS = 30
+BACKTEST_DAYS = 180
 
 # Maximum number of qualifying symbols to test.
 # Set to 0 for all qualifying symbols.
@@ -58,7 +58,14 @@ MAX_SYMBOLS = 0
 # Change if your actual Binance fee is different.
 FEE_PER_SIDE = 0.001
 
-OUTPUT_CSV = "backtest_results.csv"
+# V2 risk / execution model
+STARTING_BALANCE = 1000.0
+RISK_PER_TRADE = 0.01          # 1% of current equity
+SL_BUFFER_PERCENT = 0.05       # small buffer above Candle 3 high
+MAX_HOLD_CANDLES = 96          # safety cap for unresolved trades
+
+
+OUTPUT_CSV = "backtest_v2_results.csv"
 
 
 # ============================================================
@@ -849,6 +856,9 @@ def main():
     print("=" * 78)
 
     print(f"Backtest days:       {BACKTEST_DAYS}")
+    print("V2 execution model: entry=FVG high | SL=C3 high+buffer | TP=1.7%")
+    print(f"Risk per trade:      {RISK_PER_TRADE * 100:.1f}%")
+    print(f"Starting balance:    ${STARTING_BALANCE:,.2f}")
     print(f"Min 24H volume:      ${MIN_QUOTE_VOLUME_24H:,.0f}")
     print(f"FVG minimum ratio:   {FVG_MIN_RATIO * 100:.0f}%")
     print(f"Target:              {TARGET_PERCENT}%")
@@ -952,4 +962,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"FATAL BACKTEST ERROR: {e}")
+        raise
+
