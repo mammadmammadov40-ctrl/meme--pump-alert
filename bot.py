@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
+# ============================================================
+# TELEGRAM SETTINGS
+# ============================================================
+
 TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
 
@@ -65,6 +69,7 @@ def binance_get(endpoint, params=None):
     url = BINANCE_BASE_URL + endpoint
 
     try:
+
         response = requests.get(
             url,
             params=params,
@@ -85,10 +90,42 @@ def binance_get(endpoint, params=None):
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM REQUEST
 # ============================================================
 
 def send_telegram(message):
+
+    # --------------------------------------------------------
+    # Check configuration
+    # --------------------------------------------------------
+
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN"
+    ):
+
+        print(
+            "[TELEGRAM ERROR] "
+            "TELEGRAM_BOT_TOKEN is not configured."
+        )
+
+        return False
+
+    if (
+        not TELEGRAM_CHAT_ID
+        or TELEGRAM_CHAT_ID == "YOUR_TELEGRAM_CHAT_ID"
+    ):
+
+        print(
+            "[TELEGRAM ERROR] "
+            "TELEGRAM_CHAT_ID is not configured."
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # Telegram API
+    # --------------------------------------------------------
 
     url = (
         f"https://api.telegram.org/bot"
@@ -102,30 +139,91 @@ def send_telegram(message):
 
     try:
 
+        print("[TELEGRAM] Sending message...")
+
         response = requests.post(
             url,
             data=payload,
-            timeout=10
+            timeout=15
         )
 
-        if response.status_code != 200:
+        print(
+            f"[TELEGRAM STATUS] "
+            f"{response.status_code}"
+        )
+
+        print(
+            f"[TELEGRAM RESPONSE] "
+            f"{response.text}"
+        )
+
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
+
+        if response.status_code == 200:
+
+            try:
+
+                data = response.json()
+
+            except Exception:
+
+                data = {}
+
+            if data.get("ok") is True:
+
+                print(
+                    "[TELEGRAM SUCCESS] "
+                    "Message sent successfully."
+                )
+
+                return True
 
             print(
-                f"[TELEGRAM ERROR] "
-                f"{response.text}"
+                "[TELEGRAM FAILED] "
+                f"{data}"
             )
 
-        else:
+            return False
 
-            print(
-                "[TELEGRAM] Message sent"
-            )
+        # ----------------------------------------------------
+        # ERROR
+        # ----------------------------------------------------
+
+        print(
+            f"[TELEGRAM ERROR] "
+            f"HTTP {response.status_code}"
+        )
+
+        return False
+
+    except requests.exceptions.Timeout:
+
+        print(
+            "[TELEGRAM ERROR] "
+            "Request timed out."
+        )
+
+        return False
+
+    except requests.exceptions.RequestException as e:
+
+        print(
+            "[TELEGRAM REQUEST ERROR] "
+            f"{e}"
+        )
+
+        return False
 
     except Exception as e:
 
         print(
-            f"[TELEGRAM ERROR] {e}"
+            "[TELEGRAM UNKNOWN ERROR] "
+            f"{e}"
         )
+
+        return False
 
 
 # ============================================================
@@ -135,11 +233,47 @@ def send_telegram(message):
 def send_telegram_once(key, message):
 
     if telegram_state.get(key):
+
         return
 
-    send_telegram(message)
+    success = send_telegram(message)
 
-    telegram_state[key] = True
+    # Only mark as sent if Telegram actually accepted it
+    if success:
+
+        telegram_state[key] = True
+
+
+# ============================================================
+# TELEGRAM CONNECTION TEST
+# ============================================================
+
+def test_telegram():
+
+    print("=" * 70)
+    print("[TELEGRAM TEST] Starting...")
+    print("=" * 70)
+
+    result = send_telegram(
+        "🧪 TELEGRAM TEST\n\n"
+        "Binance Bearish FVG Bot Telegram connection is working. ✅"
+    )
+
+    if result:
+
+        print(
+            "[TELEGRAM TEST] SUCCESS ✅"
+        )
+
+    else:
+
+        print(
+            "[TELEGRAM TEST] FAILED ❌"
+        )
+
+    print("=" * 70)
+
+    return result
 
 
 # ============================================================
@@ -153,6 +287,7 @@ def get_spot_usdt_symbols():
     )
 
     if not data:
+
         return []
 
     symbols = []
@@ -164,6 +299,7 @@ def get_spot_usdt_symbols():
             and item.get("quoteAsset") == "USDT"
             and item.get("isSpotTradingAllowed") is True
         ):
+
             symbols.append(
                 item["symbol"]
             )
@@ -185,6 +321,7 @@ def get_qualified_symbols():
         now - volume_cache["timestamp"]
         < VOLUME_CACHE_SECONDS
     ):
+
         return volume_cache["symbols"]
 
     data = binance_get(
@@ -192,6 +329,7 @@ def get_qualified_symbols():
     )
 
     if not data:
+
         return volume_cache["symbols"]
 
     qualified = []
@@ -206,6 +344,7 @@ def get_qualified_symbols():
         if not symbol.endswith(
             "USDT"
         ):
+
             continue
 
         try:
@@ -253,6 +392,7 @@ def get_closed_klines(
     )
 
     if not data:
+
         return []
 
     now_ms = int(
@@ -290,6 +430,7 @@ def get_current_price(symbol):
     )
 
     if not data:
+
         return None
 
     try:
@@ -313,6 +454,7 @@ def calculate_ema(
 ):
 
     if len(values) < period:
+
         return None
 
     multiplier = 2 / (
@@ -348,6 +490,7 @@ def get_24h_volume(symbol):
     )
 
     if not data:
+
         return None
 
     try:
@@ -404,6 +547,7 @@ def get_bullish_trend_data(symbol):
         ema50,
         ema100
     ):
+
         return None
 
     bullish = (
@@ -436,6 +580,7 @@ def initialize_symbol_cycle(symbol):
         )
 
         if not candles:
+
             continue
 
         latest_open_time = int(
@@ -467,6 +612,7 @@ def find_new_bearish_fvg(
     )
 
     if len(candles) < 3:
+
         return None
 
     last_processed = last_processed_fvg.get(
@@ -496,9 +642,11 @@ def find_new_bearish_fvg(
 
         # Only NEW FVG
         if c3_open_time <= last_processed:
+
             continue
 
         if c3_open_time <= search_start:
+
             continue
 
         # ----------------------------------------------------
@@ -512,6 +660,7 @@ def find_new_bearish_fvg(
 
         # C1 bearish
         if c1_close >= c1_open:
+
             continue
 
         # ----------------------------------------------------
@@ -525,6 +674,7 @@ def find_new_bearish_fvg(
 
         # C2 bearish
         if c2_close >= c2_open:
+
             continue
 
         # Candle 2 BODY
@@ -543,6 +693,7 @@ def find_new_bearish_fvg(
         )
 
         if body_size <= 0:
+
             continue
 
         # ----------------------------------------------------
@@ -561,6 +712,7 @@ def find_new_bearish_fvg(
         # ----------------------------------------------------
 
         if c1_low <= c3_high:
+
             continue
 
         fvg_low = c3_high
@@ -571,23 +723,24 @@ def find_new_bearish_fvg(
         )
 
         if fvg_size <= 0:
+
             continue
 
         # ----------------------------------------------------
         # FVG MUST BE COMPLETELY
-        # INSIDE CANDLE 2 OPEN-CLOSE BODY
+        # INSIDE CANDLE 2 BODY
         # ----------------------------------------------------
 
         if fvg_low < body_low:
+
             continue
 
         if fvg_high > body_high:
+
             continue
 
         # ----------------------------------------------------
         # FVG SIZE >= 50% OF CANDLE 2 BODY
-        #
-        # FVG CAN BE ANYWHERE INSIDE THE BODY.
         # ----------------------------------------------------
 
         fvg_ratio = (
@@ -595,6 +748,7 @@ def find_new_bearish_fvg(
         )
 
         if fvg_ratio < FVG_MIN_RATIO:
+
             continue
 
         # ----------------------------------------------------
@@ -726,12 +880,25 @@ def activate_fvg(
         "STATUS: ACTIVE 🔴"
     )
 
-    send_telegram(message)
-
-    print(
-        f"[FVG ACTIVE] {symbol} | "
-        f"{fvg['interval']}"
+    success = send_telegram(
+        message
     )
+
+    if success:
+
+        print(
+            f"[FVG ACTIVE] {symbol} | "
+            f"{fvg['interval']} | "
+            f"Telegram sent"
+        )
+
+    else:
+
+        print(
+            f"[FVG ACTIVE] {symbol} | "
+            f"{fvg['interval']} | "
+            f"Telegram FAILED"
+        )
 
 
 # ============================================================
@@ -751,12 +918,13 @@ def reset_symbol_cycle(
     # Clear old Telegram cycle states
     keys_to_delete = []
 
-    for key in telegram_state:
+    for key in list(telegram_state.keys()):
 
         if (
             isinstance(key, tuple)
             and key[0] == symbol
         ):
+
             keys_to_delete.append(
                 key
             )
@@ -791,6 +959,7 @@ def monitor_active_fvg(symbol):
     )
 
     if not fvg:
+
         return
 
     current_price = get_current_price(
@@ -798,6 +967,7 @@ def monitor_active_fvg(symbol):
     )
 
     if current_price is None:
+
         return
 
     target = fvg["target"]
@@ -951,9 +1121,6 @@ def process_symbol(
     # ========================================================
     # STEP 3
     # 1H BULLISH TREND
-    #
-    # FVG SEARCH IS NOT ALLOWED
-    # BEFORE THIS STEP PASSES.
     # ========================================================
 
     trend = get_bullish_trend_data(
@@ -971,7 +1138,6 @@ def process_symbol(
 
     if not trend["bullish"]:
 
-        # Only notify when state changes
         if telegram_state.get(
             trend_key
         ) != "NOT_BULLISH":
@@ -1069,8 +1235,6 @@ def cleanup_symbols(
         )
 
         # Do not destroy an already active FVG.
-        # It continues being monitored until
-        # target or Candle 3 High cancellation.
         if symbol in active_fvgs:
 
             continue
@@ -1094,12 +1258,13 @@ def cleanup_symbols(
         # Clear Telegram states
         keys_to_delete = []
 
-        for key in telegram_state:
+        for key in list(telegram_state.keys()):
 
             if (
                 isinstance(key, tuple)
                 and key[0] == symbol
             ):
+
                 keys_to_delete.append(
                     key
                 )
@@ -1144,20 +1309,39 @@ def main():
     print("=" * 70)
 
     # ========================================================
-    # TEST TELEGRAM
+    # TELEGRAM TEST
     # ========================================================
 
-    send_telegram(
-        "🤖 BEARISH FVG BOT STARTED\n\n"
-        f"Volume Filter: ${MIN_QUOTE_VOLUME_24H:,.0f}+\n"
-        "1H Trend: Close > EMA20 > EMA50 > EMA100\n"
-        "FVG: Bearish only\n"
-        "FVG Priority: 15M -> 1H\n"
-        "FVG inside Candle 2 Body: YES\n"
-        "Minimum FVG / C2 Body: 50%\n"
-        f"Target: -{TARGET_PERCENT}% from Candle 3 High\n\n"
-        "Status: RUNNING 🟢"
-    )
+    telegram_ok = test_telegram()
+
+    if not telegram_ok:
+
+        print(
+            "\n"
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+            "TELEGRAM CONNECTION FAILED\n"
+            "Check BOT TOKEN and CHAT ID.\n"
+            "See [TELEGRAM RESPONSE] above for exact error.\n"
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+        )
+
+    # ========================================================
+    # START MESSAGE
+    # ========================================================
+
+    if telegram_ok:
+
+        send_telegram(
+            "🤖 BEARISH FVG BOT STARTED\n\n"
+            f"Volume Filter: ${MIN_QUOTE_VOLUME_24H:,.0f}+\n"
+            "1H Trend: Close > EMA20 > EMA50 > EMA100\n"
+            "FVG: Bearish only\n"
+            "FVG Priority: 15M -> 1H\n"
+            "FVG inside Candle 2 Body: YES\n"
+            "Minimum FVG / C2 Body: 50%\n"
+            f"Target: -{TARGET_PERCENT}% from Candle 3 High\n\n"
+            "Status: RUNNING 🟢"
+        )
 
     while True:
 
@@ -1219,11 +1403,13 @@ def main():
                     )
 
                     if volume is None:
+
                         continue
 
                     # Safety check:
                     # symbol must still be >= $20M
                     if volume < MIN_QUOTE_VOLUME_24H:
+
                         continue
 
                     process_symbol(
