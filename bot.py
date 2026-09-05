@@ -331,6 +331,25 @@ def detect_bearish_fvg(candles):
         return None
 
     # --------------------------------------------------------
+    # NEW CONDITION
+    #
+    # C3 MUST CLOSE BELOW C2 LOW
+    #
+    # C2 Low > C3 Close
+    #
+    # This means:
+    #
+    # C3 Close < C2 Low
+    # --------------------------------------------------------
+
+    c2_low = candle_low(c2)
+    c3_close = candle_close(c3)
+
+    if c3_close >= c2_low:
+
+        return None
+
+    # --------------------------------------------------------
     # FVG
     # --------------------------------------------------------
 
@@ -1158,6 +1177,10 @@ def main():
 
     print(
         "C3: GREEN or RED"
+    )
+
+    print(
+        "C3 CLOSE: MUST BE BELOW C2 LOW"
     )
 
     print(
