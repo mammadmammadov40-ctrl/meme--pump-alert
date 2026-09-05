@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 # ============================================================
 # BINANCE BEARISH FVG LIVE ALERT BOT
 # REAL-TIME ROLLING 3-CANDLE VERSION
+# 15m + 1h INDEPENDENT ACTIVE FVG
 # ============================================================
 
 BINANCE_BASE_URL = "https://api.binance.com"
@@ -38,7 +39,19 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BOT_START_MS = int(time.time() * 1000)
 
-# One active setup per symbol
+# ------------------------------------------------------------
+# ACTIVE SETUPS
+#
+# KEY = (symbol, interval)
+#
+# This allows the same symbol to have:
+#
+# BTCUSDT 15m -> ACTIVE
+# BTCUSDT 1h  -> ACTIVE
+#
+# independently.
+# ------------------------------------------------------------
+
 active_setups = {}
 
 # Prevent the exact same FVG from alerting twice
@@ -747,7 +760,20 @@ def monitor_active_setups():
 
         return
 
-    for symbol, setup in list(
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Each symbol + timeframe is monitored independently.
+    #
+    # Example:
+    #
+    # ("BTCUSDT", "15m")
+    # ("BTCUSDT", "1h")
+    #
+    # can both be active at the same time.
+    # --------------------------------------------------------
+
+    for (symbol, interval), setup in list(
         active_setups.items()
     ):
 
@@ -774,7 +800,7 @@ def monitor_active_setups():
                 print(
                     f"[TARGET HIT] "
                     f"{symbol} "
-                    f"{setup['interval']} "
+                    f"{interval} "
                     f"price={current_price}"
                 )
 
@@ -784,10 +810,14 @@ def monitor_active_setups():
                     )
                 )
 
-                # IMPORTANT:
-                # Forget completed FVG
+                # ------------------------------------------------
+                # ONLY THIS TIMEFRAME IS REMOVED
+                #
+                # If 1h is also active, it stays active.
+                # ------------------------------------------------
+
                 active_setups.pop(
-                    symbol,
+                    (symbol, interval),
                     None
                 )
 
@@ -804,7 +834,7 @@ def monitor_active_setups():
                 print(
                     f"[CANCELLED] "
                     f"{symbol} "
-                    f"{setup['interval']} "
+                    f"{interval} "
                     f"price={current_price}"
                 )
 
@@ -815,10 +845,14 @@ def monitor_active_setups():
                     )
                 )
 
-                # IMPORTANT:
-                # Forget completed FVG
+                # ------------------------------------------------
+                # ONLY THIS TIMEFRAME IS REMOVED
+                #
+                # If 1h is also active, it stays active.
+                # ------------------------------------------------
+
                 active_setups.pop(
-                    symbol,
+                    (symbol, interval),
                     None
                 )
 
@@ -828,7 +862,7 @@ def monitor_active_setups():
 
             print(
                 f"[MONITOR ERROR] "
-                f"{symbol}: {e}"
+                f"{symbol} {interval}: {e}"
             )
 
 
@@ -929,17 +963,27 @@ def scan():
     )
 
     # --------------------------------------------------------
-    # FVG scanning
+    # FVG SCANNING
+    #
+    # IMPORTANT:
+    #
+    # 15m and 1h are now INDEPENDENT.
+    #
+    # We DO NOT break after a 15m FVG.
+    #
+    # Therefore:
+    #
+    # 15m FVG -> can activate 15m
+    #
+    # AND
+    #
+    # 1h FVG -> can activate 1h
+    #
+    # on the SAME symbol and SAME scan.
     # --------------------------------------------------------
 
     for symbol in qualified_symbols:
 
-        # One active FVG per symbol
-        #
-        # BUT:
-        # We still update the rolling candle state
-        # even when this symbol already has an active setup.
-        #
         for interval in FVG_INTERVALS:
 
             try:
@@ -962,19 +1006,33 @@ def scan():
                 )
 
                 # ------------------------------------------------
-                # If symbol already has active setup,
-                # ignore this new FVG.
+                # ACTIVE KEY
                 #
-                # Rolling window still continues.
+                # Symbol + timeframe are independent.
                 # ------------------------------------------------
 
-                if symbol in active_setups:
+                setup_key = (
+                    symbol,
+                    interval
+                )
+
+                # ------------------------------------------------
+                # If THIS timeframe already has an active FVG,
+                # ignore only this new FVG.
+                #
+                # IMPORTANT:
+                # 15m active does NOT block 1h.
+                # 1h active does NOT block 15m.
+                # ------------------------------------------------
+
+                if setup_key in active_setups:
 
                     print(
                         f"[IGNORED] "
                         f"{symbol} {interval} "
                         f"new FVG found but "
-                        f"symbol already has active setup"
+                        f"this timeframe already has "
+                        f"an active setup"
                     )
 
                     continue
@@ -1000,7 +1058,7 @@ def scan():
                 # ------------------------------------------------
 
                 active_setups[
-                    symbol
+                    setup_key
                 ] = setup
 
                 print(
@@ -1023,12 +1081,13 @@ def scan():
                 )
 
                 # ------------------------------------------------
-                # One active setup per symbol.
+                # IMPORTANT:
                 #
-                # 15m has priority because it is first.
+                # NO BREAK HERE.
+                #
+                # We must continue to 1h even if 15m
+                # generated a signal.
                 # ------------------------------------------------
-
-                break
 
             except Exception as e:
 
@@ -1054,6 +1113,10 @@ def main():
 
     print(
         "REAL-TIME ROLLING 3-CANDLE VERSION"
+    )
+
+    print(
+        "15m + 1h INDEPENDENT ACTIVE FVG"
     )
 
     print(
@@ -1103,6 +1166,14 @@ def main():
 
     print(
         "EMA / Trend filter: DISABLED"
+    )
+
+    print(
+        "15m + 1h: INDEPENDENT"
+    )
+
+    print(
+        "One active FVG PER TIMEFRAME"
     )
 
     print(
