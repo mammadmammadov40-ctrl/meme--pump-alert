@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 # ============================================================
 # BINANCE BEARISH FVG LIVE ALERT BOT
 # REAL-TIME ROLLING 3-CANDLE VERSION
-# 15m + 1h INDEPENDENT ACTIVE FVG
+# 5m + 15m + 30m + 1h INDEPENDENT ACTIVE FVG
+# EACH TIMEFRAME HAS ITS OWN TARGET
 # ============================================================
 
 BINANCE_BASE_URL = "https://api.binance.com"
@@ -18,9 +19,15 @@ MIN_QUOTE_VOLUME_24H = 20_000_000
 
 FVG_MIN_RATIO = 0.50
 
-TARGET_PERCENT = 1.2
+# Each timeframe has its own target
+FVG_TARGETS = {
+    "5m": 0.7,
+    "15m": 1.2,
+    "30m": 1.7,
+    "1h": 2.4,
+}
 
-FVG_INTERVALS = ["15m", "1h"]
+FVG_INTERVALS = list(FVG_TARGETS.keys())
 
 SCAN_SECONDS = 60
 
@@ -290,6 +297,7 @@ def detect_bearish_fvg(candles):
     c2 = candles[1]
     c3 = candles[2]
 
+    # C2 MUST BE BEARISH
     if not candle_is_bearish(c2):
 
         return None
@@ -297,6 +305,7 @@ def detect_bearish_fvg(candles):
     c1_low = candle_low(c1)
     c3_high = candle_high(c3)
 
+    # Bearish FVG condition
     if c1_low <= c3_high:
 
         return None
@@ -304,6 +313,7 @@ def detect_bearish_fvg(candles):
     c2_low = candle_low(c2)
     c3_close = candle_close(c3)
 
+    # C3 CLOSE MUST BE BELOW C2 LOW
     if c3_close >= c2_low:
 
         return None
@@ -344,6 +354,7 @@ def detect_bearish_fvg(candles):
 
         return None
 
+    # FVG MUST BE INSIDE C2 BODY
     if fvg_low < c2_body_low:
 
         return None
@@ -358,6 +369,7 @@ def detect_bearish_fvg(candles):
         c2_body_size
     )
 
+    # Minimum FVG ratio = 50%
     if fvg_ratio < FVG_MIN_RATIO:
 
         return None
@@ -426,6 +438,7 @@ def update_realtime_fvg(
 
     state = candle_state.get(key)
 
+    # First scan initializes the rolling window
     if state is None:
 
         candle_state[key] = {
@@ -452,12 +465,14 @@ def update_realtime_fvg(
         ]
     )
 
+    # No new closed candle
     if latest_open_time <= last_time:
 
         return None
 
     old_window = state["window"]
 
+    # Rolling 3-candle window
     new_window = [
         old_window[-2],
         old_window[-1],
@@ -510,6 +525,9 @@ def create_setup(
     volume_24h
 ):
 
+    # Get target specifically for this timeframe
+    target_percent = FVG_TARGETS[interval]
+
     c3_high = fvg["c3_high"]
 
     target = (
@@ -518,7 +536,7 @@ def create_setup(
         (
             1
             -
-            TARGET_PERCENT / 100
+            target_percent / 100
         )
     )
 
@@ -541,6 +559,8 @@ def create_setup(
         "c3_close": fvg["c3_close"],
 
         "target": target,
+
+        "target_percent": target_percent,
 
         "volume_24h": volume_24h,
 
@@ -575,6 +595,8 @@ def format_signal(setup):
 
     volume = setup["volume_24h"]
 
+    target_percent = setup["target_percent"]
+
     return (
         "🔴 <b>BEARISH FVG SIGNAL</b>\n\n"
 
@@ -590,7 +612,7 @@ def format_signal(setup):
         f"<b>C3 High:</b> "
         f"{c3_high:.8g}\n"
 
-        f"<b>Target (-{TARGET_PERCENT}%):</b> "
+        f"<b>Target (-{target_percent}%):</b> "
         f"{target:.8g}\n\n"
 
         f"<b>24H Volume:</b> "
@@ -610,8 +632,8 @@ def format_target_message(setup):
         f"<b>{setup['symbol']}</b> "
         f"{setup['interval']}\n\n"
 
-        f"<b>Target:</b> "
-        f"{setup['target']:.8g}\n"
+        f"<b>Target (-{setup['target_percent']}%):</b> "
+        f"{setup['target']:.8g}\n\n"
 
         "FVG setup completed.\n"
         "Bot is now looking for a NEW FVG."
@@ -700,13 +722,20 @@ def monitor_active_setups():
 
             c3_high = setup["c3_high"]
 
+            # ==================================================
+            # TARGET HIT
+            # ==================================================
+
             if current_price <= target:
 
                 print(
                     f"[TARGET HIT] "
                     f"{symbol} "
                     f"{interval} "
-                    f"price={current_price}"
+                    f"target="
+                    f"{target} "
+                    f"price="
+                    f"{current_price}"
                 )
 
                 send_telegram(
@@ -722,13 +751,18 @@ def monitor_active_setups():
 
                 continue
 
+            # ==================================================
+            # CANCELLED
+            # ==================================================
+
             if current_price > c3_high:
 
                 print(
                     f"[CANCELLED] "
                     f"{symbol} "
                     f"{interval} "
-                    f"price={current_price}"
+                    f"price="
+                    f"{current_price}"
                 )
 
                 send_telegram(
@@ -780,7 +814,12 @@ def scan():
         "=" * 70
     )
 
+    # First monitor existing active setups
     monitor_active_setups()
+
+    # ========================================================
+    # GET SYMBOLS
+    # ========================================================
 
     symbols = get_spot_usdt_symbols()
 
@@ -799,6 +838,10 @@ def scan():
         f"{len(symbols)}"
     )
 
+    # ========================================================
+    # GET VOLUMES
+    # ========================================================
+
     volumes = get_24h_volumes()
 
     if not volumes:
@@ -809,6 +852,10 @@ def scan():
         )
 
         return
+
+    # ========================================================
+    # VOLUME FILTER
+    # ========================================================
 
     qualified_symbols = []
 
@@ -833,6 +880,10 @@ def scan():
         f"{len(qualified_symbols)}"
     )
 
+    # ========================================================
+    # FVG SCAN
+    # ========================================================
+
     for symbol in qualified_symbols:
 
         for interval in FVG_INTERVALS:
@@ -852,11 +903,13 @@ def scan():
                     fvg["fvg_id"]
                 )
 
+                # Each timeframe is independent
                 setup_key = (
                     symbol,
                     interval
                 )
 
+                # One active FVG per timeframe
                 if setup_key in active_setups:
 
                     print(
@@ -888,10 +941,17 @@ def scan():
                 print(
                     f"[NEW FVG] "
                     f"{symbol} {interval} "
-                    f"FVG={fvg['fvg_low']:.8g}"
-                    f"-{fvg['fvg_high']:.8g} "
+                    f"FVG="
+                    f"{fvg['fvg_low']:.8g}"
+                    f"-"
+                    f"{fvg['fvg_high']:.8g} "
                     f"ratio="
-                    f"{fvg['fvg_ratio'] * 100:.2f}%"
+                    f"{fvg['fvg_ratio'] * 100:.2f}% "
+                    f"target="
+                    f"{setup['target']:.8g} "
+                    f"(-"
+                    f"{setup['target_percent']}"
+                    f"%)"
                 )
 
                 send_telegram(
@@ -927,7 +987,7 @@ def main():
     )
 
     print(
-        "15m + 1h INDEPENDENT ACTIVE FVG"
+        "5m + 15m + 30m + 1h INDEPENDENT ACTIVE FVG"
     )
 
     print(
@@ -945,14 +1005,15 @@ def main():
     )
 
     print(
-        f"Target: "
-        f"{TARGET_PERCENT}%"
+        "Targets:"
     )
 
-    print(
-        f"Intervals: "
-        f"{FVG_INTERVALS}"
-    )
+    for interval in FVG_INTERVALS:
+
+        print(
+            f"  {interval}: "
+            f"{FVG_TARGETS[interval]}%"
+        )
 
     print(
         f"Scan: "
@@ -984,7 +1045,7 @@ def main():
     )
 
     print(
-        "15m + 1h: INDEPENDENT"
+        "5m + 15m + 30m + 1h: INDEPENDENT"
     )
 
     print(
