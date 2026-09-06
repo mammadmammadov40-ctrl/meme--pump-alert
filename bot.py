@@ -18,7 +18,7 @@ MIN_QUOTE_VOLUME_24H = 20_000_000
 
 FVG_MIN_RATIO = 0.50
 
-TARGET_PERCENT = 1.7
+TARGET_PERCENT = 1.2
 
 FVG_INTERVALS = ["15m", "1h"]
 
@@ -39,26 +39,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BOT_START_MS = int(time.time() * 1000)
 
-# ------------------------------------------------------------
-# ACTIVE SETUPS
-#
-# KEY = (symbol, interval)
-#
-# This allows the same symbol to have:
-#
-# BTCUSDT 15m -> ACTIVE
-# BTCUSDT 1h  -> ACTIVE
-#
-# independently.
-# ------------------------------------------------------------
-
 active_setups = {}
 
-# Prevent the exact same FVG from alerting twice
 processed_fvgs = set()
 
-# Rolling 3-candle state
-# key = (symbol, interval)
 candle_state = {}
 
 
@@ -306,22 +290,9 @@ def detect_bearish_fvg(candles):
     c2 = candles[1]
     c3 = candles[2]
 
-    # --------------------------------------------------------
-    # ONLY C2 MUST BE BEARISH
-    #
-    # C1 can be green or red
-    # C3 can be green or red
-    # --------------------------------------------------------
-
     if not candle_is_bearish(c2):
 
         return None
-
-    # --------------------------------------------------------
-    # MAIN FVG CONDITION
-    #
-    # C1 Low > C3 High
-    # --------------------------------------------------------
 
     c1_low = candle_low(c1)
     c3_high = candle_high(c3)
@@ -330,28 +301,12 @@ def detect_bearish_fvg(candles):
 
         return None
 
-    # --------------------------------------------------------
-    # NEW CONDITION
-    #
-    # C3 MUST CLOSE BELOW C2 LOW
-    #
-    # C2 Low > C3 Close
-    #
-    # This means:
-    #
-    # C3 Close < C2 Low
-    # --------------------------------------------------------
-
     c2_low = candle_low(c2)
     c3_close = candle_close(c3)
 
     if c3_close >= c2_low:
 
         return None
-
-    # --------------------------------------------------------
-    # FVG
-    # --------------------------------------------------------
 
     fvg_low = c3_high
     fvg_high = c1_low
@@ -365,10 +320,6 @@ def detect_bearish_fvg(candles):
     if fvg_size <= 0:
 
         return None
-
-    # --------------------------------------------------------
-    # C2 BODY
-    # --------------------------------------------------------
 
     c2_open = candle_open(c2)
     c2_close = candle_close(c2)
@@ -393,10 +344,6 @@ def detect_bearish_fvg(candles):
 
         return None
 
-    # --------------------------------------------------------
-    # FVG MUST BE COMPLETELY INSIDE C2 BODY
-    # --------------------------------------------------------
-
     if fvg_low < c2_body_low:
 
         return None
@@ -404,10 +351,6 @@ def detect_bearish_fvg(candles):
     if fvg_high > c2_body_high:
 
         return None
-
-    # --------------------------------------------------------
-    # FVG >= 50% OF C2 BODY
-    # --------------------------------------------------------
 
     fvg_ratio = (
         fvg_size
@@ -418,10 +361,6 @@ def detect_bearish_fvg(candles):
     if fvg_ratio < FVG_MIN_RATIO:
 
         return None
-
-    # --------------------------------------------------------
-    # RETURN VALID FVG
-    # --------------------------------------------------------
 
     return {
 
@@ -487,15 +426,6 @@ def update_realtime_fvg(
 
     state = candle_state.get(key)
 
-    # --------------------------------------------------------
-    # FIRST TIME:
-    #
-    # Load current 3 closed candles,
-    # but DO NOT scan old FVG.
-    #
-    # This makes the bot forget old FVGs.
-    # --------------------------------------------------------
-
     if state is None:
 
         candle_state[key] = {
@@ -516,10 +446,6 @@ def update_realtime_fvg(
 
         return None
 
-    # --------------------------------------------------------
-    # NO NEW CANDLE
-    # --------------------------------------------------------
-
     last_time = int(
         state[
             "last_closed_open_time"
@@ -529,21 +455,6 @@ def update_realtime_fvg(
     if latest_open_time <= last_time:
 
         return None
-
-    # --------------------------------------------------------
-    # NEW CANDLE CLOSED
-    #
-    # Oldest candle is forgotten.
-    #
-    # Example:
-    #
-    # 1 2 3
-    #      ↓
-    # 2 3 4
-    #      ↓
-    # 3 4 5
-    #
-    # --------------------------------------------------------
 
     old_window = state["window"]
 
@@ -565,10 +476,6 @@ def update_realtime_fvg(
         f"C3 closed"
     )
 
-    # --------------------------------------------------------
-    # CHECK FVG
-    # --------------------------------------------------------
-
     fvg = detect_bearish_fvg(
         new_window
     )
@@ -576,10 +483,6 @@ def update_realtime_fvg(
     if not fvg:
 
         return None
-
-    # --------------------------------------------------------
-    # UNIQUE FVG ID
-    # --------------------------------------------------------
 
     fvg_id = (
         symbol,
@@ -779,19 +682,6 @@ def monitor_active_setups():
 
         return
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Each symbol + timeframe is monitored independently.
-    #
-    # Example:
-    #
-    # ("BTCUSDT", "15m")
-    # ("BTCUSDT", "1h")
-    #
-    # can both be active at the same time.
-    # --------------------------------------------------------
-
     for (symbol, interval), setup in list(
         active_setups.items()
     ):
@@ -810,10 +700,6 @@ def monitor_active_setups():
 
             c3_high = setup["c3_high"]
 
-            # ------------------------------------------------
-            # TARGET HIT
-            # ------------------------------------------------
-
             if current_price <= target:
 
                 print(
@@ -829,24 +715,12 @@ def monitor_active_setups():
                     )
                 )
 
-                # ------------------------------------------------
-                # ONLY THIS TIMEFRAME IS REMOVED
-                #
-                # If 1h is also active, it stays active.
-                # ------------------------------------------------
-
                 active_setups.pop(
                     (symbol, interval),
                     None
                 )
 
                 continue
-
-            # ------------------------------------------------
-            # CANCELLED
-            #
-            # Price goes ABOVE C3 HIGH
-            # ------------------------------------------------
 
             if current_price > c3_high:
 
@@ -863,12 +737,6 @@ def monitor_active_setups():
                         current_price
                     )
                 )
-
-                # ------------------------------------------------
-                # ONLY THIS TIMEFRAME IS REMOVED
-                #
-                # If 1h is also active, it stays active.
-                # ------------------------------------------------
 
                 active_setups.pop(
                     (symbol, interval),
@@ -912,15 +780,7 @@ def scan():
         "=" * 70
     )
 
-    # --------------------------------------------------------
-    # First monitor existing setups
-    # --------------------------------------------------------
-
     monitor_active_setups()
-
-    # --------------------------------------------------------
-    # Get symbols
-    # --------------------------------------------------------
 
     symbols = get_spot_usdt_symbols()
 
@@ -939,10 +799,6 @@ def scan():
         f"{len(symbols)}"
     )
 
-    # --------------------------------------------------------
-    # 24H volumes
-    # --------------------------------------------------------
-
     volumes = get_24h_volumes()
 
     if not volumes:
@@ -953,10 +809,6 @@ def scan():
         )
 
         return
-
-    # --------------------------------------------------------
-    # Volume filter
-    # --------------------------------------------------------
 
     qualified_symbols = []
 
@@ -981,26 +833,6 @@ def scan():
         f"{len(qualified_symbols)}"
     )
 
-    # --------------------------------------------------------
-    # FVG SCANNING
-    #
-    # IMPORTANT:
-    #
-    # 15m and 1h are now INDEPENDENT.
-    #
-    # We DO NOT break after a 15m FVG.
-    #
-    # Therefore:
-    #
-    # 15m FVG -> can activate 15m
-    #
-    # AND
-    #
-    # 1h FVG -> can activate 1h
-    #
-    # on the SAME symbol and SAME scan.
-    # --------------------------------------------------------
-
     for symbol in qualified_symbols:
 
         for interval in FVG_INTERVALS:
@@ -1016,33 +848,14 @@ def scan():
 
                     continue
 
-                # ------------------------------------------------
-                # Mark this exact FVG as processed
-                # ------------------------------------------------
-
                 processed_fvgs.add(
                     fvg["fvg_id"]
                 )
-
-                # ------------------------------------------------
-                # ACTIVE KEY
-                #
-                # Symbol + timeframe are independent.
-                # ------------------------------------------------
 
                 setup_key = (
                     symbol,
                     interval
                 )
-
-                # ------------------------------------------------
-                # If THIS timeframe already has an active FVG,
-                # ignore only this new FVG.
-                #
-                # IMPORTANT:
-                # 15m active does NOT block 1h.
-                # 1h active does NOT block 15m.
-                # ------------------------------------------------
 
                 if setup_key in active_setups:
 
@@ -1056,10 +869,6 @@ def scan():
 
                     continue
 
-                # ------------------------------------------------
-                # Create setup
-                # ------------------------------------------------
-
                 volume = volumes.get(
                     symbol,
                     0
@@ -1071,10 +880,6 @@ def scan():
                     fvg,
                     volume
                 )
-
-                # ------------------------------------------------
-                # Activate
-                # ------------------------------------------------
 
                 active_setups[
                     setup_key
@@ -1089,24 +894,11 @@ def scan():
                     f"{fvg['fvg_ratio'] * 100:.2f}%"
                 )
 
-                # ------------------------------------------------
-                # Telegram
-                # ------------------------------------------------
-
                 send_telegram(
                     format_signal(
                         setup
                     )
                 )
-
-                # ------------------------------------------------
-                # IMPORTANT:
-                #
-                # NO BREAK HERE.
-                #
-                # We must continue to 1h even if 15m
-                # generated a signal.
-                # ------------------------------------------------
 
             except Exception as e:
 
