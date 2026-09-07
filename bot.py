@@ -31,10 +31,10 @@ FVG_MIN_RATIO = 0.50
 
 # Each timeframe has its own target
 FVG_TARGETS = {
-    "5m": 0.7,
-    "15m": 1.2,
-    "30m": 1.7,
-    "1h": 2.4,
+    "5m": 1.2,
+    "15m": 1.7,
+    "30m": 2.2,
+    "1h": 2.7,
 }
 
 
