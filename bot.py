@@ -7,8 +7,19 @@ from datetime import datetime, timezone
 # ============================================================
 # BINANCE BEARISH FVG LIVE ALERT BOT
 # REAL-TIME ROLLING 3-CANDLE VERSION
+#
 # 5m + 15m + 30m + 1h INDEPENDENT ACTIVE FVG
-# EACH TIMEFRAME HAS ITS OWN TARGET
+#
+# VOLUME FILTER:
+# 24H TOTAL VOLUME >= 20M USDT
+# AND
+# 24H BUY VOLUME > 24H SELL VOLUME
+#
+# TARGETS:
+# 5m  = 1.2%
+# 15m = 1.7%
+# 30m = 2.2%
+# 1h  = 2.7%
 #
 # TELEGRAM:
 # ONLY TARGET HIT
@@ -223,7 +234,7 @@ def get_spot_usdt_symbols():
 
 
 # ============================================================
-# 24H VOLUME
+# 24H TOTAL VOLUME
 # ============================================================
 
 def get_24h_volumes():
@@ -274,6 +285,203 @@ def get_24h_volumes():
 
 
     return volumes
+
+
+# ============================================================
+# 24H BUY / SELL VOLUME
+#
+# Binance 1h kline:
+#
+# [7]  = Quote asset volume
+# [10] = Taker buy quote asset volume
+#
+# BUY  = taker buy quote volume
+# SELL = total quote volume - buy quote volume
+#
+# We use the latest 24 completed 1h candles.
+# ============================================================
+
+def get_24h_buy_sell_volume(symbol):
+
+    data = binance_get(
+
+        "/api/v3/klines",
+
+        {
+            "symbol":
+                symbol,
+
+            "interval":
+                "1h",
+
+            "limit":
+                25,
+        }
+
+    )
+
+
+    if not data:
+
+        return None
+
+
+    now_ms = int(
+        time.time() * 1000
+    )
+
+
+    closed_candles = []
+
+
+    for candle in data:
+
+        try:
+
+            close_time = int(
+                candle[6]
+            )
+
+
+            if close_time < now_ms:
+
+                closed_candles.append(
+                    candle
+                )
+
+        except Exception:
+
+            continue
+
+
+    if len(closed_candles) < 24:
+
+        return None
+
+
+    # Latest 24 completed 1h candles
+    candles_24h = (
+        closed_candles[-24:]
+    )
+
+
+    total_volume = 0.0
+
+    buy_volume = 0.0
+
+
+    for candle in candles_24h:
+
+        try:
+
+            total_quote_volume = float(
+                candle[7]
+            )
+
+            taker_buy_quote_volume = float(
+                candle[10]
+            )
+
+
+            total_volume += (
+                total_quote_volume
+            )
+
+            buy_volume += (
+                taker_buy_quote_volume
+            )
+
+
+        except Exception:
+
+            continue
+
+
+    if total_volume <= 0:
+
+        return None
+
+
+    sell_volume = (
+        total_volume
+        -
+        buy_volume
+    )
+
+
+    if sell_volume < 0:
+
+        sell_volume = 0.0
+
+
+    buy_percent = (
+        buy_volume
+        /
+        total_volume
+        *
+        100
+    )
+
+
+    sell_percent = (
+        sell_volume
+        /
+        total_volume
+        *
+        100
+    )
+
+
+    return {
+
+        "total_volume":
+            total_volume,
+
+        "buy_volume":
+            buy_volume,
+
+        "sell_volume":
+            sell_volume,
+
+        "buy_percent":
+            buy_percent,
+
+        "sell_percent":
+            sell_percent,
+
+    }
+
+
+# ============================================================
+# VOLUME FORMAT
+# ============================================================
+
+def format_volume(value):
+
+    if value >= 1_000_000_000:
+
+        return (
+            f"{value / 1_000_000_000:.2f}B"
+        )
+
+
+    if value >= 1_000_000:
+
+        return (
+            f"{value / 1_000_000:.2f}M"
+        )
+
+
+    if value >= 1_000:
+
+        return (
+            f"{value / 1_000:.2f}K"
+        )
+
+
+    return (
+        f"{value:.2f}"
+    )
 
 
 # ============================================================
@@ -721,7 +929,7 @@ def create_setup(
     symbol,
     interval,
     fvg,
-    volume_24h
+    volume_data
 ):
 
     # Target specifically for timeframe
@@ -787,7 +995,19 @@ def create_setup(
             target_percent,
 
         "volume_24h":
-            volume_24h,
+            volume_data["total_volume"],
+
+        "buy_volume":
+            volume_data["buy_volume"],
+
+        "sell_volume":
+            volume_data["sell_volume"],
+
+        "buy_percent":
+            volume_data["buy_percent"],
+
+        "sell_percent":
+            volume_data["sell_percent"],
 
         "created_at":
             int(
@@ -824,6 +1044,17 @@ def format_target_message(setup):
         f"{setup['c3_high']:.8g}"
         f" → "
         f"{setup['target']:.8g}\n\n"
+
+        f"<b>24H Volume:</b> "
+        f"{format_volume(setup['volume_24h'])}\n"
+
+        f"<b>Buy:</b> "
+        f"{format_volume(setup['buy_volume'])}"
+        f" ({setup['buy_percent']:.2f}%)\n"
+
+        f"<b>Sell:</b> "
+        f"{format_volume(setup['sell_volume'])}"
+        f" ({setup['sell_percent']:.2f}%)\n\n"
 
         "FVG setup completed.\n"
         "Bot is now looking for a NEW FVG."
@@ -1076,7 +1307,7 @@ def scan():
 
 
     # ========================================================
-    # GET VOLUMES
+    # GET 24H TOTAL VOLUMES
     # ========================================================
 
     volumes = (
@@ -1097,10 +1328,10 @@ def scan():
 
 
     # ========================================================
-    # VOLUME FILTER
+    # TOTAL VOLUME FILTER
     # ========================================================
 
-    qualified_symbols = []
+    volume_qualified_symbols = []
 
 
     for symbol in symbols:
@@ -1121,7 +1352,7 @@ def scan():
 
         ):
 
-            qualified_symbols.append(
+            volume_qualified_symbols.append(
                 symbol
             )
 
@@ -1129,7 +1360,155 @@ def scan():
     print(
 
         f"[INFO] "
-        f"Volume qualified: "
+        f"20M+ total volume: "
+        f"{len(volume_qualified_symbols)}"
+
+    )
+
+
+    # ========================================================
+    # BUY / SELL FILTER
+    # ========================================================
+
+    qualified_symbols = []
+
+
+    for symbol in volume_qualified_symbols:
+
+        try:
+
+            volume_data = (
+                get_24h_buy_sell_volume(
+                    symbol
+                )
+            )
+
+
+            if volume_data is None:
+
+                print(
+
+                    f"[VOLUME ERROR] "
+                    f"{symbol} "
+                    f"Could not calculate "
+                    f"buy/sell volume"
+
+                )
+
+                continue
+
+
+            total_volume = (
+                volume_data[
+                    "total_volume"
+                ]
+            )
+
+
+            buy_volume = (
+                volume_data[
+                    "buy_volume"
+                ]
+            )
+
+
+            sell_volume = (
+                volume_data[
+                    "sell_volume"
+                ]
+            )
+
+
+            buy_percent = (
+                volume_data[
+                    "buy_percent"
+                ]
+            )
+
+
+            sell_percent = (
+                volume_data[
+                    "sell_percent"
+                ]
+            )
+
+
+            # =================================================
+            # BOTH CONDITIONS
+            # =================================================
+
+            if (
+
+                total_volume >=
+                MIN_QUOTE_VOLUME_24H
+
+                and
+
+                buy_volume >
+                sell_volume
+
+            ):
+
+                qualified_symbols.append(
+
+                    (
+                        symbol,
+                        volume_data
+                    )
+
+                )
+
+
+                print(
+
+                    f"[QUALIFIED] "
+                    f"{symbol} | "
+                    f"24H="
+                    f"{format_volume(total_volume)} | "
+                    f"BUY="
+                    f"{format_volume(buy_volume)} "
+                    f"({buy_percent:.2f}%) | "
+                    f"SELL="
+                    f"{format_volume(sell_volume)} "
+                    f"({sell_percent:.2f}%) | "
+                    f"BUY > SELL"
+
+                )
+
+
+            else:
+
+                print(
+
+                    f"[REJECTED] "
+                    f"{symbol} | "
+                    f"24H="
+                    f"{format_volume(total_volume)} | "
+                    f"BUY="
+                    f"{format_volume(buy_volume)} "
+                    f"({buy_percent:.2f}%) | "
+                    f"SELL="
+                    f"{format_volume(sell_volume)} "
+                    f"({sell_percent:.2f}%)"
+
+                )
+
+
+        except Exception as e:
+
+            print(
+
+                f"[BUY/SELL ERROR] "
+                f"{symbol}: "
+                f"{e}"
+
+            )
+
+
+    print(
+
+        f"[INFO] "
+        f"Final qualified: "
         f"{len(qualified_symbols)}"
 
     )
@@ -1139,7 +1518,10 @@ def scan():
     # FVG SCAN
     # ========================================================
 
-    for symbol in qualified_symbols:
+    for (
+        symbol,
+        volume_data
+    ) in qualified_symbols:
 
         for interval in FVG_INTERVALS:
 
@@ -1195,12 +1577,6 @@ def scan():
                     continue
 
 
-                volume = volumes.get(
-                    symbol,
-                    0
-                )
-
-
                 setup = create_setup(
 
                     symbol,
@@ -1209,7 +1585,7 @@ def scan():
 
                     fvg,
 
-                    volume
+                    volume_data
 
                 )
 
@@ -1235,7 +1611,11 @@ def scan():
                     f"{setup['target']:.8g} "
                     f"(-"
                     f"{setup['target_percent']}"
-                    f"%)"
+                    f"%) | "
+                    f"BUY="
+                    f"{format_volume(volume_data['buy_volume'])} "
+                    f"SELL="
+                    f"{format_volume(volume_data['sell_volume'])}"
 
                 )
 
@@ -1304,6 +1684,15 @@ def main():
 
         f"Min 24H Volume: "
         f"${MIN_QUOTE_VOLUME_24H:,.0f}"
+
+    )
+
+
+    print(
+
+        "Volume Filter: "
+        "24H Total >= 20M USDT "
+        "AND BUY > SELL"
 
     )
 
@@ -1386,6 +1775,11 @@ def main():
 
     print(
         "Telegram shows: C3 High -> Target"
+    )
+
+
+    print(
+        "Volume: TOTAL + BUY + SELL"
     )
 
 
