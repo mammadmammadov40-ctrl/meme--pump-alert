@@ -15,6 +15,14 @@ from datetime import datetime, timezone
 # AND
 # 24H BUY VOLUME > 24H SELL VOLUME
 #
+# FVG FILTERS:
+#
+# 1) C1 LOW -> C3 HIGH FVG SIZE >= 0.5%
+#
+# 2) FVG SIZE / C2 BODY SIZE >= 50%
+#
+# BOTH CONDITIONS MUST BE TRUE
+#
 # TARGETS:
 # 5m  = 1.2%
 # 15m = 1.7%
@@ -36,6 +44,18 @@ BINANCE_BASE_URL = "https://api.binance.com"
 # ============================================================
 
 MIN_QUOTE_VOLUME_24H = 20_000_000
+
+
+# ------------------------------------------------------------
+# FVG MINIMUM SIZE AS % OF C1 LOW
+# ------------------------------------------------------------
+
+FVG_MIN_PERCENT = 0.5
+
+
+# ------------------------------------------------------------
+# FVG MUST ALSO BE AT LEAST 50% OF C2 BODY
+# ------------------------------------------------------------
 
 FVG_MIN_RATIO = 0.50
 
@@ -648,6 +668,16 @@ def detect_bearish_fvg(candles):
         return None
 
 
+    # --------------------------------------------------------
+    # FVG AREA
+    #
+    # FVG is between:
+    #
+    # C3 HIGH
+    # and
+    # C1 LOW
+    # --------------------------------------------------------
+
     fvg_low = c3_high
 
     fvg_high = c1_low
@@ -665,9 +695,46 @@ def detect_bearish_fvg(candles):
         return None
 
 
-    # --------------------------------------------------------
+    # ========================================================
+    # CONDITION 1
+    #
+    # FVG SIZE MUST BE >= 0.5%
+    #
+    # Formula:
+    #
+    # (C1 LOW - C3 HIGH) / C1 LOW * 100
+    #
+    # Example:
+    #
+    # C1 LOW  = 0.201
+    # C3 HIGH = 0.200
+    #
+    # FVG = 0.001
+    #
+    # 0.001 / 0.201 * 100
+    # = 0.4975%
+    #
+    # Therefore:
+    # 0.4975% < 0.5% -> INVALID
+    # ========================================================
+
+    fvg_percent = (
+        fvg_size
+        /
+        c1_low
+        *
+        100
+    )
+
+
+    if fvg_percent < FVG_MIN_PERCENT:
+
+        return None
+
+
+    # ========================================================
     # C2 BODY
-    # --------------------------------------------------------
+    # ========================================================
 
     c2_open = candle_open(c2)
 
@@ -698,9 +765,11 @@ def detect_bearish_fvg(candles):
         return None
 
 
-    # --------------------------------------------------------
+    # ========================================================
+    # CONDITION 2
+    #
     # FVG MUST BE INSIDE C2 BODY
-    # --------------------------------------------------------
+    # ========================================================
 
     if fvg_low < c2_body_low:
 
@@ -712,9 +781,11 @@ def detect_bearish_fvg(candles):
         return None
 
 
-    # --------------------------------------------------------
-    # FVG RATIO
-    # --------------------------------------------------------
+    # ========================================================
+    # FVG / C2 BODY RATIO
+    #
+    # Minimum = 50%
+    # ========================================================
 
     fvg_ratio = (
         fvg_size
@@ -723,11 +794,14 @@ def detect_bearish_fvg(candles):
     )
 
 
-    # Minimum FVG ratio = 50%
     if fvg_ratio < FVG_MIN_RATIO:
 
         return None
 
+
+    # ========================================================
+    # BOTH CONDITIONS PASSED
+    # ========================================================
 
     return {
 
@@ -740,17 +814,32 @@ def detect_bearish_fvg(candles):
         "fvg_size":
             fvg_size,
 
+        "fvg_percent":
+            fvg_percent,
+
         "fvg_ratio":
             fvg_ratio,
+
+        "c1_low":
+            c1_low,
+
+        "c2_open":
+            c2_open,
+
+        "c2_close":
+            c2_close,
+
+        "c2_body_size":
+            c2_body_size,
+
+        "c3_open_time":
+            int(c3[0]),
 
         "c1_open_time":
             int(c1[0]),
 
         "c2_open_time":
             int(c2[0]),
-
-        "c3_open_time":
-            int(c3[0]),
 
         "c3_close_time":
             int(c3[6]),
@@ -979,8 +1068,20 @@ def create_setup(
         "fvg_high":
             fvg["fvg_high"],
 
+        "fvg_size":
+            fvg["fvg_size"],
+
+        "fvg_percent":
+            fvg["fvg_percent"],
+
         "fvg_ratio":
             fvg["fvg_ratio"],
+
+        "c1_low":
+            fvg["c1_low"],
+
+        "c2_body_size":
+            fvg["c2_body_size"],
 
         "c3_high":
             c3_high,
@@ -1044,6 +1145,12 @@ def format_target_message(setup):
         f"{setup['c3_high']:.8g}"
         f" → "
         f"{setup['target']:.8g}\n\n"
+
+        f"<b>FVG Size:</b> "
+        f"{setup['fvg_percent']:.2f}%\n"
+
+        f"<b>FVG / C2 Body:</b> "
+        f"{setup['fvg_ratio'] * 100:.2f}%\n\n"
 
         f"<b>24H Volume:</b> "
         f"{format_volume(setup['volume_24h'])}\n"
@@ -1602,9 +1709,14 @@ def scan():
                     f"FVG="
                     f"{fvg['fvg_low']:.8g}"
                     f"-"
-                    f"{fvg['fvg_high']:.8g} "
-                    f"ratio="
-                    f"{fvg['fvg_ratio'] * 100:.2f}% "
+                    f"{fvg['fvg_high']:.8g} | "
+
+                    f"FVG Size="
+                    f"{fvg['fvg_percent']:.2f}% | "
+
+                    f"FVG/C2 Body="
+                    f"{fvg['fvg_ratio'] * 100:.2f}% | "
+
                     f"C3 High="
                     f"{setup['c3_high']:.8g} "
                     f"target="
@@ -1612,6 +1724,7 @@ def scan():
                     f"(-"
                     f"{setup['target_percent']}"
                     f"%) | "
+
                     f"BUY="
                     f"{format_volume(volume_data['buy_volume'])} "
                     f"SELL="
@@ -1699,9 +1812,38 @@ def main():
 
     print(
 
-        f"FVG Minimum Ratio: "
+        f"FVG Minimum Size: "
+        f"{FVG_MIN_PERCENT:.2f}% "
+        f"(C1 Low -> C3 High)"
+
+    )
+
+
+    print(
+
+        f"FVG Minimum C2 Body Ratio: "
         f"{FVG_MIN_RATIO * 100:.0f}%"
 
+    )
+
+
+    print(
+        "FVG Requirements:"
+    )
+
+
+    print(
+        "  1. C1 Low -> C3 High >= 0.5%"
+    )
+
+
+    print(
+        "  2. FVG / C2 Body >= 50%"
+    )
+
+
+    print(
+        "  BOTH CONDITIONS REQUIRED"
     )
 
 
