@@ -5,23 +5,27 @@ from datetime import datetime, timezone
 
 
 # ============================================================
-# BINANCE BEARISH FVG LIVE ALERT BOT
-# REAL-TIME ROLLING 3-CANDLE VERSION
+# BINANCE DUAL STRATEGY LIVE ALERT BOT
 #
-# 5m + 15m + 30m + 1h INDEPENDENT ACTIVE FVG
+# ============================================================
 #
-# VOLUME FILTER:
+# 🔴 STRATEGY 1 — ORIGINAL BEARISH FVG
+#
+# 5m + 15m + 30m + 1h
+# Independent active FVG
+#
 # 24H TOTAL VOLUME >= 20M USDT
 # AND
 # 24H BUY VOLUME > 24H SELL VOLUME
 #
-# FVG FILTERS:
+# ORIGINAL BEARISH FVG CONDITIONS:
 #
-# 1) C1 LOW -> C3 HIGH FVG SIZE >= 0.5%
-#
-# 2) FVG SIZE / C2 BODY SIZE >= 50%
-#
-# BOTH CONDITIONS MUST BE TRUE
+# 1. C2 MUST BE BEARISH
+# 2. C1 LOW > C3 HIGH
+# 3. C3 CLOSE < C2 LOW
+# 4. FVG >= 0.5%
+# 5. FVG MUST BE INSIDE C2 BODY
+# 6. FVG / C2 BODY >= 50%
 #
 # TARGETS:
 # 5m  = 1.2%
@@ -31,8 +35,40 @@ from datetime import datetime, timezone
 #
 # TELEGRAM:
 # ONLY TARGET HIT
-# NO FVG CREATION MESSAGE
-# NO CANCEL MESSAGE
+#
+#
+# ============================================================
+#
+# 🟢 STRATEGY 2 — NEW BULLISH TREND + BULLISH FVG
+#
+# 15m + 30m + 1h
+# Independent
+#
+# CONDITIONS:
+#
+# 1. 24H TOTAL VOLUME >= 20M USDT
+# 2. 24H BUY VOLUME > SELL VOLUME
+# 3. EMA20 > EMA50
+# 4. EMA20 RISING
+# 5. CLOSE > EMA20
+# 6. BULLISH STRUCTURE BREAK
+# 7. STRONG BULLISH DISPLACEMENT
+# 8. BODY / RANGE >= 60%
+# 9. RANGE >= 1.3x average previous 20 candles
+# 10. VOLUME >= 1.5x average previous 20 candles
+# 11. BULLISH FVG: C1 HIGH < C3 LOW
+# 12. FVG >= 0.5%
+# 13. NO C2 BODY CONDITION
+# 14. NO 50% FVG/BODY CONDITION
+# 15. C3 MUST BE CLOSED
+#
+# STRUCTURE:
+# Previous 10 CLOSED candles' highest HIGH
+# must be broken by C3 CLOSE.
+#
+# TELEGRAM:
+# Bullish signal is sent when ALL conditions pass.
+#
 # ============================================================
 
 
@@ -40,27 +76,23 @@ BINANCE_BASE_URL = "https://api.binance.com"
 
 
 # ============================================================
-# SETTINGS
+# GENERAL SETTINGS
 # ============================================================
 
 MIN_QUOTE_VOLUME_24H = 20_000_000
 
+SCAN_SECONDS = 60
 
-# ------------------------------------------------------------
-# FVG MINIMUM SIZE AS % OF C1 LOW
-# ------------------------------------------------------------
+
+# ============================================================
+# 🔴 ORIGINAL BEARISH FVG SETTINGS
+# ============================================================
 
 FVG_MIN_PERCENT = 0.5
-
-
-# ------------------------------------------------------------
-# FVG MUST ALSO BE AT LEAST 50% OF C2 BODY
-# ------------------------------------------------------------
 
 FVG_MIN_RATIO = 0.50
 
 
-# Each timeframe has its own target
 FVG_TARGETS = {
     "5m": 1.2,
     "15m": 1.7,
@@ -74,7 +106,47 @@ FVG_INTERVALS = list(
 )
 
 
-SCAN_SECONDS = 60
+# ============================================================
+# 🟢 NEW BULLISH STRATEGY SETTINGS
+# ============================================================
+
+BULLISH_INTERVALS = [
+    "15m",
+    "30m",
+    "1h",
+]
+
+
+BULLISH_EMA_FAST = 20
+
+BULLISH_EMA_SLOW = 50
+
+
+BULLISH_FVG_MIN_PERCENT = 0.5
+
+
+# Structure break:
+# Highest HIGH of previous 10 CLOSED candles
+STRUCTURE_LOOKBACK = 10
+
+
+# Strong displacement:
+# Body must be at least 60% of candle range
+DISPLACEMENT_MIN_BODY_RATIO = 0.60
+
+
+# Candle range must be at least 1.3x
+# previous 20 candle average range
+DISPLACEMENT_RANGE_MULTIPLIER = 1.30
+
+
+# Volume must be at least 1.5x
+# previous 20 candle average volume
+DISPLACEMENT_VOLUME_MULTIPLIER = 1.50
+
+
+# Number of candles used for averages
+AVERAGE_LOOKBACK = 20
 
 
 # ============================================================
@@ -85,13 +157,14 @@ TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN"
 )
 
+
 TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID"
 )
 
 
 # ============================================================
-# BOT STATE
+# 🔴 ORIGINAL BEARISH BOT STATE
 # ============================================================
 
 BOT_START_MS = int(
@@ -101,9 +174,18 @@ BOT_START_MS = int(
 
 active_setups = {}
 
+
 processed_fvgs = set()
 
+
 candle_state = {}
+
+
+# ============================================================
+# 🟢 NEW BULLISH BOT STATE
+# ============================================================
+
+processed_bullish_signals = set()
 
 
 # ============================================================
@@ -121,6 +203,7 @@ def binance_get(
         endpoint
     )
 
+
     try:
 
         response = requests.get(
@@ -129,9 +212,12 @@ def binance_get(
             timeout=20
         )
 
+
         response.raise_for_status()
 
+
         return response.json()
+
 
     except Exception as e:
 
@@ -139,6 +225,7 @@ def binance_get(
             f"[BINANCE ERROR] "
             f"{endpoint}: {e}"
         )
+
 
         return None
 
@@ -191,15 +278,19 @@ def send_telegram(message):
             timeout=20
         )
 
+
         response.raise_for_status()
 
+
         return True
+
 
     except Exception as e:
 
         print(
             f"[TELEGRAM ERROR] {e}"
         )
+
 
         return False
 
@@ -309,16 +400,6 @@ def get_24h_volumes():
 
 # ============================================================
 # 24H BUY / SELL VOLUME
-#
-# Binance 1h kline:
-#
-# [7]  = Quote asset volume
-# [10] = Taker buy quote asset volume
-#
-# BUY  = taker buy quote volume
-# SELL = total quote volume - buy quote volume
-#
-# We use the latest 24 completed 1h candles.
 # ============================================================
 
 def get_24h_buy_sell_volume(symbol):
@@ -369,6 +450,7 @@ def get_24h_buy_sell_volume(symbol):
                     candle
                 )
 
+
         except Exception:
 
             continue
@@ -379,7 +461,6 @@ def get_24h_buy_sell_volume(symbol):
         return None
 
 
-    # Latest 24 completed 1h candles
     candles_24h = (
         closed_candles[-24:]
     )
@@ -398,6 +479,7 @@ def get_24h_buy_sell_volume(symbol):
                 candle[7]
             )
 
+
             taker_buy_quote_volume = float(
                 candle[10]
             )
@@ -406,6 +488,7 @@ def get_24h_buy_sell_volume(symbol):
             total_volume += (
                 total_quote_volume
             )
+
 
             buy_volume += (
                 taker_buy_quote_volume
@@ -505,7 +588,14 @@ def format_volume(value):
 
 
 # ============================================================
-# KLINES
+# ============================================================
+# 🔴 ORIGINAL BEARISH FVG STRATEGY
+# ============================================================
+# ============================================================
+
+
+# ============================================================
+# GET LATEST 3 CLOSED CANDLES
 # ============================================================
 
 def get_latest_closed_candles(
@@ -614,7 +704,7 @@ def candle_is_bearish(candle):
 
 
 # ============================================================
-# BEARISH FVG DETECTION
+# ORIGINAL BEARISH FVG DETECTION
 # ============================================================
 
 def detect_bearish_fvg(candles):
@@ -646,7 +736,7 @@ def detect_bearish_fvg(candles):
 
 
     # --------------------------------------------------------
-    # BEARISH FVG CONDITION
+    # BEARISH FVG
     # --------------------------------------------------------
 
     if c1_low <= c3_high:
@@ -660,7 +750,7 @@ def detect_bearish_fvg(candles):
 
 
     # --------------------------------------------------------
-    # C3 CLOSE MUST BE BELOW C2 LOW
+    # C3 CLOSE BELOW C2 LOW
     # --------------------------------------------------------
 
     if c3_close >= c2_low:
@@ -669,13 +759,7 @@ def detect_bearish_fvg(candles):
 
 
     # --------------------------------------------------------
-    # FVG AREA
-    #
-    # FVG is between:
-    #
-    # C3 HIGH
-    # and
-    # C1 LOW
+    # FVG
     # --------------------------------------------------------
 
     fvg_low = c3_high
@@ -695,28 +779,9 @@ def detect_bearish_fvg(candles):
         return None
 
 
-    # ========================================================
-    # CONDITION 1
-    #
-    # FVG SIZE MUST BE >= 0.5%
-    #
-    # Formula:
-    #
-    # (C1 LOW - C3 HIGH) / C1 LOW * 100
-    #
-    # Example:
-    #
-    # C1 LOW  = 0.201
-    # C3 HIGH = 0.200
-    #
-    # FVG = 0.001
-    #
-    # 0.001 / 0.201 * 100
-    # = 0.4975%
-    #
-    # Therefore:
-    # 0.4975% < 0.5% -> INVALID
-    # ========================================================
+    # --------------------------------------------------------
+    # FVG >= 0.5%
+    # --------------------------------------------------------
 
     fvg_percent = (
         fvg_size
@@ -733,7 +798,7 @@ def detect_bearish_fvg(candles):
 
 
     # ========================================================
-    # C2 BODY
+    # ORIGINAL C2 BODY CONDITION
     # ========================================================
 
     c2_open = candle_open(c2)
@@ -765,11 +830,10 @@ def detect_bearish_fvg(candles):
         return None
 
 
-    # ========================================================
-    # CONDITION 2
-    #
+    # --------------------------------------------------------
+    # ORIGINAL:
     # FVG MUST BE INSIDE C2 BODY
-    # ========================================================
+    # --------------------------------------------------------
 
     if fvg_low < c2_body_low:
 
@@ -781,11 +845,10 @@ def detect_bearish_fvg(candles):
         return None
 
 
-    # ========================================================
-    # FVG / C2 BODY RATIO
-    #
-    # Minimum = 50%
-    # ========================================================
+    # --------------------------------------------------------
+    # ORIGINAL:
+    # FVG / C2 BODY >= 50%
+    # --------------------------------------------------------
 
     fvg_ratio = (
         fvg_size
@@ -798,10 +861,6 @@ def detect_bearish_fvg(candles):
 
         return None
 
-
-    # ========================================================
-    # BOTH CONDITIONS PASSED
-    # ========================================================
 
     return {
 
@@ -854,7 +913,7 @@ def detect_bearish_fvg(candles):
 
 
 # ============================================================
-# REAL-TIME ROLLING FVG
+# ORIGINAL REAL-TIME ROLLING FVG
 # ============================================================
 
 def update_realtime_fvg(
@@ -912,9 +971,8 @@ def update_realtime_fvg(
 
 
         print(
-            f"[INIT] "
-            f"{symbol} {interval} "
-            f"rolling window initialized"
+            f"[BEARISH INIT] "
+            f"{symbol} {interval}"
         )
 
 
@@ -929,7 +987,7 @@ def update_realtime_fvg(
 
 
     # --------------------------------------------------------
-    # NO NEW CLOSED CANDLE
+    # NO NEW CANDLE
     # --------------------------------------------------------
 
     if latest_open_time <= last_time:
@@ -941,10 +999,6 @@ def update_realtime_fvg(
         "window"
     ]
 
-
-    # --------------------------------------------------------
-    # ROLLING 3-CANDLE WINDOW
-    # --------------------------------------------------------
 
     new_window = [
 
@@ -968,9 +1022,8 @@ def update_realtime_fvg(
 
 
     print(
-        f"[NEW CANDLE] "
-        f"{symbol} {interval} "
-        f"C3 closed"
+        f"[BEARISH NEW CANDLE] "
+        f"{symbol} {interval}"
     )
 
 
@@ -1011,7 +1064,7 @@ def update_realtime_fvg(
 
 
 # ============================================================
-# CREATE ACTIVE SETUP
+# ORIGINAL CREATE ACTIVE SETUP
 # ============================================================
 
 def create_setup(
@@ -1021,7 +1074,6 @@ def create_setup(
     volume_data
 ):
 
-    # Target specifically for timeframe
     target_percent = (
         FVG_TARGETS[
             interval
@@ -1029,13 +1081,11 @@ def create_setup(
     )
 
 
-    # C3 HIGH IS THE STARTING PRICE
     c3_high = fvg[
         "c3_high"
     ]
 
 
-    # Target is calculated downward
     target = (
 
         c3_high
@@ -1122,14 +1172,14 @@ def create_setup(
 
 
 # ============================================================
-# TARGET MESSAGE
+# ORIGINAL TARGET MESSAGE
 # ============================================================
 
 def format_target_message(setup):
 
     return (
 
-        "🟢 <b>TARGET HIT</b>\n\n"
+        "🔴 <b>BEARISH FVG TARGET HIT</b>\n\n"
 
         f"<b>{setup['symbol']}</b> "
         f"{setup['interval']}\n\n"
@@ -1163,8 +1213,7 @@ def format_target_message(setup):
         f"{format_volume(setup['sell_volume'])}"
         f" ({setup['sell_percent']:.2f}%)\n\n"
 
-        "FVG setup completed.\n"
-        "Bot is now looking for a NEW FVG."
+        "Original Bearish FVG setup completed."
 
     )
 
@@ -1204,7 +1253,7 @@ def get_current_price(symbol):
 
 
 # ============================================================
-# MONITOR ACTIVE SETUPS
+# ORIGINAL MONITOR ACTIVE SETUPS
 # ============================================================
 
 def monitor_active_setups():
@@ -1245,30 +1294,22 @@ def monitor_active_setups():
             ]
 
 
-            # ==================================================
+            # ------------------------------------------------
             # TARGET HIT
-            # ==================================================
+            # ------------------------------------------------
 
             if current_price <= target:
 
                 print(
 
-                    f"[TARGET HIT] "
+                    f"[BEARISH TARGET HIT] "
                     f"{symbol} "
                     f"{interval} "
-                    f"C3 High="
-                    f"{c3_high} "
-                    f"Target="
-                    f"{target} "
                     f"Price="
                     f"{current_price}"
 
                 )
 
-
-                # ------------------------------------------------
-                # TELEGRAM ONLY HERE
-                # ------------------------------------------------
 
                 send_telegram(
 
@@ -1294,28 +1335,22 @@ def monitor_active_setups():
                 continue
 
 
-            # ==================================================
+            # ------------------------------------------------
             # CANCELLED
-            # ==================================================
+            # ------------------------------------------------
 
             if current_price > c3_high:
 
                 print(
 
-                    f"[CANCELLED] "
+                    f"[BEARISH CANCELLED] "
                     f"{symbol} "
                     f"{interval} "
-                    f"C3 High="
-                    f"{c3_high} "
                     f"Price="
                     f"{current_price}"
 
                 )
 
-
-                # ------------------------------------------------
-                # NO TELEGRAM ON CANCEL
-                # ------------------------------------------------
 
                 active_setups.pop(
 
@@ -1336,7 +1371,7 @@ def monitor_active_setups():
 
             print(
 
-                f"[MONITOR ERROR] "
+                f"[BEARISH MONITOR ERROR] "
                 f"{symbol} "
                 f"{interval}: "
                 f"{e}"
@@ -1345,7 +1380,949 @@ def monitor_active_setups():
 
 
 # ============================================================
-# SCAN
+# ============================================================
+# 🟢 NEW BULLISH TREND STRATEGY
+# ============================================================
+# ============================================================
+
+
+# ============================================================
+# GET CLOSED CANDLES FOR BULLISH STRATEGY
+# ============================================================
+
+def get_bullish_closed_candles(
+    symbol,
+    interval,
+    limit=80
+):
+
+    data = binance_get(
+
+        "/api/v3/klines",
+
+        {
+            "symbol":
+                symbol,
+
+            "interval":
+                interval,
+
+            "limit":
+                limit,
+        }
+
+    )
+
+
+    if not data:
+
+        return []
+
+
+    now_ms = int(
+        time.time() * 1000
+    )
+
+
+    closed = []
+
+
+    for candle in data:
+
+        try:
+
+            close_time = int(
+                candle[6]
+            )
+
+
+            if close_time < now_ms:
+
+                closed.append(
+                    candle
+                )
+
+
+        except Exception:
+
+            continue
+
+
+    return closed
+
+
+# ============================================================
+# EMA
+# ============================================================
+
+def calculate_ema(
+    values,
+    period
+):
+
+    if len(values) < period:
+
+        return None
+
+
+    ema = sum(
+        values[:period]
+    ) / period
+
+
+    multiplier = (
+        2 /
+        (period + 1)
+    )
+
+
+    for value in values[period:]:
+
+        ema = (
+
+            (
+                value
+                -
+                ema
+            )
+
+            *
+            multiplier
+
+            +
+            ema
+
+        )
+
+
+    return ema
+
+
+# ============================================================
+# BULLISH FVG DETECTION
+# ============================================================
+
+def detect_bullish_fvg(
+    candles
+):
+
+    if len(candles) < 3:
+
+        return None
+
+
+    c1 = candles[-3]
+
+    c2 = candles[-2]
+
+    c3 = candles[-1]
+
+
+    c1_high = candle_high(c1)
+
+    c3_low = candle_low(c3)
+
+
+    # --------------------------------------------------------
+    # BULLISH FVG
+    #
+    # C1 HIGH < C3 LOW
+    # --------------------------------------------------------
+
+    if c1_high >= c3_low:
+
+        return None
+
+
+    fvg_size = (
+        c3_low
+        -
+        c1_high
+    )
+
+
+    if fvg_size <= 0:
+
+        return None
+
+
+    # --------------------------------------------------------
+    # FVG >= 0.5%
+    # --------------------------------------------------------
+
+    fvg_percent = (
+
+        fvg_size
+        /
+        c1_high
+        *
+        100
+
+    )
+
+
+    if (
+        fvg_percent
+        <
+        BULLISH_FVG_MIN_PERCENT
+    ):
+
+        return None
+
+
+    return {
+
+        "c1_high":
+            c1_high,
+
+        "c2_high":
+            candle_high(c2),
+
+        "c2_low":
+            candle_low(c2),
+
+        "c3_low":
+            c3_low,
+
+        "c3_high":
+            candle_high(c3),
+
+        "c3_open":
+            candle_open(c3),
+
+        "c3_close":
+            candle_close(c3),
+
+        "fvg_size":
+            fvg_size,
+
+        "fvg_percent":
+            fvg_percent,
+
+        "c1_open_time":
+            int(c1[0]),
+
+        "c2_open_time":
+            int(c2[0]),
+
+        "c3_open_time":
+            int(c3[0]),
+
+        "c3_close_time":
+            int(c3[6]),
+
+    }
+
+
+# ============================================================
+# BULLISH DISPLACEMENT
+# ============================================================
+
+def check_bullish_displacement(
+    candles
+):
+
+    if len(candles)
+    <
+    AVERAGE_LOOKBACK + 1:
+
+        return None
+
+
+    c3 = candles[-1]
+
+
+    c3_open = candle_open(c3)
+
+    c3_high = candle_high(c3)
+
+    c3_low = candle_low(c3)
+
+    c3_close = candle_close(c3)
+
+
+    # --------------------------------------------------------
+    # C3 MUST BE BULLISH
+    # --------------------------------------------------------
+
+    if c3_close <= c3_open:
+
+        return None
+
+
+    c3_range = (
+        c3_high
+        -
+        c3_low
+    )
+
+
+    if c3_range <= 0:
+
+        return None
+
+
+    c3_body = (
+        c3_close
+        -
+        c3_open
+    )
+
+
+    body_ratio = (
+        c3_body
+        /
+        c3_range
+    )
+
+
+    # --------------------------------------------------------
+    # BODY >= 60% OF RANGE
+    # --------------------------------------------------------
+
+    if (
+        body_ratio
+        <
+        DISPLACEMENT_MIN_BODY_RATIO
+    ):
+
+        return None
+
+
+    previous_candles = candles[
+        -(
+            AVERAGE_LOOKBACK + 1
+        ):
+        -1
+    ]
+
+
+    ranges = []
+
+
+    volumes = []
+
+
+    for candle in previous_candles:
+
+        high = candle_high(candle)
+
+        low = candle_low(candle)
+
+        quote_volume = float(
+            candle[7]
+        )
+
+
+        candle_range = (
+            high
+            -
+            low
+        )
+
+
+        if candle_range > 0:
+
+            ranges.append(
+                candle_range
+            )
+
+
+        volumes.append(
+            quote_volume
+        )
+
+
+    if not ranges:
+
+        return None
+
+
+    if not volumes:
+
+        return None
+
+
+    average_range = (
+        sum(ranges)
+        /
+        len(ranges)
+    )
+
+
+    average_volume = (
+        sum(volumes)
+        /
+        len(volumes)
+    )
+
+
+    # --------------------------------------------------------
+    # RANGE >= 1.3x AVERAGE
+    # --------------------------------------------------------
+
+    if (
+        c3_range
+        <
+        average_range
+        *
+        DISPLACEMENT_RANGE_MULTIPLIER
+    ):
+
+        return None
+
+
+    c3_volume = float(
+        c3[7]
+    )
+
+
+    # --------------------------------------------------------
+    # VOLUME >= 1.5x AVERAGE
+    # --------------------------------------------------------
+
+    if (
+        c3_volume
+        <
+        average_volume
+        *
+        DISPLACEMENT_VOLUME_MULTIPLIER
+    ):
+
+        return None
+
+
+    return {
+
+        "body_ratio":
+            body_ratio,
+
+        "range":
+            c3_range,
+
+        "average_range":
+            average_range,
+
+        "range_multiple":
+            (
+                c3_range
+                /
+                average_range
+            ),
+
+        "volume":
+            c3_volume,
+
+        "average_volume":
+            average_volume,
+
+        "volume_multiple":
+            (
+                c3_volume
+                /
+                average_volume
+            ),
+
+    }
+
+
+# ============================================================
+# BULLISH STRUCTURE BREAK
+# ============================================================
+
+def check_bullish_structure_break(
+    candles
+):
+
+    # Need:
+    # previous 10 closed candles
+    # + current C3
+
+    required = (
+        STRUCTURE_LOOKBACK
+        +
+        1
+    )
+
+
+    if len(candles) < required:
+
+        return None
+
+
+    c3 = candles[-1]
+
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # C3 IS NOT INCLUDED IN STRUCTURE HIGH
+    #
+    # Previous 10 closed candles are:
+    #
+    # candles[-11:-1]
+    # --------------------------------------------------------
+
+    previous_candles = candles[
+        -(
+            STRUCTURE_LOOKBACK
+            +
+            1
+        ):
+        -1
+    ]
+
+
+    previous_high = max(
+        candle_high(candle)
+        for candle
+        in previous_candles
+    )
+
+
+    c3_close = candle_close(c3)
+
+
+    # --------------------------------------------------------
+    # BULLISH BOS
+    # --------------------------------------------------------
+
+    if c3_close <= previous_high:
+
+        return None
+
+
+    break_percent = (
+
+        (
+            c3_close
+            -
+            previous_high
+        )
+        /
+        previous_high
+        *
+        100
+
+    )
+
+
+    return {
+
+        "previous_high":
+            previous_high,
+
+        "break_price":
+            c3_close,
+
+        "break_percent":
+            break_percent,
+
+    }
+
+
+# ============================================================
+# NEW BULLISH STRATEGY
+# ============================================================
+
+def detect_bullish_strategy(
+    symbol,
+    interval
+):
+
+    candles = (
+        get_bullish_closed_candles(
+            symbol,
+            interval,
+            80
+        )
+    )
+
+
+    minimum_needed = (
+        max(
+            BULLISH_EMA_SLOW,
+            STRUCTURE_LOOKBACK,
+            AVERAGE_LOOKBACK
+        )
+        +
+        5
+    )
+
+
+    if len(candles) < minimum_needed:
+
+        print(
+
+            f"[BULLISH WAIT] "
+            f"{symbol} {interval} "
+            f"not enough closed candles"
+
+        )
+
+        return None
+
+
+    # ========================================================
+    # LAST CLOSED CANDLE
+    # ========================================================
+
+    c3 = candles[-1]
+
+
+    c3_open_time = int(
+        c3[0]
+    )
+
+
+    # ========================================================
+    # EMA20 / EMA50
+    # ========================================================
+
+    closes = [
+
+        candle_close(candle)
+
+        for candle
+        in candles
+
+    ]
+
+
+    ema20 = calculate_ema(
+        closes,
+        BULLISH_EMA_FAST
+    )
+
+
+    ema50 = calculate_ema(
+        closes,
+        BULLISH_EMA_SLOW
+    )
+
+
+    if (
+        ema20 is None
+        or
+        ema50 is None
+    ):
+
+        return None
+
+
+    # --------------------------------------------------------
+    # EMA20 > EMA50
+    # --------------------------------------------------------
+
+    if ema20 <= ema50:
+
+        return None
+
+
+    # ========================================================
+    # EMA20 RISING
+    #
+    # Calculate EMA20 one candle earlier
+    # ========================================================
+
+    previous_closes = closes[:-1]
+
+
+    previous_ema20 = calculate_ema(
+        previous_closes,
+        BULLISH_EMA_FAST
+    )
+
+
+    if previous_ema20 is None:
+
+        return None
+
+
+    if ema20 <= previous_ema20:
+
+        return None
+
+
+    # ========================================================
+    # PRICE > EMA20
+    # ========================================================
+
+    c3_close = candle_close(c3)
+
+
+    if c3_close <= ema20:
+
+        return None
+
+
+    # ========================================================
+    # STRUCTURE BREAK
+    # ========================================================
+
+    structure = (
+        check_bullish_structure_break(
+            candles
+        )
+    )
+
+
+    if structure is None:
+
+        return None
+
+
+    # ========================================================
+    # BULLISH DISPLACEMENT
+    # ========================================================
+
+    displacement = (
+        check_bullish_displacement(
+            candles
+        )
+    )
+
+
+    if displacement is None:
+
+        return None
+
+
+    # ========================================================
+    # BULLISH FVG
+    # ========================================================
+
+    fvg = detect_bullish_fvg(
+        candles[-3:]
+    )
+
+
+    if fvg is None:
+
+        return None
+
+
+    # ========================================================
+    # ALL CONDITIONS PASSED
+    # ========================================================
+
+    signal_id = (
+
+        symbol,
+
+        interval,
+
+        c3_open_time
+
+    )
+
+
+    if (
+        signal_id
+        in
+        processed_bullish_signals
+    ):
+
+        return None
+
+
+    return {
+
+        "signal_id":
+            signal_id,
+
+        "symbol":
+            symbol,
+
+        "interval":
+            interval,
+
+        "c3_open_time":
+            c3_open_time,
+
+        "c3_close":
+            c3_close,
+
+        "c3_high":
+            candle_high(c3),
+
+        "c3_low":
+            candle_low(c3),
+
+        "ema20":
+            ema20,
+
+        "ema50":
+            ema50,
+
+        "previous_ema20":
+            previous_ema20,
+
+        "previous_high":
+            structure[
+                "previous_high"
+            ],
+
+        "break_price":
+            structure[
+                "break_price"
+            ],
+
+        "break_percent":
+            structure[
+                "break_percent"
+            ],
+
+        "body_ratio":
+            displacement[
+                "body_ratio"
+            ],
+
+        "range":
+            displacement[
+                "range"
+            ],
+
+        "average_range":
+            displacement[
+                "average_range"
+            ],
+
+        "range_multiple":
+            displacement[
+                "range_multiple"
+            ],
+
+        "volume":
+            displacement[
+                "volume"
+            ],
+
+        "average_volume":
+            displacement[
+                "average_volume"
+            ],
+
+        "volume_multiple":
+            displacement[
+                "volume_multiple"
+            ],
+
+        "fvg_low":
+            fvg["c1_high"],
+
+        "fvg_high":
+            fvg["c3_low"],
+
+        "fvg_size":
+            fvg["fvg_size"],
+
+        "fvg_percent":
+            fvg["fvg_percent"],
+
+    }
+
+
+# ============================================================
+# BULLISH TELEGRAM MESSAGE
+# ============================================================
+
+def format_bullish_message(
+    signal,
+    volume_data
+):
+
+    return (
+
+        "🟢 <b>BULLISH TREND SIGNAL</b>\n\n"
+
+        f"<b>{signal['symbol']}</b> "
+        f"{signal['interval']}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+
+        "<b>📈 TREND</b>\n"
+
+        f"EMA20: "
+        f"{signal['ema20']:.8g}\n"
+
+        f"EMA50: "
+        f"{signal['ema50']:.8g}\n"
+
+        f"EMA20 > EMA50: "
+        f"✅\n"
+
+        f"Price > EMA20: "
+        f"✅\n"
+
+        f"EMA20 Rising: "
+        f"✅\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+
+        "<b>🚀 STRUCTURE</b>\n"
+
+        f"Previous High: "
+        f"{signal['previous_high']:.8g}\n"
+
+        f"Break Price: "
+        f"{signal['break_price']:.8g}\n"
+
+        f"BOS: "
+        f"✅ "
+        f"(+{signal['break_percent']:.2f}%)\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+
+        "<b>💪 DISPLACEMENT</b>\n"
+
+        f"Body/Range: "
+        f"{signal['body_ratio'] * 100:.2f}%\n"
+
+        f"Range: "
+        f"{signal['range_multiple']:.2f}x avg\n"
+
+        f"Volume: "
+        f"{signal['volume_multiple']:.2f}x avg\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+
+        "<b>🟢 BULLISH FVG</b>\n"
+
+        f"FVG: "
+        f"{signal['fvg_low']:.8g}"
+        f" → "
+        f"{signal['fvg_high']:.8g}\n"
+
+        f"FVG Size: "
+        f"{signal['fvg_percent']:.2f}%\n"
+
+        "C2 Body Filter: ❌\n"
+
+        "50% Ratio Filter: ❌\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+
+        f"<b>24H Volume:</b> "
+        f"{format_volume(volume_data['total_volume'])}\n"
+
+        f"<b>Buy:</b> "
+        f"{format_volume(volume_data['buy_volume'])}"
+        f" ({volume_data['buy_percent']:.2f}%)\n"
+
+        f"<b>Sell:</b> "
+        f"{format_volume(volume_data['sell_volume'])}"
+        f" ({volume_data['sell_percent']:.2f}%)\n\n"
+
+        "🟢 <b>ALL BULLISH CONDITIONS PASSED</b>"
+
+    )
+
+
+# ============================================================
+# ============================================================
+# MAIN SCAN
+# ============================================================
 # ============================================================
 
 def scan():
@@ -1353,7 +2330,7 @@ def scan():
     print(
         "\n"
         +
-        "=" * 70
+        "=" * 75
     )
 
 
@@ -1374,13 +2351,13 @@ def scan():
 
 
     print(
-        "=" * 70
+        "=" * 75
     )
 
 
-    # --------------------------------------------------------
-    # FIRST MONITOR EXISTING ACTIVE SETUPS
-    # --------------------------------------------------------
+    # ========================================================
+    # 🔴 ORIGINAL ACTIVE BEARISH SETUPS
+    # ========================================================
 
     monitor_active_setups()
 
@@ -1414,7 +2391,7 @@ def scan():
 
 
     # ========================================================
-    # GET 24H TOTAL VOLUMES
+    # GET 24H VOLUMES
     # ========================================================
 
     volumes = (
@@ -1435,7 +2412,7 @@ def scan():
 
 
     # ========================================================
-    # TOTAL VOLUME FILTER
+    # 20M+ VOLUME FILTER
     # ========================================================
 
     volume_qualified_symbols = []
@@ -1496,9 +2473,7 @@ def scan():
                 print(
 
                     f"[VOLUME ERROR] "
-                    f"{symbol} "
-                    f"Could not calculate "
-                    f"buy/sell volume"
+                    f"{symbol}"
 
                 )
 
@@ -1540,10 +2515,6 @@ def scan():
             )
 
 
-            # =================================================
-            # BOTH CONDITIONS
-            # =================================================
-
             if (
 
                 total_volume >=
@@ -1577,8 +2548,7 @@ def scan():
                     f"({buy_percent:.2f}%) | "
                     f"SELL="
                     f"{format_volume(sell_volume)} "
-                    f"({sell_percent:.2f}%) | "
-                    f"BUY > SELL"
+                    f"({sell_percent:.2f}%)"
 
                 )
 
@@ -1622,8 +2592,14 @@ def scan():
 
 
     # ========================================================
-    # FVG SCAN
+    # 🔴 ORIGINAL BEARISH FVG SCAN
     # ========================================================
+
+    print(
+        "\n"
+        "========== BEARISH FVG SCAN =========="
+    )
+
 
     for (
         symbol,
@@ -1652,32 +2628,25 @@ def scan():
                 )
 
 
-                # ------------------------------------------------
-                # EACH TIMEFRAME IS INDEPENDENT
-                # ------------------------------------------------
-
                 setup_key = (
 
                     symbol,
-
                     interval
 
                 )
 
 
                 # ------------------------------------------------
-                # ONE ACTIVE FVG PER TIMEFRAME
+                # ONE ACTIVE BEARISH FVG
                 # ------------------------------------------------
 
                 if setup_key in active_setups:
 
                     print(
 
-                        f"[IGNORED] "
+                        f"[BEARISH IGNORED] "
                         f"{symbol} {interval} "
-                        f"new FVG found but "
-                        f"this timeframe already has "
-                        f"an active setup"
+                        f"already active"
 
                     )
 
@@ -1704,52 +2673,171 @@ def scan():
 
                 print(
 
-                    f"[NEW FVG] "
-                    f"{symbol} {interval} "
+                    f"[NEW BEARISH FVG] "
+                    f"{symbol} {interval} | "
+
                     f"FVG="
                     f"{fvg['fvg_low']:.8g}"
                     f"-"
                     f"{fvg['fvg_high']:.8g} | "
 
-                    f"FVG Size="
+                    f"Size="
                     f"{fvg['fvg_percent']:.2f}% | "
 
-                    f"FVG/C2 Body="
+                    f"C2 Ratio="
                     f"{fvg['fvg_ratio'] * 100:.2f}% | "
 
-                    f"C3 High="
-                    f"{setup['c3_high']:.8g} "
-                    f"target="
-                    f"{setup['target']:.8g} "
-                    f"(-"
-                    f"{setup['target_percent']}"
-                    f"%) | "
-
-                    f"BUY="
-                    f"{format_volume(volume_data['buy_volume'])} "
-                    f"SELL="
-                    f"{format_volume(volume_data['sell_volume'])}"
+                    f"Target="
+                    f"{setup['target']:.8g}"
 
                 )
-
-
-                # =================================================
-                # NO TELEGRAM MESSAGE HERE
-                # =================================================
-                #
-                # FVG CREATED = NO TELEGRAM
-                #
-                # Telegram will ONLY be sent inside
-                # monitor_active_setups() when TARGET HIT.
-                #
-                # =================================================
 
 
             except Exception as e:
 
                 print(
 
-                    f"[FVG ERROR] "
+                    f"[BEARISH FVG ERROR] "
+                    f"{symbol} "
+                    f"{interval}: "
+                    f"{e}"
+
+                )
+
+
+    # ========================================================
+    # 🟢 NEW BULLISH STRATEGY SCAN
+    # ========================================================
+
+    print(
+        "\n"
+        "========== BULLISH TREND SCAN =========="
+    )
+
+
+    for (
+        symbol,
+        volume_data
+    ) in qualified_symbols:
+
+        for interval in BULLISH_INTERVALS:
+
+            try:
+
+                signal = (
+                    detect_bullish_strategy(
+                        symbol,
+                        interval
+                    )
+                )
+
+
+                if signal is None:
+
+                    continue
+
+
+                signal_id = (
+                    signal[
+                        "signal_id"
+                    ]
+                )
+
+
+                if (
+                    signal_id
+                    in
+                    processed_bullish_signals
+                ):
+
+                    continue
+
+
+                # ------------------------------------------------
+                # SAVE FIRST
+                # ------------------------------------------------
+
+                processed_bullish_signals.add(
+                    signal_id
+                )
+
+
+                print(
+
+                    "\n"
+                    "[🟢 BULLISH SIGNAL] "
+                    f"{symbol} "
+                    f"{interval}"
+
+                )
+
+
+                print(
+
+                    f"  EMA20="
+                    f"{signal['ema20']:.8g} | "
+                    f"EMA50="
+                    f"{signal['ema50']:.8g}"
+
+                )
+
+
+                print(
+
+                    f"  BOS="
+                    f"{signal['previous_high']:.8g}"
+                    f" -> "
+                    f"{signal['break_price']:.8g} "
+                    f"(+"
+                    f"{signal['break_percent']:.2f}"
+                    f"%)"
+
+                )
+
+
+                print(
+
+                    f"  Body="
+                    f"{signal['body_ratio'] * 100:.2f}% | "
+                    f"Range="
+                    f"{signal['range_multiple']:.2f}x | "
+                    f"Volume="
+                    f"{signal['volume_multiple']:.2f}x"
+
+                )
+
+
+                print(
+
+                    f"  Bullish FVG="
+                    f"{signal['fvg_low']:.8g}"
+                    f"-"
+                    f"{signal['fvg_high']:.8g} | "
+                    f"Size="
+                    f"{signal['fvg_percent']:.2f}%"
+
+                )
+
+
+                # ------------------------------------------------
+                # TELEGRAM
+                # ------------------------------------------------
+
+                send_telegram(
+
+                    format_bullish_message(
+                        signal,
+                        volume_data
+                    )
+
+                )
+
+
+            except Exception as e:
+
+                print(
+
+                    f"[BULLISH ERROR] "
                     f"{symbol} "
                     f"{interval}: "
                     f"{e}"
@@ -1764,175 +2852,161 @@ def scan():
 def main():
 
     print(
-        "=" * 70
+        "=" * 75
     )
 
 
     print(
-        "BINANCE BEARISH FVG LIVE ALERT BOT"
+        "BINANCE DUAL STRATEGY LIVE ALERT BOT"
     )
 
 
     print(
-        "REAL-TIME ROLLING 3-CANDLE VERSION"
+        "=" * 75
     )
 
 
     print(
-        "5m + 15m + 30m + 1h INDEPENDENT ACTIVE FVG"
+        "\n🔴 ORIGINAL BEARISH FVG:"
     )
 
 
     print(
-        "TELEGRAM ALERT ONLY WHEN TARGET IS HIT"
+        "  Timeframes: 5m + 15m + 30m + 1h"
     )
 
 
     print(
-        "=" * 70
+        "  C2 Bearish: REQUIRED"
     )
 
 
     print(
-
-        f"Min 24H Volume: "
-        f"${MIN_QUOTE_VOLUME_24H:,.0f}"
-
+        "  C3 Close < C2 Low: REQUIRED"
     )
 
 
     print(
-
-        "Volume Filter: "
-        "24H Total >= 20M USDT "
-        "AND BUY > SELL"
-
+        "  FVG >= 0.5%"
     )
 
 
     print(
-
-        f"FVG Minimum Size: "
-        f"{FVG_MIN_PERCENT:.2f}% "
-        f"(C1 Low -> C3 High)"
-
+        "  FVG inside C2 Body: REQUIRED"
     )
 
 
     print(
-
-        f"FVG Minimum C2 Body Ratio: "
-        f"{FVG_MIN_RATIO * 100:.0f}%"
-
+        "  FVG/C2 Body >= 50%: REQUIRED"
     )
 
 
     print(
-        "FVG Requirements:"
+        "  Telegram: TARGET HIT ONLY"
     )
 
 
     print(
-        "  1. C1 Low -> C3 High >= 0.5%"
+        "\n🟢 NEW BULLISH TREND:"
     )
 
 
     print(
-        "  2. FVG / C2 Body >= 50%"
+        "  Timeframes: 15m + 30m + 1h"
     )
 
 
     print(
-        "  BOTH CONDITIONS REQUIRED"
+        "  EMA20 > EMA50"
     )
 
 
     print(
-        "Targets:"
+        "  EMA20 Rising"
     )
 
 
-    for interval in FVG_INTERVALS:
-
-        print(
-
-            f"  {interval}: "
-            f"{FVG_TARGETS[interval]}%"
-
-        )
+    print(
+        "  Price > EMA20"
+    )
 
 
     print(
+        f"  Structure Break: "
+        f"Previous {STRUCTURE_LOOKBACK} "
+        f"closed candles HIGH"
+    )
 
-        f"Scan: "
+
+    print(
+        "  Bullish Displacement"
+    )
+
+
+    print(
+        f"  Body/Range >= "
+        f"{DISPLACEMENT_MIN_BODY_RATIO * 100:.0f}%"
+    )
+
+
+    print(
+        f"  Range >= "
+        f"{DISPLACEMENT_RANGE_MULTIPLIER:.1f}x average"
+    )
+
+
+    print(
+        f"  Volume >= "
+        f"{DISPLACEMENT_VOLUME_MULTIPLIER:.1f}x average"
+    )
+
+
+    print(
+        f"  Bullish FVG >= "
+        f"{BULLISH_FVG_MIN_PERCENT:.1f}%"
+    )
+
+
+    print(
+        "  C2 Body condition: DISABLED"
+    )
+
+
+    print(
+        "  50% Ratio condition: DISABLED"
+    )
+
+
+    print(
+        "  Telegram: SIGNAL"
+    )
+
+
+    print(
+        "\nCOMMON VOLUME FILTER:"
+    )
+
+
+    print(
+        "  24H Total >= 20M USDT"
+    )
+
+
+    print(
+        "  24H BUY > SELL"
+    )
+
+
+    print(
+        f"\nScan: "
         f"{SCAN_SECONDS} seconds"
-
     )
 
 
     print(
-        "C1: GREEN or RED"
+        "=" * 75
     )
 
-
-    print(
-        "C2: MUST BE RED"
-    )
-
-
-    print(
-        "C3: GREEN or RED"
-    )
-
-
-    print(
-        "C3 CLOSE: MUST BE BELOW C2 LOW"
-    )
-
-
-    print(
-        "Historical FVG scan: DISABLED"
-    )
-
-
-    print(
-        "EMA / Trend filter: DISABLED"
-    )
-
-
-    print(
-        "5m + 15m + 30m + 1h: INDEPENDENT"
-    )
-
-
-    print(
-        "One active FVG PER TIMEFRAME"
-    )
-
-
-    print(
-        "Telegram: TARGET HIT ONLY"
-    )
-
-
-    print(
-        "Telegram shows: C3 High -> Target"
-    )
-
-
-    print(
-        "Volume: TOTAL + BUY + SELL"
-    )
-
-
-    print(
-        "=" * 70
-    )
-
-
-    # ========================================================
-    # MAIN LOOP
-    # ========================================================
 
     while True:
 
@@ -1954,9 +3028,7 @@ def main():
         elapsed = (
 
             time.time()
-
             -
-
             cycle_start
 
         )
@@ -1966,7 +3038,9 @@ def main():
 
             1,
 
-            SCAN_SECONDS - elapsed
+            SCAN_SECONDS
+            -
+            elapsed
 
         )
 
@@ -2006,8 +3080,6 @@ if __name__ == "__main__":
     except Exception as e:
 
         print(
-
             f"FATAL ERROR: "
             f"{e}"
-
         )
