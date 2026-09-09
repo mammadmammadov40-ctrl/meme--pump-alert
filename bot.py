@@ -72,7 +72,8 @@ RSI_INTERVALS = ["15m", "30m", "1h"]
 # Screenshot uses RSI(6), so this strategy follows RSI(6).
 RSI_PERIOD = 6
 RSI_HISTORY_LIMIT = 200
-# A swing low is confirmed only after 2 candles to the right.
+# FIRST reference swing low: confirmed with 2 candles to the right.
+# NEXT lows: checked immediately when the candle closes.
 RSI_PIVOT_LEFT = 2
 RSI_PIVOT_RIGHT = 2
 
@@ -1321,105 +1322,19 @@ def is_price_pivot_low(candles, index):
     )
 
 
-def find_bullish_rsi_divergence(candles):
-    """
-    Detect the exact pattern shown in the user's chart:
-
-      Price: second confirmed swing low is LOWER than first.
-      RSI:   RSI at second swing low is HIGHER than first.
-
-    The second swing low must have RSI_PIVOT_RIGHT closed candles
-    after it. This avoids using an unfinished/future pivot.
-    """
-    minimum_needed = (
-        RSI_PERIOD
-        + RSI_PIVOT_LEFT
-        + RSI_PIVOT_RIGHT
-        + 10
-    )
-
-    if len(candles) < minimum_needed:
-        return None
-
-    closes = [candle_close(c) for c in candles]
-    rsi_values = calculate_rsi(closes, RSI_PERIOD)
-
-    if not rsi_values or len(rsi_values) != len(candles):
-        return None
-
-    pivots = []
-
-    # Only pivots that are fully confirmed by candles to the right.
-    last_confirmable = len(candles) - RSI_PIVOT_RIGHT - 1
-
-    for i in range(RSI_PIVOT_LEFT, last_confirmable + 1):
-        if not is_price_pivot_low(candles, i):
-            continue
-
-        rsi_value = rsi_values[i]
-
-        if rsi_value is None:
-            continue
-
-        pivots.append({
-            "index": i,
-            "time": int(candles[i][0]),
-            "price_low": candle_low(candles[i]),
-            "rsi": float(rsi_value),
-        })
-
-    if len(pivots) < 2:
-        return None
-
-    # Check the newest consecutive pair first.
-    for second_pos in range(len(pivots) - 1, 0, -1):
-        first = pivots[second_pos - 1]
-        second = pivots[second_pos]
-
-        price_lower_low = second["price_low"] < first["price_low"]
-        rsi_higher_low = second["rsi"] > first["rsi"]
-
-        if not (price_lower_low and rsi_higher_low):
-            continue
-
-        price_change_percent = (
-            (second["price_low"] - first["price_low"])
-            / first["price_low"]
-            * 100
-            if first["price_low"] > 0
-            else 0.0
-        )
-
-        rsi_change = second["rsi"] - first["rsi"]
-
-        return {
-            "first_index": first["index"],
-            "second_index": second["index"],
-            "first_time": first["time"],
-            "second_time": second["time"],
-            "first_price_low": first["price_low"],
-            "second_price_low": second["price_low"],
-            "first_rsi": first["rsi"],
-            "second_rsi": second["rsi"],
-            "price_change_percent": price_change_percent,
-            "rsi_change": rsi_change,
-            "confirmed_at": int(candles[-1][0]),
-        }
-
-    return None
-
-
 def get_confirmed_rsi_pivot(candles):
-    """Return the newest pivot low that became confirmed on the latest scan.
+    """Return the newest confirmed FIRST swing low.
 
-    With RSI_PIVOT_RIGHT=2, the pivot at index -3 is confirmed when the
-    latest closed candle arrives. Only closed candles are used.
+    The first reference low is a real swing low: it needs
+    RSI_PIVOT_LEFT candles on the left and RSI_PIVOT_RIGHT candles
+    on the right to be confirmed.
     """
     if len(candles) < (RSI_PERIOD + RSI_PIVOT_LEFT + RSI_PIVOT_RIGHT + 2):
         return None
 
     closes = [candle_close(c) for c in candles]
     rsi_values = calculate_rsi(closes, RSI_PERIOD)
+
     if not rsi_values or len(rsi_values) != len(candles):
         return None
 
@@ -1429,6 +1344,7 @@ def get_confirmed_rsi_pivot(candles):
         return None
 
     rsi_value = rsi_values[index]
+
     if rsi_value is None:
         return None
 
@@ -1439,6 +1355,36 @@ def get_confirmed_rsi_pivot(candles):
         "rsi": float(rsi_value),
     }
 
+
+def get_latest_closed_rsi_candle(candles):
+    """Return the latest CLOSED candle and its RSI.
+
+    IMPORTANT: after the first reference low is stored, the next low
+    does NOT need two candles on the right. The currently closed candle
+    itself is checked immediately. If its low is below the reference
+    low, it becomes the next candidate.
+    """
+    if len(candles) < RSI_PERIOD + 2:
+        return None
+
+    closes = [candle_close(c) for c in candles]
+    rsi_values = calculate_rsi(closes, RSI_PERIOD)
+
+    if not rsi_values or len(rsi_values) != len(candles):
+        return None
+
+    index = len(candles) - 1
+    rsi_value = rsi_values[index]
+
+    if rsi_value is None:
+        return None
+
+    return {
+        "index": index,
+        "time": int(candles[index][0]),
+        "price_low": candle_low(candles[index]),
+        "rsi": float(rsi_value),
+    }
 
 def get_rsi_closed_candles(symbol, interval):
     return get_bullish_closed_candles(
@@ -1837,85 +1783,110 @@ def scan():
                 state_key = (symbol, interval)
                 previous_time = rsi_candle_state.get(state_key)
 
-                # First scan: initialize the candle clock and, if available,
-                # remember the newest already-confirmed swing low.
+                # ------------------------------------------------
+                # FIRST SCAN
+                # ------------------------------------------------
+                # Do not alert on historical divergence after restart.
+                # We only initialize the clock and remember the newest
+                # already-confirmed swing low as the first reference.
                 if previous_time is None:
                     rsi_candle_state[state_key] = latest_open_time
-                    pivot = get_confirmed_rsi_pivot(candles)
-                    if pivot is not None:
-                        rsi_first_pivot_state[state_key] = pivot
+
+                    first = get_confirmed_rsi_pivot(candles)
+
+                    if first is not None:
+                        rsi_first_pivot_state[state_key] = first
                         print(
                             f"[RSI FIRST LOW] {symbol} {interval} | "
-                            f"Price={pivot['price_low']:.8g} | "
-                            f"RSI={pivot['rsi']:.2f} | "
-                            "Watching for LOWER LOW + HIGHER RSI"
+                            f"Price={first['price_low']:.8g} | "
+                            f"RSI={first['rsi']:.2f} | "
+                            "Waiting for NEXT LOWER LOW"
                         )
                     else:
                         print(
                             f"[RSI INIT] {symbol} {interval} | "
                             "Waiting for first confirmed swing low"
                         )
+
                     continue
 
-                # Nothing new closed on this timeframe yet.
+                # No new closed candle yet.
                 if latest_open_time <= previous_time:
                     continue
 
                 rsi_candle_state[state_key] = latest_open_time
 
-                # A new pivot can only be confirmed after the required right
-                # candles have closed. This is deliberately not calculated
-                # from an unfinished candle.
-                second = get_confirmed_rsi_pivot(candles)
-                if second is None:
+                # ------------------------------------------------
+                # AFTER FIRST LOW: CHECK EVERY NEW CLOSED CANDLE
+                # ------------------------------------------------
+                # There is NO 2-right-candle wait for the next low.
+                # The newly closed candle is checked immediately.
+                current = get_latest_closed_rsi_candle(candles)
+
+                if current is None:
                     continue
 
                 first = rsi_first_pivot_state.get(state_key)
 
-                # If no first low exists yet, store this one and keep watching.
+                # If we do not have a reference low, use a newly
+                # confirmed swing low to start the sequence.
                 if first is None:
-                    rsi_first_pivot_state[state_key] = second
+                    first = get_confirmed_rsi_pivot(candles)
+
+                    if first is None:
+                        continue
+
+                    rsi_first_pivot_state[state_key] = first
+
                     print(
                         f"[RSI FIRST LOW] {symbol} {interval} | "
-                        f"Price={second['price_low']:.8g} | "
-                        f"RSI={second['rsi']:.2f} | "
-                        "Watching for LOWER LOW + HIGHER RSI"
+                        f"Price={first['price_low']:.8g} | "
+                        f"RSI={first['rsi']:.2f} | "
+                        "Waiting for NEXT LOWER LOW"
                     )
                     continue
 
-                # Ignore the same pivot if the scan runs again without a new
-                # pivot confirmation.
-                if second["time"] == first["time"]:
+                # Same candle as the stored reference: nothing to compare.
+                if current["time"] == first["time"]:
                     continue
 
-                price_lower_low = second["price_low"] < first["price_low"]
-                rsi_higher_low = second["rsi"] > first["rsi"]
+                # A new candidate exists only when its price low is below
+                # the current reference low.
+                if current["price_low"] >= first["price_low"]:
+                    continue
 
+                price_lower_low = current["price_low"] < first["price_low"]
+                rsi_higher_low = current["rsi"] > first["rsi"]
+
+                # ------------------------------------------------
+                # DIVERGENCE CONFIRMED ON THE SAME CLOSED CANDLE
+                # ------------------------------------------------
                 if price_lower_low and rsi_higher_low:
                     price_change_percent = (
-                        (second["price_low"] - first["price_low"])
+                        (current["price_low"] - first["price_low"])
                         / first["price_low"] * 100
                         if first["price_low"] > 0 else 0.0
                     )
-                    rsi_change = second["rsi"] - first["rsi"]
+                    rsi_change = current["rsi"] - first["rsi"]
 
                     signal = {
                         "symbol": symbol,
                         "interval": interval,
                         "first_index": first["index"],
-                        "second_index": second["index"],
+                        "second_index": current["index"],
                         "first_time": first["time"],
-                        "second_time": second["time"],
+                        "second_time": current["time"],
                         "first_price_low": first["price_low"],
-                        "second_price_low": second["price_low"],
+                        "second_price_low": current["price_low"],
                         "first_rsi": first["rsi"],
-                        "second_rsi": second["rsi"],
+                        "second_rsi": current["rsi"],
                         "price_change_percent": price_change_percent,
                         "rsi_change": rsi_change,
-                        "confirmed_at": int(candles[-1][0]),
+                        "confirmed_at": current["time"],
                     }
 
-                    signal_id = (symbol, interval, second["time"])
+                    signal_id = (symbol, interval, current["time"])
+
                     if signal_id not in processed_rsi_signals:
                         processed_rsi_signals.add(signal_id)
 
@@ -1929,16 +1900,17 @@ def scan():
                             f"{symbol} {interval}"
                         )
                         print(
-                            f"  Price: {first['price_low']:.8g} -> "
-                            f"{second['price_low']:.8g} "
-                            f"({price_change_percent:.2f}%)"
+                            f"  1st Low: {first['price_low']:.8g} | "
+                            f"2nd Low: {current['price_low']:.8g} | "
+                            f"Price={price_change_percent:.2f}%"
                         )
                         print(
                             f"  RSI(6): {first['rsi']:.2f} -> "
-                            f"{second['rsi']:.2f} (+{rsi_change:.2f})"
+                            f"{current['rsi']:.2f} | "
+                            f"Higher={rsi_change:.2f}"
                         )
                         print(
-                            f"  Confirmed: "
+                            f"  Confirmed on CLOSED candle: "
                             f"{confirmation_time.strftime('%Y-%m-%d %H:%M:%S UTC')}"
                         )
 
@@ -1948,29 +1920,37 @@ def scan():
                                 total_volume
                             )
                         )
+
                         print(
                             "[RSI TELEGRAM] "
                             + ("SENT" if success else "FAILED")
                         )
 
-                    # After a confirmed divergence, use the second low as the
-                    # new reference so a later divergence can be detected.
-                    rsi_first_pivot_state[state_key] = second
+                    # After a signal, the 2nd low becomes the NEW reference.
+                    # The sequence continues from this latest low.
+                    rsi_first_pivot_state[state_key] = current
+
+                    print(
+                        f"[RSI RESET] {symbol} {interval} | "
+                        f"New reference Low={current['price_low']:.8g} | "
+                        f"RSI={current['rsi']:.2f}"
+                    )
 
                 else:
-                    # Keep the original first low alive. We do NOT expire it
-                    # after 5/20/50 candles; the next confirmed swing low is
-                    # still compared against this stored first low.
+                    # The new lower low did NOT satisfy RSI higher-low.
+                    # Therefore the old reference is forgotten and this
+                    # new low becomes the reference for the NEXT low.
+                    rsi_first_pivot_state[state_key] = current
+
                     print(
-                        f"[RSI WAIT] {symbol} {interval} | "
-                        f"First={first['price_low']:.8g}/RSI {first['rsi']:.2f} | "
-                        f"New={second['price_low']:.8g}/RSI {second['rsi']:.2f} | "
-                        "No divergence"
+                        f"[RSI REPLACE] {symbol} {interval} | "
+                        f"Old Low={first['price_low']:.8g}/RSI {first['rsi']:.2f} | "
+                        f"New Low={current['price_low']:.8g}/RSI {current['rsi']:.2f} | "
+                        "RSI condition failed -> NEW reference saved"
                     )
 
             except Exception as e:
                 print(f"[RSI ERROR] {symbol} {interval}: {e}")
-
 
 
 # ============================================================
@@ -2031,9 +2011,12 @@ def main():
     print("  Price: Lower Low")
     print("  RSI: Higher Low")
     print(
-        f"  Pivot: {RSI_PIVOT_LEFT} left / "
+        f"  First low confirmation: {RSI_PIVOT_LEFT} left / "
         f"{RSI_PIVOT_RIGHT} right closed candles"
     )
+    print("  Next lower low: CHECKED ON ITS OWN CANDLE CLOSE")
+    print("  Failed lower low: REPLACE OLD REFERENCE")
+    print("  After signal: START AGAIN FROM LATEST LOW")
     print("  First scan: NO SIGNAL")
     print("  New closed candle: CHECK")
     print("  Telegram: SIGNAL")
