@@ -92,6 +92,7 @@ bullish_candle_state = {}
 
 processed_rsi_signals = set()
 rsi_candle_state = {}
+rsi_first_pivot_state = {}
 
 
 # ============================================================
@@ -1408,6 +1409,37 @@ def find_bullish_rsi_divergence(candles):
     return None
 
 
+def get_confirmed_rsi_pivot(candles):
+    """Return the newest pivot low that became confirmed on the latest scan.
+
+    With RSI_PIVOT_RIGHT=2, the pivot at index -3 is confirmed when the
+    latest closed candle arrives. Only closed candles are used.
+    """
+    if len(candles) < (RSI_PERIOD + RSI_PIVOT_LEFT + RSI_PIVOT_RIGHT + 2):
+        return None
+
+    closes = [candle_close(c) for c in candles]
+    rsi_values = calculate_rsi(closes, RSI_PERIOD)
+    if not rsi_values or len(rsi_values) != len(candles):
+        return None
+
+    index = len(candles) - RSI_PIVOT_RIGHT - 1
+
+    if not is_price_pivot_low(candles, index):
+        return None
+
+    rsi_value = rsi_values[index]
+    if rsi_value is None:
+        return None
+
+    return {
+        "index": index,
+        "time": int(candles[index][0]),
+        "price_low": candle_low(candles[index]),
+        "rsi": float(rsi_value),
+    }
+
+
 def get_rsi_closed_candles(symbol, interval):
     return get_bullish_closed_candles(
         symbol,
@@ -1437,115 +1469,6 @@ def format_rsi_divergence_message(signal, total_volume):
         "🔵 <b>BULLISH DIVERGENCE CONFIRMED</b>"
     )
 
-
-    # ========================================================
-    # 🔵 RSI BULLISH DIVERGENCE SCAN
-    # ========================================================
-
-    print("\n========== RSI BULLISH DIVERGENCE SCAN ==========")
-
-    # Strategy 3 is independent of the BUY > SELL filter.
-    # It uses only the common 24H liquidity requirement.
-    rsi_symbols = [
-        (symbol, volumes.get(symbol, 0.0))
-        for symbol in symbols
-        if volumes.get(symbol, 0.0) >= MIN_QUOTE_VOLUME_24H
-    ]
-
-    for symbol, total_volume in rsi_symbols:
-
-        for interval in RSI_INTERVALS:
-
-            try:
-                candles = get_rsi_closed_candles(
-                    symbol,
-                    interval
-                )
-
-                if not candles:
-                    continue
-
-                latest_open_time = int(candles[-1][0])
-                state_key = (symbol, interval)
-                previous_time = rsi_candle_state.get(state_key)
-
-                # First scan only initializes the candle clock.
-                # No old/historical divergence alert after restart.
-                if previous_time is None:
-                    rsi_candle_state[state_key] = latest_open_time
-                    print(
-                        f"[RSI INIT] {symbol} {interval} | "
-                        "Waiting for NEW closed candle"
-                    )
-                    continue
-
-                if latest_open_time <= previous_time:
-                    continue
-
-                rsi_candle_state[state_key] = latest_open_time
-
-                signal = find_bullish_rsi_divergence(candles)
-
-                if signal is None:
-                    continue
-
-                signal_id = (
-                    symbol,
-                    interval,
-                    signal["second_time"],
-                )
-
-                if signal_id in processed_rsi_signals:
-                    continue
-
-                processed_rsi_signals.add(signal_id)
-
-                full_signal = {
-                    "symbol": symbol,
-                    "interval": interval,
-                    **signal,
-                }
-
-                confirmation_time = datetime.fromtimestamp(
-                    signal["confirmed_at"] / 1000,
-                    tz=timezone.utc
-                )
-
-                print(
-                    "\n[🔵 RSI BULLISH DIVERGENCE] "
-                    f"{symbol} {interval}"
-                )
-                print(
-                    f"  Price: {signal['first_price_low']:.8g}"
-                    f" -> {signal['second_price_low']:.8g} "
-                    f"({signal['price_change_percent']:.2f}%)"
-                )
-                print(
-                    f"  RSI(6): {signal['first_rsi']:.2f}"
-                    f" -> {signal['second_rsi']:.2f} "
-                    f"(+{signal['rsi_change']:.2f})"
-                )
-                print(
-                    f"  Confirmed: "
-                    f"{confirmation_time.strftime('%Y-%m-%d %H:%M:%S UTC')}"
-                )
-
-                success = send_telegram(
-                    format_rsi_divergence_message(
-                        full_signal,
-                        total_volume
-                    )
-                )
-
-                print(
-                    "[RSI TELEGRAM] "
-                    + ("SENT" if success else "FAILED")
-                )
-
-            except Exception as e:
-                print(
-                    f"[RSI ERROR] {symbol} {interval}: {e}"
-                )
 
 
 # ============================================================
@@ -1888,6 +1811,166 @@ def scan():
                     f"[BULLISH ERROR] "
                     f"{symbol} {interval}: {e}"
                 )
+
+    # ========================================================
+    # 🔵 RSI BULLISH DIVERGENCE SCAN
+    # ========================================================
+
+    print("\n========== RSI BULLISH DIVERGENCE SCAN ==========")
+
+    # Strategy 3 is independent of BUY > SELL.
+    # It uses only the common 24H total-volume requirement.
+    rsi_symbols = [
+        (symbol, volumes.get(symbol, 0.0))
+        for symbol in symbols
+        if volumes.get(symbol, 0.0) >= MIN_QUOTE_VOLUME_24H
+    ]
+
+    for symbol, total_volume in rsi_symbols:
+        for interval in RSI_INTERVALS:
+            try:
+                candles = get_rsi_closed_candles(symbol, interval)
+                if not candles:
+                    continue
+
+                latest_open_time = int(candles[-1][0])
+                state_key = (symbol, interval)
+                previous_time = rsi_candle_state.get(state_key)
+
+                # First scan: initialize the candle clock and, if available,
+                # remember the newest already-confirmed swing low.
+                if previous_time is None:
+                    rsi_candle_state[state_key] = latest_open_time
+                    pivot = get_confirmed_rsi_pivot(candles)
+                    if pivot is not None:
+                        rsi_first_pivot_state[state_key] = pivot
+                        print(
+                            f"[RSI FIRST LOW] {symbol} {interval} | "
+                            f"Price={pivot['price_low']:.8g} | "
+                            f"RSI={pivot['rsi']:.2f} | "
+                            "Watching for LOWER LOW + HIGHER RSI"
+                        )
+                    else:
+                        print(
+                            f"[RSI INIT] {symbol} {interval} | "
+                            "Waiting for first confirmed swing low"
+                        )
+                    continue
+
+                # Nothing new closed on this timeframe yet.
+                if latest_open_time <= previous_time:
+                    continue
+
+                rsi_candle_state[state_key] = latest_open_time
+
+                # A new pivot can only be confirmed after the required right
+                # candles have closed. This is deliberately not calculated
+                # from an unfinished candle.
+                second = get_confirmed_rsi_pivot(candles)
+                if second is None:
+                    continue
+
+                first = rsi_first_pivot_state.get(state_key)
+
+                # If no first low exists yet, store this one and keep watching.
+                if first is None:
+                    rsi_first_pivot_state[state_key] = second
+                    print(
+                        f"[RSI FIRST LOW] {symbol} {interval} | "
+                        f"Price={second['price_low']:.8g} | "
+                        f"RSI={second['rsi']:.2f} | "
+                        "Watching for LOWER LOW + HIGHER RSI"
+                    )
+                    continue
+
+                # Ignore the same pivot if the scan runs again without a new
+                # pivot confirmation.
+                if second["time"] == first["time"]:
+                    continue
+
+                price_lower_low = second["price_low"] < first["price_low"]
+                rsi_higher_low = second["rsi"] > first["rsi"]
+
+                if price_lower_low and rsi_higher_low:
+                    price_change_percent = (
+                        (second["price_low"] - first["price_low"])
+                        / first["price_low"] * 100
+                        if first["price_low"] > 0 else 0.0
+                    )
+                    rsi_change = second["rsi"] - first["rsi"]
+
+                    signal = {
+                        "symbol": symbol,
+                        "interval": interval,
+                        "first_index": first["index"],
+                        "second_index": second["index"],
+                        "first_time": first["time"],
+                        "second_time": second["time"],
+                        "first_price_low": first["price_low"],
+                        "second_price_low": second["price_low"],
+                        "first_rsi": first["rsi"],
+                        "second_rsi": second["rsi"],
+                        "price_change_percent": price_change_percent,
+                        "rsi_change": rsi_change,
+                        "confirmed_at": int(candles[-1][0]),
+                    }
+
+                    signal_id = (symbol, interval, second["time"])
+                    if signal_id not in processed_rsi_signals:
+                        processed_rsi_signals.add(signal_id)
+
+                        confirmation_time = datetime.fromtimestamp(
+                            signal["confirmed_at"] / 1000,
+                            tz=timezone.utc
+                        )
+
+                        print(
+                            f"\n[🔵 RSI BULLISH DIVERGENCE] "
+                            f"{symbol} {interval}"
+                        )
+                        print(
+                            f"  Price: {first['price_low']:.8g} -> "
+                            f"{second['price_low']:.8g} "
+                            f"({price_change_percent:.2f}%)"
+                        )
+                        print(
+                            f"  RSI(6): {first['rsi']:.2f} -> "
+                            f"{second['rsi']:.2f} (+{rsi_change:.2f})"
+                        )
+                        print(
+                            f"  Confirmed: "
+                            f"{confirmation_time.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+                        )
+
+                        success = send_telegram(
+                            format_rsi_divergence_message(
+                                signal,
+                                total_volume
+                            )
+                        )
+                        print(
+                            "[RSI TELEGRAM] "
+                            + ("SENT" if success else "FAILED")
+                        )
+
+                    # After a confirmed divergence, use the second low as the
+                    # new reference so a later divergence can be detected.
+                    rsi_first_pivot_state[state_key] = second
+
+                else:
+                    # Keep the original first low alive. We do NOT expire it
+                    # after 5/20/50 candles; the next confirmed swing low is
+                    # still compared against this stored first low.
+                    print(
+                        f"[RSI WAIT] {symbol} {interval} | "
+                        f"First={first['price_low']:.8g}/RSI {first['rsi']:.2f} | "
+                        f"New={second['price_low']:.8g}/RSI {second['rsi']:.2f} | "
+                        "No divergence"
+                    )
+
+            except Exception as e:
+                print(f"[RSI ERROR] {symbol} {interval}: {e}")
+
 
 
 # ============================================================
