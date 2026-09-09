@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 
 # ============================================================
 # BINANCE DUAL STRATEGY LIVE ALERT BOT
-#
 # ============================================================
 #
 # 🔴 STRATEGY 1 — ORIGINAL BEARISH FVG
@@ -18,7 +17,7 @@ from datetime import datetime, timezone
 # AND
 # 24H BUY VOLUME > 24H SELL VOLUME
 #
-# ORIGINAL BEARISH FVG CONDITIONS:
+# ORIGINAL BEARISH FVG:
 #
 # 1. C2 MUST BE BEARISH
 # 2. C1 LOW > C3 HIGH
@@ -39,7 +38,7 @@ from datetime import datetime, timezone
 #
 # ============================================================
 #
-# 🟢 STRATEGY 2 — NEW BULLISH TREND + BULLISH FVG
+# 🟢 STRATEGY 2 — BULLISH TREND + BULLISH FVG
 #
 # 15m + 30m + 1h
 # Independent
@@ -66,8 +65,15 @@ from datetime import datetime, timezone
 # Previous 10 CLOSED candles' highest HIGH
 # must be broken by C3 CLOSE.
 #
+# EMA:
+# EMA20 + EMA50 calculated from sufficient closed-candle history.
+#
 # TELEGRAM:
 # Bullish signal is sent when ALL conditions pass.
+#
+# IMPORTANT:
+# Strategy 2 does NOT alert on the old candle present
+# when the bot starts. It waits for a NEW closed candle.
 #
 # ============================================================
 
@@ -107,7 +113,7 @@ FVG_INTERVALS = list(
 
 
 # ============================================================
-# 🟢 NEW BULLISH STRATEGY SETTINGS
+# 🟢 BULLISH STRATEGY SETTINGS
 # ============================================================
 
 BULLISH_INTERVALS = [
@@ -122,6 +128,11 @@ BULLISH_EMA_FAST = 20
 BULLISH_EMA_SLOW = 50
 
 
+# Enough history for stable EMA calculation
+BULLISH_HISTORY_LIMIT = 200
+
+
+# Bullish FVG minimum size
 BULLISH_FVG_MIN_PERCENT = 0.5
 
 
@@ -135,17 +146,17 @@ STRUCTURE_LOOKBACK = 10
 DISPLACEMENT_MIN_BODY_RATIO = 0.60
 
 
-# Candle range must be at least 1.3x
-# previous 20 candle average range
+# Current candle range must be at least
+# 1.3x previous 20 candle average range
 DISPLACEMENT_RANGE_MULTIPLIER = 1.30
 
 
-# Volume must be at least 1.5x
-# previous 20 candle average volume
+# Current candle volume must be at least
+# 1.5x previous 20 candle average volume
 DISPLACEMENT_VOLUME_MULTIPLIER = 1.50
 
 
-# Number of candles used for averages
+# Average calculations
 AVERAGE_LOOKBACK = 20
 
 
@@ -182,10 +193,20 @@ candle_state = {}
 
 
 # ============================================================
-# 🟢 NEW BULLISH BOT STATE
+# 🟢 BULLISH BOT STATE
 # ============================================================
 
+# Prevent duplicate signal for same candle
 processed_bullish_signals = set()
+
+
+# IMPORTANT:
+# Stores the latest closed candle seen for each
+# symbol + timeframe.
+#
+# This prevents the bot from sending a signal
+# immediately after Railway restart using an old candle.
+bullish_candle_state = {}
 
 
 # ============================================================
@@ -203,7 +224,6 @@ def binance_get(
         endpoint
     )
 
-
     try:
 
         response = requests.get(
@@ -212,12 +232,9 @@ def binance_get(
             timeout=20
         )
 
-
         response.raise_for_status()
 
-
         return response.json()
-
 
     except Exception as e:
 
@@ -225,7 +242,6 @@ def binance_get(
             f"[BINANCE ERROR] "
             f"{endpoint}: {e}"
         )
-
 
         return None
 
@@ -278,19 +294,15 @@ def send_telegram(message):
             timeout=20
         )
 
-
         response.raise_for_status()
 
-
         return True
-
 
     except Exception as e:
 
         print(
             f"[TELEGRAM ERROR] {e}"
         )
-
 
         return False
 
@@ -1387,13 +1399,13 @@ def monitor_active_setups():
 
 
 # ============================================================
-# GET CLOSED CANDLES FOR BULLISH STRATEGY
+# GET CLOSED CANDLES
 # ============================================================
 
 def get_bullish_closed_candles(
     symbol,
     interval,
-    limit=80
+    limit=BULLISH_HISTORY_LIMIT
 ):
 
     data = binance_get(
@@ -1465,16 +1477,29 @@ def calculate_ema(
         return None
 
 
-    ema = sum(
-        values[:period]
-    ) / period
+    # --------------------------------------------------------
+    # INITIAL EMA = SMA OF FIRST PERIOD VALUES
+    # --------------------------------------------------------
+
+    ema = (
+        sum(
+            values[:period]
+        )
+        /
+        period
+    )
 
 
     multiplier = (
-        2 /
+        2.0
+        /
         (period + 1)
     )
 
+
+    # --------------------------------------------------------
+    # CONTINUE CLASSIC EMA CALCULATION
+    # --------------------------------------------------------
 
     for value in values[period:]:
 
@@ -1499,7 +1524,7 @@ def calculate_ema(
 
 
 # ============================================================
-# BULLISH FVG DETECTION
+# BULLISH FVG
 # ============================================================
 
 def detect_bullish_fvg(
@@ -1547,7 +1572,7 @@ def detect_bullish_fvg(
 
 
     # --------------------------------------------------------
-    # FVG >= 0.5%
+    # FVG PERCENT
     # --------------------------------------------------------
 
     fvg_percent = (
@@ -1560,6 +1585,10 @@ def detect_bullish_fvg(
 
     )
 
+
+    # --------------------------------------------------------
+    # MINIMUM 0.5%
+    # --------------------------------------------------------
 
     if (
         fvg_percent
@@ -1622,9 +1651,13 @@ def check_bullish_displacement(
     candles
 ):
 
-    if len(candles)
-    <
-    AVERAGE_LOOKBACK + 1:
+    # --------------------------------------------------------
+    # NEED CURRENT CANDLE + PREVIOUS 20 CANDLES
+    # --------------------------------------------------------
+
+    if len(candles) < (
+        AVERAGE_LOOKBACK + 1
+    ):
 
         return None
 
@@ -1677,7 +1710,7 @@ def check_bullish_displacement(
 
 
     # --------------------------------------------------------
-    # BODY >= 60% OF RANGE
+    # BODY >= 60%
     # --------------------------------------------------------
 
     if (
@@ -1689,6 +1722,12 @@ def check_bullish_displacement(
         return None
 
 
+    # --------------------------------------------------------
+    # PREVIOUS 20 CANDLES
+    #
+    # C3 IS EXCLUDED
+    # --------------------------------------------------------
+
     previous_candles = candles[
         -(
             AVERAGE_LOOKBACK + 1
@@ -1699,7 +1738,6 @@ def check_bullish_displacement(
 
     ranges = []
 
-
     volumes = []
 
 
@@ -1709,9 +1747,16 @@ def check_bullish_displacement(
 
         low = candle_low(candle)
 
-        quote_volume = float(
-            candle[7]
-        )
+
+        try:
+
+            quote_volume = float(
+                candle[7]
+            )
+
+        except Exception:
+
+            continue
 
 
         candle_range = (
@@ -1733,12 +1778,12 @@ def check_bullish_displacement(
         )
 
 
-    if not ranges:
+    if len(ranges) < AVERAGE_LOOKBACK:
 
         return None
 
 
-    if not volumes:
+    if len(volumes) < AVERAGE_LOOKBACK:
 
         return None
 
@@ -1757,23 +1802,55 @@ def check_bullish_displacement(
     )
 
 
+    if average_range <= 0:
+
+        return None
+
+
+    if average_volume <= 0:
+
+        return None
+
+
     # --------------------------------------------------------
     # RANGE >= 1.3x AVERAGE
     # --------------------------------------------------------
 
-    if (
+    range_multiple = (
         c3_range
-        <
+        /
         average_range
-        *
+    )
+
+
+    if (
+        range_multiple
+        <
         DISPLACEMENT_RANGE_MULTIPLIER
     ):
 
         return None
 
 
-    c3_volume = float(
-        c3[7]
+    # --------------------------------------------------------
+    # CURRENT VOLUME
+    # --------------------------------------------------------
+
+    try:
+
+        c3_volume = float(
+            c3[7]
+        )
+
+    except Exception:
+
+        return None
+
+
+    volume_multiple = (
+        c3_volume
+        /
+        average_volume
     )
 
 
@@ -1782,10 +1859,8 @@ def check_bullish_displacement(
     # --------------------------------------------------------
 
     if (
-        c3_volume
+        volume_multiple
         <
-        average_volume
-        *
         DISPLACEMENT_VOLUME_MULTIPLIER
     ):
 
@@ -1804,11 +1879,7 @@ def check_bullish_displacement(
             average_range,
 
         "range_multiple":
-            (
-                c3_range
-                /
-                average_range
-            ),
+            range_multiple,
 
         "volume":
             c3_volume,
@@ -1817,11 +1888,7 @@ def check_bullish_displacement(
             average_volume,
 
         "volume_multiple":
-            (
-                c3_volume
-                /
-                average_volume
-            ),
+            volume_multiple,
 
     }
 
@@ -1834,9 +1901,13 @@ def check_bullish_structure_break(
     candles
 ):
 
+    # --------------------------------------------------------
     # Need:
-    # previous 10 closed candles
-    # + current C3
+    #
+    # previous 10 candles
+    # +
+    # current C3
+    # --------------------------------------------------------
 
     required = (
         STRUCTURE_LOOKBACK
@@ -1854,11 +1925,9 @@ def check_bullish_structure_break(
 
 
     # --------------------------------------------------------
-    # IMPORTANT:
+    # C3 IS EXCLUDED
     #
-    # C3 IS NOT INCLUDED IN STRUCTURE HIGH
-    #
-    # Previous 10 closed candles are:
+    # Previous 10 closed candles:
     #
     # candles[-11:-1]
     # --------------------------------------------------------
@@ -1874,9 +1943,12 @@ def check_bullish_structure_break(
 
 
     previous_high = max(
+
         candle_high(candle)
+
         for candle
         in previous_candles
+
     )
 
 
@@ -1884,7 +1956,7 @@ def check_bullish_structure_break(
 
 
     # --------------------------------------------------------
-    # BULLISH BOS
+    # BULLISH BREAK OF STRUCTURE
     # --------------------------------------------------------
 
     if c3_close <= previous_high:
@@ -1922,7 +1994,7 @@ def check_bullish_structure_break(
 
 
 # ============================================================
-# NEW BULLISH STRATEGY
+# BULLISH STRATEGY DETECTION
 # ============================================================
 
 def detect_bullish_strategy(
@@ -1934,19 +2006,19 @@ def detect_bullish_strategy(
         get_bullish_closed_candles(
             symbol,
             interval,
-            80
+            BULLISH_HISTORY_LIMIT
         )
     )
 
 
-    minimum_needed = (
-        max(
-            BULLISH_EMA_SLOW,
-            STRUCTURE_LOOKBACK,
-            AVERAGE_LOOKBACK
-        )
-        +
-        5
+    minimum_needed = max(
+
+        BULLISH_EMA_SLOW + 2,
+
+        STRUCTURE_LOOKBACK + 1,
+
+        AVERAGE_LOOKBACK + 1
+
     )
 
 
@@ -1955,8 +2027,8 @@ def detect_bullish_strategy(
         print(
 
             f"[BULLISH WAIT] "
-            f"{symbol} {interval} "
-            f"not enough closed candles"
+            f"{symbol} {interval} | "
+            f"Not enough closed candles"
 
         )
 
@@ -1990,14 +2062,20 @@ def detect_bullish_strategy(
 
 
     ema20 = calculate_ema(
+
         closes,
+
         BULLISH_EMA_FAST
+
     )
 
 
     ema50 = calculate_ema(
+
         closes,
+
         BULLISH_EMA_SLOW
+
     )
 
 
@@ -2011,6 +2089,7 @@ def detect_bullish_strategy(
 
 
     # --------------------------------------------------------
+    # CONDITION 3:
     # EMA20 > EMA50
     # --------------------------------------------------------
 
@@ -2020,17 +2099,22 @@ def detect_bullish_strategy(
 
 
     # ========================================================
-    # EMA20 RISING
+    # PREVIOUS EMA20
     #
-    # Calculate EMA20 one candle earlier
+    # Remove C3 and calculate EMA20 again.
+    # This gives the EMA20 value of the previous
+    # closed candle.
     # ========================================================
 
     previous_closes = closes[:-1]
 
 
     previous_ema20 = calculate_ema(
+
         previous_closes,
+
         BULLISH_EMA_FAST
+
     )
 
 
@@ -2039,13 +2123,19 @@ def detect_bullish_strategy(
         return None
 
 
+    # --------------------------------------------------------
+    # CONDITION 4:
+    # EMA20 RISING
+    # --------------------------------------------------------
+
     if ema20 <= previous_ema20:
 
         return None
 
 
     # ========================================================
-    # PRICE > EMA20
+    # CONDITION 5:
+    # CLOSE > EMA20
     # ========================================================
 
     c3_close = candle_close(c3)
@@ -2057,6 +2147,7 @@ def detect_bullish_strategy(
 
 
     # ========================================================
+    # CONDITION 6:
     # STRUCTURE BREAK
     # ========================================================
 
@@ -2073,7 +2164,8 @@ def detect_bullish_strategy(
 
 
     # ========================================================
-    # BULLISH DISPLACEMENT
+    # CONDITION 7-10:
+    # DISPLACEMENT + BODY + RANGE + VOLUME
     # ========================================================
 
     displacement = (
@@ -2089,7 +2181,8 @@ def detect_bullish_strategy(
 
 
     # ========================================================
-    # BULLISH FVG
+    # CONDITION 11-12:
+    # BULLISH FVG >= 0.5%
     # ========================================================
 
     fvg = detect_bullish_fvg(
@@ -2103,7 +2196,7 @@ def detect_bullish_strategy(
 
 
     # ========================================================
-    # ALL CONDITIONS PASSED
+    # SIGNAL ID
     # ========================================================
 
     signal_id = (
@@ -2117,6 +2210,10 @@ def detect_bullish_strategy(
     )
 
 
+    # --------------------------------------------------------
+    # SAME CANDLE ALREADY PROCESSED
+    # --------------------------------------------------------
+
     if (
         signal_id
         in
@@ -2125,6 +2222,10 @@ def detect_bullish_strategy(
 
         return None
 
+
+    # ========================================================
+    # ALL CONDITIONS PASSED
+    # ========================================================
 
     return {
 
@@ -2724,6 +2825,101 @@ def scan():
 
             try:
 
+                # =================================================
+                # GET CLOSED CANDLES
+                #
+                # We need the latest candle time first so that
+                # Strategy 2 only evaluates NEW candles.
+                # =================================================
+
+                candles = (
+                    get_bullish_closed_candles(
+                        symbol,
+                        interval,
+                        BULLISH_HISTORY_LIMIT
+                    )
+                )
+
+
+                if not candles:
+
+                    continue
+
+
+                latest_open_time = int(
+                    candles[-1][0]
+                )
+
+
+                state_key = (
+                    symbol,
+                    interval
+                )
+
+
+                previous_time = (
+                    bullish_candle_state.get(
+                        state_key
+                    )
+                )
+
+
+                # =================================================
+                # FIRST SCAN
+                #
+                # Save current candle and DO NOT SIGNAL.
+                # This prevents old candle alerts after restart.
+                # =================================================
+
+                if previous_time is None:
+
+                    bullish_candle_state[
+                        state_key
+                    ] = latest_open_time
+
+
+                    print(
+
+                        f"[BULLISH INIT] "
+                        f"{symbol} {interval} | "
+                        f"Waiting for NEW closed candle"
+
+                    )
+
+
+                    continue
+
+
+                # =================================================
+                # NO NEW CLOSED CANDLE
+                # =================================================
+
+                if latest_open_time <= previous_time:
+
+                    continue
+
+
+                # =================================================
+                # NEW CLOSED CANDLE
+                # =================================================
+
+                bullish_candle_state[
+                    state_key
+                ] = latest_open_time
+
+
+                print(
+
+                    f"[BULLISH NEW CANDLE] "
+                    f"{symbol} {interval}"
+
+                )
+
+
+                # =================================================
+                # CHECK STRATEGY
+                # =================================================
+
                 signal = (
                     detect_bullish_strategy(
                         symbol,
@@ -2744,6 +2940,10 @@ def scan():
                 )
 
 
+                # =================================================
+                # DUPLICATE PROTECTION
+                # =================================================
+
                 if (
                     signal_id
                     in
@@ -2753,14 +2953,18 @@ def scan():
                     continue
 
 
-                # ------------------------------------------------
-                # SAVE FIRST
-                # ------------------------------------------------
+                # =================================================
+                # SAVE SIGNAL
+                # =================================================
 
                 processed_bullish_signals.add(
                     signal_id
                 )
 
+
+                # =================================================
+                # LOG
+                # =================================================
 
                 print(
 
@@ -2778,6 +2982,16 @@ def scan():
                     f"{signal['ema20']:.8g} | "
                     f"EMA50="
                     f"{signal['ema50']:.8g}"
+
+                )
+
+
+                print(
+
+                    f"  EMA20 Rising="
+                    f"{signal['previous_ema20']:.8g}"
+                    f" -> "
+                    f"{signal['ema20']:.8g}"
 
                 )
 
@@ -2819,11 +3033,11 @@ def scan():
                 )
 
 
-                # ------------------------------------------------
+                # =================================================
                 # TELEGRAM
-                # ------------------------------------------------
+                # =================================================
 
-                send_telegram(
+                telegram_success = send_telegram(
 
                     format_bullish_message(
                         signal,
@@ -2831,6 +3045,21 @@ def scan():
                     )
 
                 )
+
+
+                if telegram_success:
+
+                    print(
+                        "[BULLISH TELEGRAM] "
+                        "Signal sent successfully"
+                    )
+
+                else:
+
+                    print(
+                        "[BULLISH TELEGRAM] "
+                        "Signal send failed"
+                    )
 
 
             except Exception as e:
@@ -2865,6 +3094,10 @@ def main():
         "=" * 75
     )
 
+
+    # ========================================================
+    # STRATEGY 1
+    # ========================================================
 
     print(
         "\n🔴 ORIGINAL BEARISH FVG:"
@@ -2906,8 +3139,12 @@ def main():
     )
 
 
+    # ========================================================
+    # STRATEGY 2
+    # ========================================================
+
     print(
-        "\n🟢 NEW BULLISH TREND:"
+        "\n🟢 BULLISH TREND STRATEGY:"
     )
 
 
@@ -2917,7 +3154,8 @@ def main():
 
 
     print(
-        "  EMA20 > EMA50"
+        f"  EMA{BULLISH_EMA_FAST} > "
+        f"EMA{BULLISH_EMA_SLOW}"
     )
 
 
@@ -2978,9 +3216,29 @@ def main():
 
 
     print(
+        f"  EMA History: "
+        f"{BULLISH_HISTORY_LIMIT} closed candles"
+    )
+
+
+    print(
+        "  First scan: NO SIGNAL"
+    )
+
+
+    print(
+        "  New closed candle: CHECK"
+    )
+
+
+    print(
         "  Telegram: SIGNAL"
     )
 
+
+    # ========================================================
+    # COMMON FILTER
+    # ========================================================
 
     print(
         "\nCOMMON VOLUME FILTER:"
