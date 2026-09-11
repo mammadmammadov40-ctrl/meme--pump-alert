@@ -7,6 +7,49 @@ from datetime import datetime, timezone
 # ============================================================
 # BINANCE RSI BULLISH DIVERGENCE LIVE ALERT BOT
 # ============================================================
+#
+# STRATEGY
+#
+# 1) BOT STARTUP:
+#    Binance-dan əvvəlki 50 bağlanmış şam götürülür.
+#    Bu 50 şam yalnız müqayisə bazasıdır.
+#    Tarixi 1-ci dib seçilmir.
+#
+# 2) DİBSİZ VƏZİYYƏT:
+#    Yeni şam əvvəlki 50 şamın hamısından aşağı low edərsə
+#    həmin şam yeni 1-ci dib olur.
+#
+# 3) FIRST LOW:
+#    1-ci dibdən sonra maksimum 50 bağlanmış şam ərzində
+#    2-ci dib axtarılır.
+#
+# 4) SECOND LOW:
+#    - 2-ci dib qiyməti 1-ci dibdən aşağı olmalıdır.
+#    - 1-ci RSI < 30
+#    - 2-ci RSI < 30
+#    - 2-ci RSI > 1-ci RSI
+#
+# 5) SECOND LOW ŞƏRTLƏRİ ÖDƏNƏNDƏ:
+#    Daha 2 şam gözlənilmir.
+#    Sonrakı bağlanan şamların RSI-si izlənilir.
+#
+# 6) RSI > 30:
+#    Son bağlanan şam RSI 30-dan yuxarı bağlanarsa
+#    TARGET SIGNAL göndərilir.
+#
+# 7) RSI 30 OLMADAN QİYMƏT 2-Cİ DİBDƏN AŞAĞI DÜŞƏRSƏ:
+#    - 2-ci dib ləğv edilir.
+#    - 1-ci dib silinir.
+#    - Köhnə 2-ci dib yeni 1-ci dib olur.
+#    - Həmin yeni 1-ci dibdən yenidən maksimum 50 şam
+#      izlənilir.
+#
+# 8) SIGNAL GƏLDİKDƏ:
+#    Setup tam silinir.
+#    Bot yeni 1-ci dib axtarışına keçir.
+#
+# ============================================================
+
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
@@ -18,14 +61,21 @@ RSI_PERIOD = 6
 
 LOOKBACK_CANDLES = 50
 
+RSI_OVERBOUGHT_LEVEL = 30
+
 RSI_TIMEFRAMES = [
     "15m",
     "30m",
     "1h"
 ]
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN"
+)
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID"
+)
 
 
 # ============================================================
@@ -41,15 +91,24 @@ states = {}
 # TELEGRAM
 # ============================================================
 
-def send_telegram(message):
+def send_telegram(
+    message,
+    symbol=None
+):
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram environment variables are missing.")
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+        print(
+            "Telegram environment variables are missing."
+        )
         return
 
     url = (
         f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+        f"{TELEGRAM_BOT_TOKEN}"
+        f"/sendMessage"
     )
 
     payload = {
@@ -57,6 +116,28 @@ def send_telegram(message):
         "text": message,
         "parse_mode": "HTML"
     }
+
+    # --------------------------------------------------------
+    # COIN ÜZƏRİNƏ BASANDA BİNANCE AÇILSIN
+    # --------------------------------------------------------
+
+    if symbol:
+
+        binance_url = (
+            "https://www.binance.com/en/trade/"
+            f"{symbol}_USDT?type=spot"
+        )
+
+        payload["reply_markup"] = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": f"🔗 {symbol} — Binance",
+                        "url": binance_url
+                    }
+                ]
+            ]
+        }
 
     try:
 
@@ -67,6 +148,7 @@ def send_telegram(message):
         )
 
         if response.status_code != 200:
+
             print(
                 "Telegram error:",
                 response.text
@@ -254,8 +336,8 @@ def get_closed_candles(
     if len(candles) < 2:
         return []
 
-    # Binance-da son kline hazırda formalaşan şamdır.
-    # Ona görə son şam çıxarılır.
+    # Son Binance kline hazırda formalaşan şamdır.
+    # Son şam çıxarılır.
     return candles[:-1]
 
 
@@ -269,7 +351,11 @@ def calculate_rsi(
 ):
 
     if len(candles) <= period:
-        return [None] * len(candles)
+
+        return [
+            None
+            for _ in candles
+        ]
 
     closes = [
         candle["close"]
@@ -435,8 +521,6 @@ def new_state():
 
         "second_time": None,
 
-        "confirmation_count": 0,
-
         # ----------------------------------------------------
         # INFO
         # ----------------------------------------------------
@@ -469,14 +553,9 @@ def reset_setup(state):
 
     state["second_time"] = None
 
-    state["confirmation_count"] = 0
-
     # --------------------------------------------------------
-    # ÇOX VACİB:
-    #
-    # Köhnə Binance şamlarına qayıtmaq yoxdur.
-    #
-    # Yeni müqayisə bazası gələcək yeni şamlardan qurulur.
+    # Köhnə tarixçəyə qayıtmaq yoxdur.
+    # Yeni rolling 50 şam bazası gələcək şamlardan qurulur.
     # --------------------------------------------------------
 
     state["comparison_window"] = []
@@ -493,14 +572,15 @@ def startup_initialize(
 ):
 
     if len(candles) < LOOKBACK_CANDLES:
+
         return False
 
     # --------------------------------------------------------
-    # BOT BAŞLAYANDA ALINAN 50 ŞAM
+    # BOT BAŞLAYANDA ALINAN ƏVVƏLKİ 50 BAĞLANMIŞ ŞAM
     #
     # YALNIZ MÜQAYİSƏ BAZASIDIR.
     #
-    # Bu şamların heç birindən tarixi 1-ci dib seçilmir.
+    # Bu 50 şamdan 1-ci dib seçilmir.
     # --------------------------------------------------------
 
     state["comparison_window"] = []
@@ -516,14 +596,17 @@ def startup_initialize(
     ):
 
         state["comparison_window"].append({
+
             "time": candles[i]["time"],
+
             "low": candles[i]["low"],
+
             "rsi": rsi_values[i]
+
         })
 
     state["startup_initialized"] = True
 
-    # Son bağlanmış şam artıq işlənmiş hesab olunur.
     state["last_candle_time"] = (
         candles[-1]["time"]
     )
@@ -576,7 +659,13 @@ def make_new_first_low(
 
     state["second_time"] = None
 
-    state["confirmation_count"] = 0
+    print(
+        f"{state['symbol']} "
+        f"{state['interval']} -> "
+        f"NEW FIRST LOW: "
+        f"{candle['low']} | "
+        f"RSI: {rsi_value:.2f}"
+    )
 
 
 # ============================================================
@@ -594,18 +683,19 @@ def process_no_first_low(
     ]
 
     # --------------------------------------------------------
-    # Əgər yeni reset olunubsa və baza hələ 50 şam deyil:
-    #
-    # Yeni şamlar toplanır.
-    # Köhnə Binance tarixçəsi istifadə edilmir.
+    # 50 şam tamamlanana qədər baza qurulur.
     # --------------------------------------------------------
 
     if len(window) < LOOKBACK_CANDLES:
 
         window.append({
+
             "time": candle["time"],
+
             "low": candle["low"],
+
             "rsi": rsi_value
+
         })
 
         print(
@@ -618,7 +708,7 @@ def process_no_first_low(
         return
 
     # --------------------------------------------------------
-    # YENİ ŞAM ƏVVƏLKİ 50 ŞAMIN HAMISINDAN AŞAĞIDIR?
+    # Yeni şam əvvəlki 50 şamın hamısından aşağıdır?
     # --------------------------------------------------------
 
     lowest_previous_50 = min(
@@ -634,37 +724,26 @@ def process_no_first_low(
             rsi_value
         )
 
-        print(
-            f"{state['symbol']} "
-            f"{state['interval']} -> "
-            f"FIRST LOW FOUND: "
-            f"{candle['low']} | "
-            f"RSI: {rsi_value:.2f}"
-        )
-
-        # ----------------------------------------------------
-        # Artıq bu rolling baza lazım deyil.
-        # First low-dan yeni setup başlayır.
-        # ----------------------------------------------------
-
+        # Yeni first low-dan setup başlayır.
         state["comparison_window"] = []
 
         return
 
     # --------------------------------------------------------
-    # DİB YOXDUR:
-    #
-    # Rolling 50 davam edir.
-    # Ən köhnə şam çıxır,
-    # yeni şam daxil olur.
+    # Rolling 50:
+    # ən köhnə çıxır, yeni şam daxil olur.
     # --------------------------------------------------------
 
     window.pop(0)
 
     window.append({
+
         "time": candle["time"],
+
         "low": candle["low"],
+
         "rsi": rsi_value
+
     })
 
 
@@ -672,7 +751,11 @@ def process_no_first_low(
 # SEND RSI SIGNAL
 # ============================================================
 
-def send_rsi_signal(state):
+def send_rsi_signal(
+    state,
+    signal_price,
+    signal_rsi
+):
 
     first_time = datetime.fromtimestamp(
         state["first_time"] / 1000,
@@ -688,14 +771,53 @@ def send_rsi_signal(state):
         "%Y-%m-%d %H:%M:%S UTC"
     )
 
+    first_low = state[
+        "first_low"
+    ]
+
+    second_low = state[
+        "second_low"
+    ]
+
+    # --------------------------------------------------------
+    # 1-ci dib -> 2-ci dib qiymət dəyişimi
+    # --------------------------------------------------------
+
+    price_first_to_second = (
+        (
+            second_low
+            - first_low
+        )
+        / first_low
+    ) * 100
+
+    # --------------------------------------------------------
+    # 2-ci dib -> RSI 30 üzərinə çıxan qiymət
+    #
+    # İSTƏDİYİN:
+    # RSI-nin faizini yox,
+    # QİYMƏTİN neçə faiz qalxdığını göstərmək.
+    # --------------------------------------------------------
+
+    price_second_to_signal = (
+        (
+            signal_price
+            - second_low
+        )
+        / second_low
+    ) * 100
+
     message = (
+
         "🟢 <b>RSI BULLISH DIVERGENCE</b>\n\n"
 
         f"<b>{state['symbol']}</b> "
         f"— <b>{state['interval']}</b>\n\n"
 
-        f"1️⃣ <b>First Low:</b> "
-        f"{state['first_low']:.8f}\n"
+        "1️⃣ <b>FIRST LOW</b>\n"
+
+        f"Price: "
+        f"{first_low:.8f}\n"
 
         f"RSI: "
         f"{state['first_rsi']:.2f}\n"
@@ -703,8 +825,10 @@ def send_rsi_signal(state):
         f"Time: "
         f"{first_time}\n\n"
 
-        f"2️⃣ <b>Second Low:</b> "
-        f"{state['second_low']:.8f}\n"
+        "2️⃣ <b>SECOND LOW</b>\n"
+
+        f"Price: "
+        f"{second_low:.8f}\n"
 
         f"RSI: "
         f"{state['second_rsi']:.2f}\n"
@@ -712,18 +836,46 @@ def send_rsi_signal(state):
         f"Time: "
         f"{second_time}\n\n"
 
-        "📉 <b>Price:</b> Lower Low\n"
-        "📈 <b>RSI:</b> Higher Low\n\n"
+        "📉 <b>PRICE</b>\n"
 
-        "✅ 2 confirmation candles "
-        "closed above the second low.\n\n"
+        f"{first_low:.8f} "
+        f"→ "
+        f"{second_low:.8f}\n"
+
+        f"Change: "
+        f"{price_first_to_second:.2f}%\n\n"
+
+        "📈 <b>RSI</b>\n"
+
+        f"{state['first_rsi']:.2f} "
+        f"→ "
+        f"{state['second_rsi']:.2f} "
+        f"→ "
+        f"{signal_rsi:.2f}\n\n"
+
+        "🚀 <b>RSI 30 ABOVE</b>\n"
+
+        f"Signal Price: "
+        f"{signal_price:.8f}\n"
+
+        f"RSI: "
+        f"{signal_rsi:.2f}\n"
+
+        f"Price movement from 2nd low: "
+        f"+{price_second_to_signal:.2f}%\n\n"
+
+        "✅ <b>RSI closed above 30.</b>\n\n"
 
         "🔄 <b>Setup completed.</b>\n"
+
         "Bot is now looking for a "
-        "<b>NEW first low</b>."
+        "<b>NEW FIRST LOW</b>."
     )
 
-    send_telegram(message)
+    send_telegram(
+        message,
+        state["symbol"]
+    )
 
 
 # ============================================================
@@ -736,11 +888,11 @@ def process_first_low(
     rsi_value
 ):
 
-    # First low-dan sonra gələn yeni şam
+    # First low-dan sonra gələn hər yeni şam
     state["bars_since_first"] += 1
 
     # ========================================================
-    # SECOND LOW CONFIRMATION
+    # SECOND LOW ARTİQ TAPILIB
     # ========================================================
 
     if state["candidate_active"]:
@@ -750,10 +902,13 @@ def process_first_low(
         ]
 
         # ----------------------------------------------------
-        # TƏSDİQ ZAMANI DAHA AŞAĞI LOW GƏLDİ
+        # ÇOX VACİB:
         #
-        # Köhnə first low silinir.
-        # Yeni aşağı şam yeni first low olur.
+        # RSI 30 olmamış qiymət 2-ci dibdən aşağı düşərsə:
+        #
+        # 2-ci dib -> yeni 1-ci dib
+        #
+        # Köhnə 1-ci dib tam silinir.
         # ----------------------------------------------------
 
         if candle["low"] < second_low:
@@ -761,71 +916,25 @@ def process_first_low(
             print(
                 f"{state['symbol']} "
                 f"{state['interval']} -> "
-                f"Lower low during confirmation. "
-                f"New first low."
+                f"Price broke SECOND LOW before "
+                f"RSI crossed 30."
             )
-
-            make_new_first_low(
-                state,
-                candle,
-                rsi_value
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # CLOSE SECOND LOW-DAN YUXARIDADIR?
-        # ----------------------------------------------------
-
-        if candle["close"] > second_low:
-
-            state["confirmation_count"] += 1
 
             print(
                 f"{state['symbol']} "
                 f"{state['interval']} -> "
-                f"Confirmation "
-                f"{state['confirmation_count']}/2"
+                f"OLD FIRST LOW DELETED."
             )
-
-            # ------------------------------------------------
-            # 2 TƏSDİQ ŞAMI TAMAMLANDI
-            # ------------------------------------------------
-
-            if state[
-                "confirmation_count"
-            ] >= 2:
-
-                send_rsi_signal(
-                    state
-                )
-
-                # Bütün setup silinir.
-                #
-                # Köhnə tarixçəyə qayıdılmır.
-                reset_setup(
-                    state
-                )
-
-                return
-
-        else:
-
-            # ------------------------------------------------
-            # CLOSE ikinci dibdən yuxarı bağlanmadı.
-            #
-            # Amma LOW ikinci dibdən aşağı da deyil.
-            #
-            # Candidate uğursuz olur.
-            # İkinci dib yeni first low kimi qəbul edilir.
-            # ------------------------------------------------
 
             print(
                 f"{state['symbol']} "
                 f"{state['interval']} -> "
-                f"Second-low confirmation failed. "
-                f"Second low becomes new first low."
+                f"SECOND LOW becomes NEW FIRST LOW."
             )
+
+            # ------------------------------------------------
+            # 2-ci dib yeni 1-ci dib olur.
+            # ------------------------------------------------
 
             state["first_low"] = (
                 state["second_low"]
@@ -839,6 +948,10 @@ def process_first_low(
                 state["second_time"]
             )
 
+            # ------------------------------------------------
+            # Yeni first low-dan yeni 50 şamlıq dövr.
+            # ------------------------------------------------
+
             state["bars_since_first"] = 0
 
             state["candidate_active"] = False
@@ -849,7 +962,52 @@ def process_first_low(
 
             state["second_time"] = None
 
-            state["confirmation_count"] = 0
+            return
+
+        # ----------------------------------------------------
+        # ƏSAS YENİ ŞƏRT:
+        #
+        # Son bağlanmış şam RSI 30-dan yuxarı bağlanıb?
+        # ----------------------------------------------------
+
+        if rsi_value > RSI_OVERBOUGHT_LEVEL:
+
+            print(
+                f"{state['symbol']} "
+                f"{state['interval']} -> "
+                f"RSI crossed above 30."
+            )
+
+            print(
+                f"{state['symbol']} "
+                f"{state['interval']} -> "
+                f"SIGNAL."
+            )
+
+            send_rsi_signal(
+                state,
+                candle["close"],
+                rsi_value
+            )
+
+            # ------------------------------------------------
+            # Signal-dan sonra bütün setup silinir.
+            # ------------------------------------------------
+
+            reset_setup(
+                state
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # RSI hələ 30-dan aşağıdır.
+        #
+        # Nə siqnal var,
+        # nə də reset.
+        #
+        # Növbəti bağlanan şam gözlənilir.
+        # ----------------------------------------------------
 
         return
 
@@ -864,8 +1022,14 @@ def process_first_low(
         print(
             f"{state['symbol']} "
             f"{state['interval']} -> "
-            f"50 candles passed. "
-            f"First low deleted."
+            f"50 candles passed without "
+            f"valid second low."
+        )
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"FIRST LOW deleted."
         )
 
         reset_setup(
@@ -881,10 +1045,33 @@ def process_first_low(
     if candle["low"] < state["first_low"]:
 
         # ----------------------------------------------------
-        # RSI HIGHER LOW
+        # ƏVVƏL RSI ŞƏRTLƏRİ
+        #
+        # HƏM 1-ci, HƏM 2-ci RSI 30-dan aşağı.
+        # 2-ci RSI 1-ci RSI-dan yüksək.
         # ----------------------------------------------------
 
-        if rsi_value > state["first_rsi"]:
+        valid_rsi_divergence = (
+
+            state["first_rsi"]
+            < RSI_OVERBOUGHT_LEVEL
+
+            and
+
+            rsi_value
+            < RSI_OVERBOUGHT_LEVEL
+
+            and
+
+            rsi_value
+            > state["first_rsi"]
+        )
+
+        if valid_rsi_divergence:
+
+            # ------------------------------------------------
+            # VALID SECOND LOW
+            # ------------------------------------------------
 
             state["candidate_active"] = True
 
@@ -900,43 +1087,67 @@ def process_first_low(
                 candle["time"]
             )
 
-            state["confirmation_count"] = 0
+            print(
+                f"{state['symbol']} "
+                f"{state['interval']} -> "
+                f"VALID SECOND LOW FOUND"
+            )
+
+            print(
+                f"First Low: "
+                f"{state['first_low']}"
+            )
+
+            print(
+                f"First RSI: "
+                f"{state['first_rsi']:.2f}"
+            )
+
+            print(
+                f"Second Low: "
+                f"{state['second_low']}"
+            )
+
+            print(
+                f"Second RSI: "
+                f"{state['second_rsi']:.2f}"
+            )
 
             print(
                 f"{state['symbol']} "
                 f"{state['interval']} -> "
-                f"POTENTIAL SECOND LOW: "
-                f"{candle['low']} | "
-                f"RSI: {rsi_value:.2f}"
+                f"Now waiting for RSI > 30."
             )
 
             return
 
         # ----------------------------------------------------
-        # PRICE LOWER LOW VAR
-        # RSI HIGHER LOW YOXDUR
+        # PRICE LOWER LOW VAR,
+        # AMMA RSI ŞƏRTİ ÖDƏNMƏYİB.
         #
-        # Köhnə first low silinir.
-        # Cari şam yeni first low olur.
+        # Cari şam yeni 1-ci dib olur.
         # ----------------------------------------------------
 
-        else:
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"Lower low found, but RSI divergence "
+            f"condition failed."
+        )
 
-            print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"Lower low found, but RSI "
-                f"condition failed. "
-                f"Current candle becomes new first low."
-            )
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"Current candle becomes NEW FIRST LOW."
+        )
 
-            make_new_first_low(
-                state,
-                candle,
-                rsi_value
-            )
+        make_new_first_low(
+            state,
+            candle,
+            rsi_value
+        )
 
-            return
+        return
 
 
 # ============================================================
@@ -982,7 +1193,7 @@ def process_symbol_interval(
     )
 
     # ========================================================
-    # FIRST STARTUP
+    # STARTUP
     # ========================================================
 
     if not state[
@@ -1024,6 +1235,7 @@ def process_symbol_interval(
             new_indices.append(i)
 
     if not new_indices:
+
         return
 
     # ========================================================
@@ -1150,7 +1362,13 @@ def main():
     print("=" * 60)
 
     print(
-        f"RSI Period: {RSI_PERIOD}"
+        f"RSI Period: "
+        f"{RSI_PERIOD}"
+    )
+
+    print(
+        f"RSI level: "
+        f"< {RSI_OVERBOUGHT_LEVEL}"
     )
 
     print(
