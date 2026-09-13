@@ -5,48 +5,90 @@ from datetime import datetime, timezone
 
 
 # ============================================================
-# BINANCE RSI BULLISH DIVERGENCE LIVE ALERT BOT
+# BINANCE RSI BULLISH DIVERGENCE + MOMENTUM CONFIRMATION BOT
 # ============================================================
 #
 # STRATEGY
 #
-# 1) BOT STARTUP:
-#    Binance-dan əvvəlki 50 bağlanmış şam götürülür.
-#    Bu 50 şam yalnız müqayisə bazasıdır.
-#    Tarixi 1-ci dib seçilmir.
+# 1) STARTUP:
+#    Previous 50 CLOSED candles are loaded only as a
+#    comparison baseline.
 #
-# 2) DİBSİZ VƏZİYYƏT:
-#    Yeni şam əvvəlki 50 şamın hamısından aşağı low edərsə
-#    həmin şam yeni 1-ci dib olur.
+# 2) FIRST LOW:
+#    A new candle becomes FIRST LOW if its low is below
+#    all previous 50 closed candles.
 #
-# 3) FIRST LOW:
-#    1-ci dibdən sonra maksimum 50 bağlanmış şam ərzində
-#    2-ci dib axtarılır.
+# 3) SECOND LOW:
+#    Price must make a lower low than FIRST LOW.
 #
-# 4) SECOND LOW:
-#    - 2-ci dib qiyməti 1-ci dibdən aşağı olmalıdır.
-#    - 1-ci RSI < 30
-#    - 2-ci RSI < 30
-#    - 2-ci RSI > 1-ci RSI
+#    RSI conditions:
+#       - First RSI < 30
+#       - Second RSI < 30
+#       - Second RSI > First RSI
 #
-# 5) SECOND LOW ŞƏRTLƏRİ ÖDƏNƏNDƏ:
-#    Daha 2 şam gözlənilmir.
-#    Sonrakı bağlanan şamların RSI-si izlənilir.
+# 4) IMPORTANT CHANGE:
 #
-# 6) RSI > 30:
-#    Son bağlanan şam RSI 30-dan yuxarı bağlanarsa
-#    TARGET SIGNAL göndərilir.
+#    RSI > 30 NO LONGER MEANS IMMEDIATE BUY.
 #
-# 7) RSI 30 OLMADAN QİYMƏT 2-Cİ DİBDƏN AŞAĞI DÜŞƏRSƏ:
-#    - 2-ci dib ləğv edilir.
-#    - 1-ci dib silinir.
-#    - Köhnə 2-ci dib yeni 1-ci dib olur.
-#    - Həmin yeni 1-ci dibdən yenidən maksimum 50 şam
-#      izlənilir.
+#    RSI > 30 starts a CONFIRMATION PHASE.
 #
-# 8) SIGNAL GƏLDİKDƏ:
-#    Setup tam silinir.
-#    Bot yeni 1-ci dib axtarışına keçir.
+# 5) CONFIRMATION PHASE:
+#
+#    After RSI closes above 30, the bot analyzes the next
+#    3 CLOSED candles.
+#
+#    It checks:
+#
+#       - RSI remains above 30
+#       - Price remains above SECOND LOW
+#       - Taker BUY pressure
+#       - BUY/SELL percentage
+#       - Volume strength
+#       - Price momentum
+#       - ATR recovery from SECOND LOW
+#       - Candle closing strength
+#       - Sudden selling pressure
+#
+# 6) BUY PRESSURE:
+#
+#    Binance kline data:
+#
+#       Total Quote Volume
+#       Taker Buy Quote Volume
+#
+#    Estimated Sell Quote Volume:
+#
+#       Sell = Total - Taker Buy
+#
+#    Buy percentage:
+#
+#       Buy / Total * 100
+#
+# 7) ATR:
+#
+#    Confirmation requires price to move at least
+#    0.5 ATR above SECOND LOW.
+#
+# 8) SELLING PRESSURE PROTECTION:
+#
+#    If a large-volume candle appears with strong selling
+#    pressure, confirmation is rejected.
+#
+# 9) RSI FAILURE:
+#
+#    If RSI goes back below 30 during confirmation,
+#    confirmation is cancelled.
+#
+# 10) SECOND LOW BREAK:
+#
+#    If price breaks SECOND LOW:
+#
+#       - Current setup is cancelled.
+#       - SECOND LOW becomes NEW FIRST LOW.
+#
+# 11) SIGNAL:
+#
+#    BUY signal is sent only after confirmation passes.
 #
 # ============================================================
 
@@ -61,13 +103,105 @@ RSI_PERIOD = 6
 
 LOOKBACK_CANDLES = 50
 
-RSI_OVERBOUGHT_LEVEL = 30
+RSI_LEVEL = 30
 
 RSI_TIMEFRAMES = [
     "15m",
     "30m",
     "1h"
 ]
+
+
+# ============================================================
+# CONFIRMATION SETTINGS
+# ============================================================
+
+# RSI 30-dan sonra neçə bağlanmış şam analiz ediləcək
+CONFIRMATION_CANDLES = 3
+
+
+# 2-ci dibdən minimum recovery:
+#
+# 0.5 ATR = qiymət 2-ci dibdən ən azı yarım ATR
+# yuxarı qalxmalıdır.
+#
+ATR_PERIOD = 14
+
+ATR_RECOVERY_MULTIPLIER = 0.50
+
+
+# ------------------------------------------------------------
+# BUY PRESSURE
+# ------------------------------------------------------------
+
+# Hər confirmation şamında minimum BUY %
+#
+# Məsələn:
+# 60% buy / 40% sell -> keçir
+# 52% buy / 48% sell -> keçmir
+#
+MIN_BUY_PERCENT = 55.0
+
+
+# Son 3 şamın orta BUY faizi
+MIN_AVG_BUY_PERCENT = 57.0
+
+
+# Son 3 şamın ən az neçə dənəsində BUY > SELL olmalıdır
+MIN_BUY_DOMINANCE_CANDLES = 2
+
+
+# ------------------------------------------------------------
+# MOMENTUM
+# ------------------------------------------------------------
+
+# Son 3 şamın maksimum close qiyməti 2-ci dibdən
+# ən azı bu qədər ATR uzaqda olmalıdır.
+MIN_PRICE_RECOVERY_ATR = 0.50
+
+
+# Son confirmation şamının close-u əvvəlki close-dan
+# ən azı bu qədər yaxşı olmalıdır.
+#
+# 0.0 = sadəcə yuxarı bağlanması kifayətdir.
+MIN_LAST_CLOSE_PROGRESS_ATR = 0.05
+
+
+# ------------------------------------------------------------
+# VOLUME
+# ------------------------------------------------------------
+
+# Son confirmation şamı əvvəlki 20 şamın orta
+# həcminin bundan az hissəsidirsə, momentum zəif hesab edilir.
+MIN_VOLUME_VS_AVG20 = 0.80
+
+
+# Böyük satış şamını müəyyən etmək üçün:
+#
+# Əgər volume >= AVG20 * 1.5
+# və SELL >= 60%
+# olarsa -> güclü satış təzyiqi
+#
+SELL_VOLUME_SPIKE_MULTIPLIER = 1.50
+
+STRONG_SELL_PERCENT = 60.0
+
+
+# ------------------------------------------------------------
+# CANDLE QUALITY
+# ------------------------------------------------------------
+
+# Son confirmation şamında close-un candle range daxilində
+# minimum yerləşmə faizi.
+#
+# 0.60 = close range-in yuxarı 60%-lik hissəsində olmalıdır.
+#
+MIN_CLOSE_LOCATION = 0.60
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN"
@@ -118,7 +252,7 @@ def send_telegram(
     }
 
     # --------------------------------------------------------
-    # COIN ÜZƏRİNƏ BASANDA BİNANCE AÇILSIN
+    # COIN ÜZƏRİNƏ BASANDA BINANCE AÇILSIN
     # --------------------------------------------------------
 
     if symbol:
@@ -296,12 +430,60 @@ def get_klines(
 
         for k in data:
 
+            total_quote_volume = float(k[7])
+
+            taker_buy_quote_volume = float(k[10])
+
+            taker_sell_quote_volume = (
+                total_quote_volume
+                - taker_buy_quote_volume
+            )
+
+            if total_quote_volume > 0:
+
+                buy_percent = (
+                    taker_buy_quote_volume
+                    / total_quote_volume
+                ) * 100
+
+                sell_percent = (
+                    taker_sell_quote_volume
+                    / total_quote_volume
+                ) * 100
+
+            else:
+
+                buy_percent = 0.0
+
+                sell_percent = 0.0
+
             candles.append({
+
                 "time": int(k[0]),
+
                 "open": float(k[1]),
+
                 "high": float(k[2]),
+
                 "low": float(k[3]),
-                "close": float(k[4])
+
+                "close": float(k[4]),
+
+                "volume": float(k[5]),
+
+                "quote_volume": total_quote_volume,
+
+                "buy_quote_volume":
+                    taker_buy_quote_volume,
+
+                "sell_quote_volume":
+                    taker_sell_quote_volume,
+
+                "buy_percent":
+                    buy_percent,
+
+                "sell_percent":
+                    sell_percent
             })
 
         return candles
@@ -334,10 +516,11 @@ def get_closed_candles(
     )
 
     if len(candles) < 2:
+
         return []
 
-    # Son Binance kline hazırda formalaşan şamdır.
-    # Son şam çıxarılır.
+    # Son kline hələ formalaşır.
+    # Onu çıxarırıq.
     return candles[:-1]
 
 
@@ -476,6 +659,94 @@ def calculate_rsi(
 
 
 # ============================================================
+# ATR
+# ============================================================
+
+def calculate_atr(
+    candles,
+    period=14
+):
+
+    if len(candles) <= period:
+
+        return [
+            None
+            for _ in candles
+        ]
+
+    atr = [
+        None
+        for _ in candles
+    ]
+
+    true_ranges = []
+
+    for i in range(
+        len(candles)
+    ):
+
+        high = candles[i]["high"]
+
+        low = candles[i]["low"]
+
+        if i == 0:
+
+            tr = high - low
+
+        else:
+
+            previous_close = (
+                candles[i - 1]["close"]
+            )
+
+            tr = max(
+                high - low,
+                abs(
+                    high
+                    - previous_close
+                ),
+                abs(
+                    low
+                    - previous_close
+                )
+            )
+
+        true_ranges.append(tr)
+
+    initial_atr = (
+        sum(
+            true_ranges[
+                1:period + 1
+            ]
+        )
+        / period
+    )
+
+    atr[period] = initial_atr
+
+    previous_atr = initial_atr
+
+    for i in range(
+        period + 1,
+        len(candles)
+    ):
+
+        current_atr = (
+            (
+                previous_atr
+                * (period - 1)
+            )
+            + true_ranges[i]
+        ) / period
+
+        atr[i] = current_atr
+
+        previous_atr = current_atr
+
+    return atr
+
+
+# ============================================================
 # NEW STATE
 # ============================================================
 
@@ -492,7 +763,7 @@ def new_state():
         "last_candle_time": None,
 
         # ----------------------------------------------------
-        # DİBSİZ VƏZİYYƏTDƏ 50-LİK MÜQAYİSƏ BAZASI
+        # 50-CANDLE COMPARISON WINDOW
         # ----------------------------------------------------
 
         "comparison_window": [],
@@ -520,6 +791,22 @@ def new_state():
         "second_rsi": None,
 
         "second_time": None,
+
+        # ----------------------------------------------------
+        # RSI RECLAIM / CONFIRMATION
+        # ----------------------------------------------------
+
+        "confirmation_active": False,
+
+        "confirmation_candles": [],
+
+        "reclaim_time": None,
+
+        "reclaim_price": None,
+
+        "reclaim_rsi": None,
+
+        "reclaim_atr": None,
 
         # ----------------------------------------------------
         # INFO
@@ -553,10 +840,19 @@ def reset_setup(state):
 
     state["second_time"] = None
 
-    # --------------------------------------------------------
-    # Köhnə tarixçəyə qayıtmaq yoxdur.
-    # Yeni rolling 50 şam bazası gələcək şamlardan qurulur.
-    # --------------------------------------------------------
+    state["confirmation_active"] = False
+
+    state["confirmation_candles"] = []
+
+    state["reclaim_time"] = None
+
+    state["reclaim_price"] = None
+
+    state["reclaim_rsi"] = None
+
+    state["reclaim_atr"] = None
+
+    # Köhnə tarixçə yenidən istifadə edilmir.
 
     state["comparison_window"] = []
 
@@ -575,14 +871,6 @@ def startup_initialize(
 
         return False
 
-    # --------------------------------------------------------
-    # BOT BAŞLAYANDA ALINAN ƏVVƏLKİ 50 BAĞLANMIŞ ŞAM
-    #
-    # YALNIZ MÜQAYİSƏ BAZASIDIR.
-    #
-    # Bu 50 şamdan 1-ci dib seçilmir.
-    # --------------------------------------------------------
-
     state["comparison_window"] = []
 
     start_index = (
@@ -597,11 +885,14 @@ def startup_initialize(
 
         state["comparison_window"].append({
 
-            "time": candles[i]["time"],
+            "time":
+                candles[i]["time"],
 
-            "low": candles[i]["low"],
+            "low":
+                candles[i]["low"],
 
-            "rsi": rsi_values[i]
+            "rsi":
+                rsi_values[i]
 
         })
 
@@ -614,8 +905,8 @@ def startup_initialize(
     print(
         f"{state['symbol']} "
         f"{state['interval']} -> "
-        f"STARTUP: previous 50 closed candles "
-        f"loaded as comparison baseline."
+        f"STARTUP: previous 50 closed "
+        f"candles loaded."
     )
 
     print(
@@ -659,6 +950,18 @@ def make_new_first_low(
 
     state["second_time"] = None
 
+    state["confirmation_active"] = False
+
+    state["confirmation_candles"] = []
+
+    state["reclaim_time"] = None
+
+    state["reclaim_price"] = None
+
+    state["reclaim_rsi"] = None
+
+    state["reclaim_atr"] = None
+
     print(
         f"{state['symbol']} "
         f"{state['interval']} -> "
@@ -669,7 +972,7 @@ def make_new_first_low(
 
 
 # ============================================================
-# DİBSİZ VƏZİYYƏT
+# NO FIRST LOW
 # ============================================================
 
 def process_no_first_low(
@@ -682,34 +985,29 @@ def process_no_first_low(
         "comparison_window"
     ]
 
-    # --------------------------------------------------------
-    # 50 şam tamamlanana qədər baza qurulur.
-    # --------------------------------------------------------
-
     if len(window) < LOOKBACK_CANDLES:
 
         window.append({
 
-            "time": candle["time"],
+            "time":
+                candle["time"],
 
-            "low": candle["low"],
+            "low":
+                candle["low"],
 
-            "rsi": rsi_value
+            "rsi":
+                rsi_value
 
         })
 
         print(
             f"{state['symbol']} "
             f"{state['interval']} -> "
-            f"Building new 50-candle comparison "
-            f"window: {len(window)}/50"
+            f"Building comparison window: "
+            f"{len(window)}/50"
         )
 
         return
-
-    # --------------------------------------------------------
-    # Yeni şam əvvəlki 50 şamın hamısından aşağıdır?
-    # --------------------------------------------------------
 
     lowest_previous_50 = min(
         item["low"]
@@ -724,27 +1022,100 @@ def process_no_first_low(
             rsi_value
         )
 
-        # Yeni first low-dan setup başlayır.
         state["comparison_window"] = []
 
         return
-
-    # --------------------------------------------------------
-    # Rolling 50:
-    # ən köhnə çıxır, yeni şam daxil olur.
-    # --------------------------------------------------------
 
     window.pop(0)
 
     window.append({
 
-        "time": candle["time"],
+        "time":
+            candle["time"],
 
-        "low": candle["low"],
+        "low":
+            candle["low"],
 
-        "rsi": rsi_value
+        "rsi":
+            rsi_value
 
     })
+
+
+# ============================================================
+# CANDLE ANALYSIS HELPERS
+# ============================================================
+
+def candle_close_location(candle):
+
+    candle_range = (
+        candle["high"]
+        - candle["low"]
+    )
+
+    if candle_range <= 0:
+
+        return 0.0
+
+    return (
+        (
+            candle["close"]
+            - candle["low"]
+        )
+        / candle_range
+    )
+
+
+def is_strong_selling_candle(
+    candle,
+    average_volume
+):
+
+    if average_volume <= 0:
+
+        return False
+
+    volume_spike = (
+        candle["volume"]
+        >= (
+            average_volume
+            * SELL_VOLUME_SPIKE_MULTIPLIER
+        )
+    )
+
+    strong_sell = (
+        candle["sell_percent"]
+        >= STRONG_SELL_PERCENT
+    )
+
+    return (
+        volume_spike
+        and strong_sell
+    )
+
+
+def get_average_volume(
+    candles,
+    count=20
+):
+
+    if not candles:
+
+        return 0.0
+
+    selected = candles[-count:]
+
+    if not selected:
+
+        return 0.0
+
+    return (
+        sum(
+            candle["volume"]
+            for candle in selected
+        )
+        / len(selected)
+    )
 
 
 # ============================================================
@@ -754,7 +1125,8 @@ def process_no_first_low(
 def send_rsi_signal(
     state,
     signal_price,
-    signal_rsi
+    signal_rsi,
+    confirmation_data
 ):
 
     first_time = datetime.fromtimestamp(
@@ -771,6 +1143,13 @@ def send_rsi_signal(
         "%Y-%m-%d %H:%M:%S UTC"
     )
 
+    reclaim_time = datetime.fromtimestamp(
+        state["reclaim_time"] / 1000,
+        tz=timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
     first_low = state[
         "first_low"
     ]
@@ -778,10 +1157,6 @@ def send_rsi_signal(
     second_low = state[
         "second_low"
     ]
-
-    # --------------------------------------------------------
-    # 1-ci dib -> 2-ci dib qiymət dəyişimi
-    # --------------------------------------------------------
 
     price_first_to_second = (
         (
@@ -791,14 +1166,6 @@ def send_rsi_signal(
         / first_low
     ) * 100
 
-    # --------------------------------------------------------
-    # 2-ci dib -> RSI 30 üzərinə çıxan qiymət
-    #
-    # İSTƏDİYİN:
-    # RSI-nin faizini yox,
-    # QİYMƏTİN neçə faiz qalxdığını göstərmək.
-    # --------------------------------------------------------
-
     price_second_to_signal = (
         (
             signal_price
@@ -806,6 +1173,39 @@ def send_rsi_signal(
         )
         / second_low
     ) * 100
+
+    atr_value = (
+        state["reclaim_atr"]
+    )
+
+    if atr_value and atr_value > 0:
+
+        atr_recovery = (
+            signal_price
+            - second_low
+        ) / atr_value
+
+    else:
+
+        atr_recovery = 0.0
+
+    avg_buy = confirmation_data[
+        "avg_buy_percent"
+    ]
+
+    buy_dominance = confirmation_data[
+        "buy_dominance"
+    ]
+
+    volume_ratio = confirmation_data[
+        "volume_ratio"
+    ]
+
+    momentum_percent = (
+        confirmation_data[
+            "momentum_percent"
+        ]
+    )
 
     message = (
 
@@ -853,7 +1253,36 @@ def send_rsi_signal(
         f"→ "
         f"{signal_rsi:.2f}\n\n"
 
-        "🚀 <b>RSI 30 ABOVE</b>\n"
+        "🔓 <b>RSI 30 RECLAIM</b>\n"
+
+        f"Price: "
+        f"{state['reclaim_price']:.8f}\n"
+
+        f"RSI: "
+        f"{state['reclaim_rsi']:.2f}\n"
+
+        f"Time: "
+        f"{reclaim_time}\n\n"
+
+        "📊 <b>MOMENTUM CONFIRMATION</b>\n"
+
+        f"Avg Buy Pressure: "
+        f"{avg_buy:.1f}%\n"
+
+        f"BUY Dominance: "
+        f"{buy_dominance}/"
+        f"{CONFIRMATION_CANDLES} candles\n"
+
+        f"Volume / Avg20: "
+        f"{volume_ratio:.2f}x\n"
+
+        f"Price Momentum: "
+        f"+{momentum_percent:.2f}%\n"
+
+        f"ATR Recovery: "
+        f"{atr_recovery:.2f} ATR\n\n"
+
+        "🟢 <b>BUY CONFIRMED</b>\n"
 
         f"Signal Price: "
         f"{signal_price:.8f}\n"
@@ -861,10 +1290,13 @@ def send_rsi_signal(
         f"RSI: "
         f"{signal_rsi:.2f}\n"
 
-        f"Price movement from 2nd low: "
+        f"From 2nd Low: "
         f"+{price_second_to_signal:.2f}%\n\n"
 
-        "✅ <b>RSI closed above 30.</b>\n\n"
+        "🛡️ <b>CONFIRMATION PASSED</b>\n"
+
+        "Buy pressure + momentum + volume "
+        "were sufficient.\n\n"
 
         "🔄 <b>Setup completed.</b>\n"
 
@@ -879,36 +1311,390 @@ def send_rsi_signal(
 
 
 # ============================================================
-# FIRST LOW VAR
+# CONFIRMATION ANALYSIS
+# ============================================================
+
+def analyze_confirmation(
+    state,
+    candles,
+    rsi_values,
+    atr_values,
+    current_index
+):
+
+    confirmation = state[
+        "confirmation_candles"
+    ]
+
+    if len(confirmation) < CONFIRMATION_CANDLES:
+
+        return False, None
+
+    second_low = state[
+        "second_low"
+    ]
+
+    # --------------------------------------------------------
+    # RSI CHECK
+    # --------------------------------------------------------
+
+    for item in confirmation:
+
+        if item["rsi"] <= RSI_LEVEL:
+
+            print(
+                f"{state['symbol']} "
+                f"{state['interval']} -> "
+                f"CONFIRMATION FAILED: "
+                f"RSI returned below/equal 30."
+            )
+
+            return False, None
+
+    # --------------------------------------------------------
+    # SECOND LOW PROTECTION
+    # --------------------------------------------------------
+
+    for item in confirmation:
+
+        if item["low"] < second_low:
+
+            print(
+                f"{state['symbol']} "
+                f"{state['interval']} -> "
+                f"CONFIRMATION FAILED: "
+                f"Second low broken."
+            )
+
+            return False, None
+
+    # --------------------------------------------------------
+    # BUY PRESSURE
+    # --------------------------------------------------------
+
+    buy_percentages = [
+        item["buy_percent"]
+        for item in confirmation
+    ]
+
+    avg_buy_percent = (
+        sum(buy_percentages)
+        / len(buy_percentages)
+    )
+
+    buy_dominance = sum(
+        1
+        for item in confirmation
+        if item["buy_percent"]
+        > item["sell_percent"]
+    )
+
+    each_buy_ok = all(
+        item["buy_percent"]
+        >= MIN_BUY_PERCENT
+        for item in confirmation
+    )
+
+    avg_buy_ok = (
+        avg_buy_percent
+        >= MIN_AVG_BUY_PERCENT
+    )
+
+    dominance_ok = (
+        buy_dominance
+        >= MIN_BUY_DOMINANCE_CANDLES
+    )
+
+    if not each_buy_ok:
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"CONFIRMATION FAILED: "
+            f"BUY pressure too weak."
+        )
+
+        return False, None
+
+    if not avg_buy_ok:
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"CONFIRMATION FAILED: "
+            f"Average BUY pressure "
+            f"{avg_buy_percent:.1f}%."
+        )
+
+        return False, None
+
+    if not dominance_ok:
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"CONFIRMATION FAILED: "
+            f"BUY dominance insufficient."
+        )
+
+        return False, None
+
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    confirmation_candles_data = []
+
+    for item in confirmation:
+
+        confirmation_candles_data.append(
+            item["candle"]
+        )
+
+    # Cari confirmation şamından əvvəlki
+    # 20 şamın həcmini hesablamaq.
+    #
+    # current_index daxilində əvvəlki 20 bağlanmış şam.
+    # Son confirmation şamını orta hesablamaya daxil etmirik.
+    # --------------------------------------------------------
+
+    start = max(
+        0,
+        current_index - 20
+    )
+
+    previous_volume_candles = (
+        candles[start:current_index]
+    )
+
+    average_volume = get_average_volume(
+        previous_volume_candles,
+        20
+    )
+
+    latest_candle = (
+        confirmation[-1]["candle"]
+    )
+
+    if average_volume > 0:
+
+        volume_ratio = (
+            latest_candle["volume"]
+            / average_volume
+        )
+
+    else:
+
+        volume_ratio = 0.0
+
+    if volume_ratio < MIN_VOLUME_VS_AVG20:
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"CONFIRMATION FAILED: "
+            f"Volume too weak."
+        )
+
+        return False, None
+
+    # --------------------------------------------------------
+    # STRONG SELLING SPIKE
+    # --------------------------------------------------------
+
+    for item in confirmation:
+
+        candle = item["candle"]
+
+        if is_strong_selling_candle(
+            candle,
+            average_volume
+        ):
+
+            print(
+                f"{state['symbol']} "
+                f"{state['interval']} -> "
+                f"CONFIRMATION FAILED: "
+                f"Strong selling volume spike."
+            )
+
+            print(
+                f"SELL: "
+                f"{candle['sell_percent']:.1f}%"
+            )
+
+            print(
+                f"Volume ratio: "
+                f"{candle['volume'] / average_volume:.2f}x"
+            )
+
+            return False, None
+
+    # --------------------------------------------------------
+    # ATR RECOVERY
+    # --------------------------------------------------------
+
+    atr_value = state[
+        "reclaim_atr"
+    ]
+
+    if (
+        atr_value is None
+        or atr_value <= 0
+    ):
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"CONFIRMATION FAILED: "
+            f"ATR unavailable."
+        )
+
+        return False, None
+
+    maximum_close = max(
+        item["candle"]["close"]
+        for item in confirmation
+    )
+
+    recovery_atr = (
+        maximum_close
+        - second_low
+    ) / atr_value
+
+    if recovery_atr < MIN_PRICE_RECOVERY_ATR:
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"CONFIRMATION FAILED: "
+            f"Price recovery only "
+            f"{recovery_atr:.2f} ATR."
+        )
+
+        return False, None
+
+    # --------------------------------------------------------
+    # PRICE MOMENTUM
+    # --------------------------------------------------------
+
+    first_confirmation_close = (
+        confirmation[0]["candle"]["close"]
+    )
+
+    last_confirmation_close = (
+        confirmation[-1]["candle"]["close"]
+    )
+
+    momentum_percent = (
+        (
+            last_confirmation_close
+            - first_confirmation_close
+        )
+        / first_confirmation_close
+    ) * 100
+
+    minimum_progress = (
+        atr_value
+        * MIN_LAST_CLOSE_PROGRESS_ATR
+    )
+
+    price_progress = (
+        last_confirmation_close
+        - first_confirmation_close
+    )
+
+    if price_progress < minimum_progress:
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"CONFIRMATION FAILED: "
+            f"Momentum too weak."
+        )
+
+        return False, None
+
+    # --------------------------------------------------------
+    # LAST CANDLE QUALITY
+    # --------------------------------------------------------
+
+    latest_close_location = (
+        candle_close_location(
+            latest_candle
+        )
+    )
+
+    if (
+        latest_close_location
+        < MIN_CLOSE_LOCATION
+    ):
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"CONFIRMATION FAILED: "
+            f"Latest candle closed too low "
+            f"inside its range."
+        )
+
+        return False, None
+
+    # --------------------------------------------------------
+    # ALL PASSED
+    # --------------------------------------------------------
+
+    confirmation_data = {
+
+        "avg_buy_percent":
+            avg_buy_percent,
+
+        "buy_dominance":
+            buy_dominance,
+
+        "volume_ratio":
+            volume_ratio,
+
+        "momentum_percent":
+            momentum_percent
+    }
+
+    print(
+        f"{state['symbol']} "
+        f"{state['interval']} -> "
+        f"ALL CONFIRMATION CONDITIONS PASSED."
+    )
+
+    return True, confirmation_data
+
+
+# ============================================================
+# PROCESS FIRST LOW
 # ============================================================
 
 def process_first_low(
     state,
     candle,
-    rsi_value
+    rsi_value,
+    atr_value,
+    candles,
+    current_index
 ):
 
-    # First low-dan sonra gələn hər yeni şam
     state["bars_since_first"] += 1
 
     # ========================================================
-    # SECOND LOW ARTİQ TAPILIB
+    # CONFIRMATION PHASE
     # ========================================================
 
-    if state["candidate_active"]:
+    if state["confirmation_active"]:
 
         second_low = state[
             "second_low"
         ]
 
         # ----------------------------------------------------
-        # ÇOX VACİB:
-        #
-        # RSI 30 olmamış qiymət 2-ci dibdən aşağı düşərsə:
-        #
-        # 2-ci dib -> yeni 1-ci dib
-        #
-        # Köhnə 1-ci dib tam silinir.
+        # 2-ci dibin altına düşmə
         # ----------------------------------------------------
 
         if candle["low"] < second_low:
@@ -916,25 +1702,15 @@ def process_first_low(
             print(
                 f"{state['symbol']} "
                 f"{state['interval']} -> "
-                f"Price broke SECOND LOW before "
-                f"RSI crossed 30."
+                f"CONFIRMATION CANCELLED."
             )
 
             print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"OLD FIRST LOW DELETED."
+                f"Price broke SECOND LOW: "
+                f"{second_low}"
             )
 
-            print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"SECOND LOW becomes NEW FIRST LOW."
-            )
-
-            # ------------------------------------------------
             # 2-ci dib yeni 1-ci dib olur.
-            # ------------------------------------------------
 
             state["first_low"] = (
                 state["second_low"]
@@ -948,10 +1724,6 @@ def process_first_low(
                 state["second_time"]
             )
 
-            # ------------------------------------------------
-            # Yeni first low-dan yeni 50 şamlıq dövr.
-            # ------------------------------------------------
-
             state["bars_since_first"] = 0
 
             state["candidate_active"] = False
@@ -962,57 +1734,165 @@ def process_first_low(
 
             state["second_time"] = None
 
-            return
+            state["confirmation_active"] = False
 
-        # ----------------------------------------------------
-        # ƏSAS YENİ ŞƏRT:
-        #
-        # Son bağlanmış şam RSI 30-dan yuxarı bağlanıb?
-        # ----------------------------------------------------
+            state["confirmation_candles"] = []
 
-        if rsi_value > RSI_OVERBOUGHT_LEVEL:
+            state["reclaim_time"] = None
 
-            print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"RSI crossed above 30."
-            )
+            state["reclaim_price"] = None
 
-            print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"SIGNAL."
-            )
+            state["reclaim_rsi"] = None
 
-            send_rsi_signal(
-                state,
-                candle["close"],
-                rsi_value
-            )
-
-            # ------------------------------------------------
-            # Signal-dan sonra bütün setup silinir.
-            # ------------------------------------------------
-
-            reset_setup(
-                state
-            )
+            state["reclaim_atr"] = None
 
             return
 
         # ----------------------------------------------------
-        # RSI hələ 30-dan aşağıdır.
-        #
-        # Nə siqnal var,
-        # nə də reset.
-        #
-        # Növbəti bağlanan şam gözlənilir.
+        # RSI yenidən 30 və ya aşağı
         # ----------------------------------------------------
+
+        if rsi_value <= RSI_LEVEL:
+
+            print(
+                f"{state['symbol']} "
+                f"{state['interval']} -> "
+                f"RSI returned to "
+                f"{rsi_value:.2f}."
+            )
+
+            print(
+                f"{state['symbol']} "
+                f"{state['interval']} -> "
+                f"CONFIRMATION CANCELLED."
+            )
+
+            # Burada 2-ci dib tamamilə silinmir.
+            #
+            # Çünki qiymət 2-ci dibdən aşağı düşməyib.
+            #
+            # Sadəcə bu RSI reclaim uğursuz oldu.
+            #
+            # Yenidən 30 üzərinə çıxmasını gözləyirik.
+
+            state["confirmation_active"] = False
+
+            state["confirmation_candles"] = []
+
+            state["reclaim_time"] = None
+
+            state["reclaim_price"] = None
+
+            state["reclaim_rsi"] = None
+
+            state["reclaim_atr"] = None
+
+            return
+
+        # ----------------------------------------------------
+        # Confirmation candle əlavə et
+        # ----------------------------------------------------
+
+        state["confirmation_candles"].append({
+
+            "candle": candle,
+
+            "rsi": rsi_value,
+
+            "buy_percent":
+                candle["buy_percent"],
+
+            "sell_percent":
+                candle["sell_percent"]
+        })
+
+        confirmation_count = len(
+            state["confirmation_candles"]
+        )
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"CONFIRMATION CANDLE "
+            f"{confirmation_count}/"
+            f"{CONFIRMATION_CANDLES}"
+        )
+
+        print(
+            f"RSI: {rsi_value:.2f}"
+        )
+
+        print(
+            f"BUY: "
+            f"{candle['buy_percent']:.1f}%"
+        )
+
+        print(
+            f"SELL: "
+            f"{candle['sell_percent']:.1f}%"
+        )
+
+        # ----------------------------------------------------
+        # 3 şam tamamlandıqda analiz
+        # ----------------------------------------------------
+
+        if (
+            confirmation_count
+            >= CONFIRMATION_CANDLES
+        ):
+
+            passed, confirmation_data = (
+                analyze_confirmation(
+                    state,
+                    candles,
+                    rsi_values=None,
+                    atr_values=None,
+                    current_index=current_index
+                )
+            )
+
+            if passed:
+
+                send_rsi_signal(
+                    state,
+                    candle["close"],
+                    rsi_value,
+                    confirmation_data
+                )
+
+                reset_setup(
+                    state
+                )
+
+                return
+
+            # ------------------------------------------------
+            # Confirmation uğursuz oldu.
+            #
+            # Setup tam silinmir.
+            #
+            # RSI 30 yenidən keçərsə yeni confirmation
+            # başlaya bilər.
+            # ------------------------------------------------
+
+            state["confirmation_active"] = False
+
+            state["confirmation_candles"] = []
+
+            state["reclaim_time"] = None
+
+            state["reclaim_price"] = None
+
+            state["reclaim_rsi"] = None
+
+            state["reclaim_atr"] = None
+
+            return
 
         return
 
     # ========================================================
-    # FIRST LOW-DAN SONRA MAXIMUM 50 ŞAM
+    # MAXIMUM 50 ŞAM
     # ========================================================
 
     if state[
@@ -1022,8 +1902,7 @@ def process_first_low(
         print(
             f"{state['symbol']} "
             f"{state['interval']} -> "
-            f"50 candles passed without "
-            f"valid second low."
+            f"50 candles passed."
         )
 
         print(
@@ -1044,22 +1923,15 @@ def process_first_low(
 
     if candle["low"] < state["first_low"]:
 
-        # ----------------------------------------------------
-        # ƏVVƏL RSI ŞƏRTLƏRİ
-        #
-        # HƏM 1-ci, HƏM 2-ci RSI 30-dan aşağı.
-        # 2-ci RSI 1-ci RSI-dan yüksək.
-        # ----------------------------------------------------
-
         valid_rsi_divergence = (
 
             state["first_rsi"]
-            < RSI_OVERBOUGHT_LEVEL
+            < RSI_LEVEL
 
             and
 
             rsi_value
-            < RSI_OVERBOUGHT_LEVEL
+            < RSI_LEVEL
 
             and
 
@@ -1068,10 +1940,6 @@ def process_first_low(
         )
 
         if valid_rsi_divergence:
-
-            # ------------------------------------------------
-            # VALID SECOND LOW
-            # ------------------------------------------------
 
             state["candidate_active"] = True
 
@@ -1114,37 +1982,113 @@ def process_first_low(
             )
 
             print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
                 f"Now waiting for RSI > 30."
             )
 
             return
 
         # ----------------------------------------------------
-        # PRICE LOWER LOW VAR,
-        # AMMA RSI ŞƏRTİ ÖDƏNMƏYİB.
-        #
-        # Cari şam yeni 1-ci dib olur.
+        # LOWER LOW VAR,
+        # RSI DIVERGENCE YOXDUR
         # ----------------------------------------------------
 
         print(
             f"{state['symbol']} "
             f"{state['interval']} -> "
-            f"Lower low found, but RSI divergence "
-            f"condition failed."
+            f"Lower low found but "
+            f"RSI divergence failed."
         )
 
         print(
-            f"{state['symbol']} "
-            f"{state['interval']} -> "
-            f"Current candle becomes NEW FIRST LOW."
+            f"Current candle becomes "
+            f"NEW FIRST LOW."
         )
 
         make_new_first_low(
             state,
             candle,
             rsi_value
+        )
+
+        return
+
+    # ========================================================
+    # SECOND LOW TAPILIB
+    # AMMA RSI HƏLƏ 30-DAN AŞAĞIDIR
+    #
+    # RSI 30-a qalxanda confirmation başlayacaq.
+    # ========================================================
+
+    if (
+        state["candidate_active"]
+        and rsi_value > RSI_LEVEL
+    ):
+
+        state["confirmation_active"] = True
+
+        state["confirmation_candles"] = []
+
+        state["reclaim_time"] = (
+            candle["time"]
+        )
+
+        state["reclaim_price"] = (
+            candle["close"]
+        )
+
+        state["reclaim_rsi"] = (
+            rsi_value
+        )
+
+        state["reclaim_atr"] = (
+            atr_value
+        )
+
+        # RSI 30-u keçən ilk şam confirmation
+        # şamlarından biri kimi daxil edilir.
+
+        state["confirmation_candles"].append({
+
+            "candle": candle,
+
+            "rsi": rsi_value,
+
+            "buy_percent":
+                candle["buy_percent"],
+
+            "sell_percent":
+                candle["sell_percent"]
+        })
+
+        print(
+            f"{state['symbol']} "
+            f"{state['interval']} -> "
+            f"RSI ABOVE 30."
+        )
+
+        print(
+            f"Price: "
+            f"{candle['close']}"
+        )
+
+        print(
+            f"RSI: "
+            f"{rsi_value:.2f}"
+        )
+
+        print(
+            f"BUY: "
+            f"{candle['buy_percent']:.1f}%"
+        )
+
+        print(
+            f"SELL: "
+            f"{candle['sell_percent']:.1f}%"
+        )
+
+        print(
+            f"Confirmation started: "
+            f"1/{CONFIRMATION_CANDLES}"
         )
 
         return
@@ -1183,13 +2127,20 @@ def process_symbol_interval(
     if len(candles) < (
         LOOKBACK_CANDLES
         + RSI_PERIOD
-        + 5
+        + ATR_PERIOD
+        + 25
     ):
+
         return
 
     rsi_values = calculate_rsi(
         candles,
         RSI_PERIOD
+    )
+
+    atr_values = calculate_atr(
+        candles,
+        ATR_PERIOD
     )
 
     # ========================================================
@@ -1209,7 +2160,7 @@ def process_symbol_interval(
         return
 
     # ========================================================
-    # ONLY NEW CLOSED CANDLES
+    # NEW CLOSED CANDLES
     # ========================================================
 
     last_time = (
@@ -1223,12 +2174,15 @@ def process_symbol_interval(
     ):
 
         if last_time is None:
+
             continue
 
         if (
             candle["time"]
             > last_time
             and rsi_values[i]
+            is not None
+            and atr_values[i]
             is not None
         ):
 
@@ -1248,11 +2202,18 @@ def process_symbol_interval(
 
         rsi_value = rsi_values[i]
 
+        atr_value = atr_values[i]
+
         if rsi_value is None:
+
+            continue
+
+        if atr_value is None:
+
             continue
 
         # ----------------------------------------------------
-        # DİBSİZ
+        # NO FIRST LOW
         # ----------------------------------------------------
 
         if state["first_low"] is None:
@@ -1272,7 +2233,10 @@ def process_symbol_interval(
             process_first_low(
                 state,
                 candle,
-                rsi_value
+                rsi_value,
+                atr_value,
+                candles,
+                i
             )
 
         # ----------------------------------------------------
@@ -1320,6 +2284,7 @@ def scan():
         if volume_24h < (
             MIN_QUOTE_VOLUME_24H
         ):
+
             continue
 
         # ----------------------------------------------------
@@ -1353,13 +2318,14 @@ def scan():
 
 def main():
 
-    print("=" * 60)
+    print("=" * 70)
 
     print(
-        "BINANCE RSI BULLISH DIVERGENCE BOT"
+        "BINANCE RSI BULLISH DIVERGENCE "
+        "+ MOMENTUM CONFIRMATION BOT"
     )
 
-    print("=" * 60)
+    print("=" * 70)
 
     print(
         f"RSI Period: "
@@ -1368,7 +2334,7 @@ def main():
 
     print(
         f"RSI level: "
-        f"< {RSI_OVERBOUGHT_LEVEL}"
+        f"< {RSI_LEVEL}"
     )
 
     print(
@@ -1382,11 +2348,36 @@ def main():
     )
 
     print(
+        f"Confirmation candles: "
+        f"{CONFIRMATION_CANDLES}"
+    )
+
+    print(
+        f"Minimum BUY pressure: "
+        f"{MIN_BUY_PERCENT:.1f}%"
+    )
+
+    print(
+        f"Minimum average BUY pressure: "
+        f"{MIN_AVG_BUY_PERCENT:.1f}%"
+    )
+
+    print(
+        f"Minimum ATR recovery: "
+        f"{ATR_RECOVERY_MULTIPLIER:.2f} ATR"
+    )
+
+    print(
+        f"Minimum volume / Avg20: "
+        f"{MIN_VOLUME_VS_AVG20:.2f}x"
+    )
+
+    print(
         f"Minimum 24H volume: "
         f"{MIN_QUOTE_VOLUME_24H:,} USDT"
     )
 
-    print("=" * 60)
+    print("=" * 70)
 
     print(
         "STARTUP MODE:"
@@ -1398,15 +2389,10 @@ def main():
     )
 
     print(
-        "No historical first low is selected."
+        "No historical first low selected."
     )
 
-    print(
-        "After reset, old historical candles "
-        "are not reused."
-    )
-
-    print("=" * 60)
+    print("=" * 70)
 
     while True:
 
