@@ -5,1763 +5,878 @@ from datetime import datetime, timezone
 
 
 # ============================================================
-# BINANCE RSI BULLISH DIVERGENCE LIVE ALERT BOT
+# BINANCE MOMENTUM + VWAP BUY BOT
+# ONLY BULLISH BUY SIGNALS
 # ============================================================
-#
-# STRATEGY
-#
-# 1) STARTUP:
-#    Previous 50 CLOSED candles are used only as comparison
-#    baseline.
-#
-# 2) FIRST LOW:
-#    A new candle must make a lower low than all previous
-#    50 candles.
-#
-# 3) SECOND LOW:
-#    - Price makes lower low than FIRST LOW
-#    - FIRST RSI < 30
-#    - SECOND RSI < 30
-#    - SECOND RSI > FIRST RSI
-#
-# 4) RSI RECOVERY:
-#    When RSI closes above 30, DO NOT immediately signal.
-#
-# 5) CONFIRMATION:
-#    Maximum 3 CLOSED candles are allowed.
-#
-#    At least 2 of these 3 conditions must pass:
-#
-#      A) RSI remains above 30
-#      B) Price recovery / higher close
-#      C) Volume is not weak
-#
-# 6) SIGNAL:
-#    If 2 of 3 confirmation conditions pass:
-#
-#       BUY SIGNAL
-#
-# 7) FAILURE:
-#    If price goes below SECOND LOW before confirmation:
-#
-#       SECOND LOW becomes NEW FIRST LOW
-#
-# 8) ATR:
-#    NOT USED.
-#
-# ============================================================
-
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
-MIN_QUOTE_VOLUME_24H = 20_000_000
-
-SCAN_SECONDS = 60
-
-RSI_PERIOD = 6
-
-LOOKBACK_CANDLES = 50
-
-RSI_LEVEL = 30
-
-RSI_TIMEFRAMES = [
-    "15m",
-    "30m",
-    "1h"
-]
-
-# ------------------------------------------------------------
-# CONFIRMATION SETTINGS
-# ------------------------------------------------------------
-
-CONFIRMATION_MAX_CANDLES = 3
-
-# Volume çox sərt deyil.
-# Cari şamın volume-u əvvəlki 5 şamın orta volume-una
-# ən azı 0.70 nisbətində olarsa PASS.
-#
-# Yəni volume mütləq çox böyük olmalı deyil.
-# Sadəcə həddindən artıq zəif olmasın.
-#
-VOLUME_MIN_RATIO = 0.70
-
-VOLUME_LOOKBACK = 5
-
-
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN"
-)
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID"
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 # ============================================================
-# GLOBALS
+# SETTINGS
+# ============================================================
+
+INTERVAL = "5m"
+
+SCAN_SECONDS = 20
+
+# Previous candles used for breakout
+BREAKOUT_LOOKBACK = 10
+
+# Volume calculation
+VOLUME_LOOKBACK = 20
+VOLUME_MULTIPLIER = 1.5
+
+# Strong bullish candle
+MIN_BODY_RATIO = 0.60
+
+# Minimum 24h quote volume
+# Set to 0 if you don't want a volume filter.
+MIN_24H_QUOTE_VOLUME = 5_000_000
+
+# Maximum symbols checked in one cycle
+# None = all eligible Binance Spot USDT symbols
+MAX_SYMBOLS = None
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+processed_signals = set()
+
+first_scan = True
+
+session_vwap_cache = {}
+
+
+# ============================================================
+# HTTP SESSION
 # ============================================================
 
 session = requests.Session()
 
-states = {}
+session.headers.update({
+    "User-Agent": "MomentumVWAPBot/1.0"
+})
+
+
+# ============================================================
+# BINANCE REQUEST
+# ============================================================
+
+def binance_get(endpoint, params=None):
+
+    url = BINANCE_BASE_URL + endpoint
+
+    try:
+
+        response = session.get(
+            url,
+            params=params,
+            timeout=10
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except Exception as e:
+
+        print(
+            f"[BINANCE ERROR] "
+            f"{endpoint} | {e}"
+        )
+
+        return None
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def send_telegram(
-    message,
-    symbol=None
-):
+def send_telegram(message):
 
-    if (
-        not TELEGRAM_BOT_TOKEN
-        or not TELEGRAM_CHAT_ID
-    ):
-        print(
-            "Telegram environment variables are missing."
-        )
-        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+
+        print("[TELEGRAM ERROR] Missing environment variables")
+
+        return False
 
     url = (
         f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}"
-        f"/sendMessage"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
     payload = {
+
         "chat_id": TELEGRAM_CHAT_ID,
+
         "text": message,
-        "parse_mode": "HTML"
+
+        "parse_mode": "HTML",
+
+        "disable_web_page_preview": True
     }
-
-    if symbol:
-
-        binance_url = (
-            "https://www.binance.com/en/trade/"
-            f"{symbol}_USDT?type=spot"
-        )
-
-        payload["reply_markup"] = {
-            "inline_keyboard": [
-                [
-                    {
-                        "text": f"🔗 {symbol} — Binance",
-                        "url": binance_url
-                    }
-                ]
-            ]
-        }
 
     try:
 
         response = session.post(
             url,
             json=payload,
-            timeout=15
-        )
-
-        if response.status_code != 200:
-
-            print(
-                "Telegram error:",
-                response.text
-            )
-
-    except Exception as e:
-
-        print(
-            "Telegram exception:",
-            e
-        )
-
-
-# ============================================================
-# BINANCE SPOT USDT SYMBOLS
-# ============================================================
-
-def get_spot_usdt_symbols():
-
-    url = (
-        f"{BINANCE_BASE_URL}"
-        f"/api/v3/exchangeInfo"
-    )
-
-    try:
-
-        response = session.get(
-            url,
-            timeout=15
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        symbols = []
-
-        for item in data.get(
-            "symbols",
-            []
-        ):
-
-            if item.get("status") != "TRADING":
-                continue
-
-            if item.get("quoteAsset") != "USDT":
-                continue
-
-            if item.get(
-                "isSpotTradingAllowed"
-            ) is not True:
-                continue
-
-            symbols.append(
-                item["symbol"]
-            )
-
-        return symbols
-
-    except Exception as e:
-
-        print(
-            "Exchange info error:",
-            e
-        )
-
-        return []
-
-
-# ============================================================
-# 24H VOLUME
-# ============================================================
-
-def get_24h_quote_volume(symbol):
-
-    url = (
-        f"{BINANCE_BASE_URL}"
-        f"/api/v3/ticker/24hr"
-    )
-
-    try:
-
-        response = session.get(
-            url,
-            params={
-                "symbol": symbol
-            },
             timeout=10
         )
 
-        response.raise_for_status()
+        if response.ok:
 
-        data = response.json()
+            print("[TELEGRAM] Sent")
 
-        return float(
-            data.get(
-                "quoteVolume",
-                0
-            )
+            return True
+
+        print(
+            "[TELEGRAM ERROR]",
+            response.status_code,
+            response.text
         )
 
-    except Exception:
-
-        return 0.0
-
-
-# ============================================================
-# BINANCE KLINES
-# ============================================================
-
-def get_klines(
-    symbol,
-    interval,
-    limit=200
-):
-
-    url = (
-        f"{BINANCE_BASE_URL}"
-        f"/api/v3/klines"
-    )
-
-    try:
-
-        response = session.get(
-            url,
-            params={
-                "symbol": symbol,
-                "interval": interval,
-                "limit": limit
-            },
-            timeout=15
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if not isinstance(
-            data,
-            list
-        ):
-            return []
-
-        candles = []
-
-        for k in data:
-
-            candles.append({
-
-                "time": int(k[0]),
-
-                "open": float(k[1]),
-
-                "high": float(k[2]),
-
-                "low": float(k[3]),
-
-                "close": float(k[4]),
-
-                # --------------------------------------------
-                # Volume
-                # --------------------------------------------
-
-                "volume": float(k[5]),
-
-                # --------------------------------------------
-                # Quote volume
-                # --------------------------------------------
-
-                "quote_volume": float(k[7]),
-
-                # --------------------------------------------
-                # Taker buy base volume
-                # --------------------------------------------
-
-                "taker_buy_volume": float(k[9]),
-
-                # --------------------------------------------
-                # Taker buy quote volume
-                # --------------------------------------------
-
-                "taker_buy_quote_volume": float(k[10])
-            })
-
-        return candles
+        return False
 
     except Exception as e:
 
         print(
-            f"Kline error "
-            f"{symbol} {interval}:",
-            e
+            f"[TELEGRAM ERROR] {e}"
         )
+
+        return False
+
+
+# ============================================================
+# GET BINANCE SPOT USDT SYMBOLS
+# ============================================================
+
+def get_symbols():
+
+    data = binance_get(
+        "/api/v3/exchangeInfo"
+    )
+
+    if not data:
 
         return []
 
+    symbols = []
+
+    for item in data.get("symbols", []):
+
+        if item.get("status") != "TRADING":
+            continue
+
+        if item.get("quoteAsset") != "USDT":
+            continue
+
+        if item.get("isSpotTradingAllowed") is not True:
+            continue
+
+        symbol = item.get("symbol")
+
+        if symbol:
+            symbols.append(symbol)
+
+    return symbols
+
 
 # ============================================================
-# CLOSED CANDLES ONLY
+# GET 24H VOLUME
 # ============================================================
 
-def get_closed_candles(
-    symbol,
-    interval,
-    limit=200
-):
+def get_24h_volumes():
+
+    data = binance_get(
+        "/api/v3/ticker/24hr"
+    )
+
+    if not data:
+        return {}
+
+    result = {}
+
+    for item in data:
+
+        symbol = item.get("symbol")
+
+        if not symbol:
+            continue
+
+        try:
+
+            quote_volume = float(
+                item.get("quoteVolume", 0)
+            )
+
+            result[symbol] = quote_volume
+
+        except Exception:
+
+            continue
+
+    return result
+
+
+# ============================================================
+# GET CLOSED 5M CANDLES
+# ============================================================
+
+def get_klines(symbol, limit=100):
+
+    data = binance_get(
+        "/api/v3/klines",
+        {
+            "symbol": symbol,
+            "interval": INTERVAL,
+            "limit": limit
+        }
+    )
+
+    if not data:
+        return []
+
+    # Remove currently forming candle
+    now_ms = int(
+        datetime.now(timezone.utc).timestamp() * 1000
+    )
+
+    closed = []
+
+    for candle in data:
+
+        close_time = int(candle[6])
+
+        if close_time <= now_ms:
+
+            closed.append(candle)
+
+    return closed
+
+
+# ============================================================
+# CALCULATE SESSION VWAP
+#
+# VWAP resets at 00:00 UTC every day.
+#
+# Typical Price = (High + Low + Close) / 3
+#
+# VWAP = Sum(Typical Price * Volume) /
+#        Sum(Volume)
+# ============================================================
+
+def calculate_session_vwap(candles):
+
+    if not candles:
+
+        return None
+
+    today = datetime.now(
+        timezone.utc
+    ).date()
+
+    cumulative_pv = 0.0
+    cumulative_volume = 0.0
+
+    for candle in candles:
+
+        open_time = int(candle[0])
+
+        candle_date = datetime.fromtimestamp(
+            open_time / 1000,
+            timezone.utc
+        ).date()
+
+        if candle_date != today:
+            continue
+
+        high = float(candle[2])
+        low = float(candle[3])
+        close = float(candle[4])
+        volume = float(candle[5])
+
+        typical_price = (
+            high + low + close
+        ) / 3.0
+
+        cumulative_pv += (
+            typical_price * volume
+        )
+
+        cumulative_volume += volume
+
+    if cumulative_volume <= 0:
+
+        return None
+
+    return (
+        cumulative_pv /
+        cumulative_volume
+    )
+
+
+# ============================================================
+# CALCULATE VWAP BEFORE LAST CANDLE
+#
+# This is important because we want to know whether
+# VWAP itself is rising.
+# ============================================================
+
+def calculate_previous_session_vwap(candles):
+
+    if len(candles) < 2:
+
+        return None
+
+    return calculate_session_vwap(
+        candles[:-1]
+    )
+
+
+# ============================================================
+# FORMAT PRICE
+# ============================================================
+
+def format_price(price):
+
+    if price >= 1000:
+        return f"{price:.2f}"
+
+    if price >= 1:
+        return f"{price:.4f}"
+
+    if price >= 0.01:
+        return f"{price:.6f}"
+
+    if price >= 0.0001:
+        return f"{price:.8f}"
+
+    return f"{price:.10f}"
+
+
+# ============================================================
+# ANALYZE SYMBOL
+# ============================================================
+
+def analyze_symbol(symbol, quote_volume):
+
+    global first_scan
+
+    # --------------------------------------------------------
+    # 24H VOLUME FILTER
+    # --------------------------------------------------------
+
+    if quote_volume < MIN_24H_QUOTE_VOLUME:
+
+        return None
+
+    # --------------------------------------------------------
+    # GET CANDLES
+    # Need at least:
+    #
+    # 10 breakout candles
+    # 20 volume candles
+    # current signal candle
+    #
+    # plus extra candles for VWAP.
+    # --------------------------------------------------------
 
     candles = get_klines(
         symbol,
-        interval,
-        limit
+        limit=300
     )
 
-    if len(candles) < 2:
-        return []
+    if len(candles) < 30:
 
-    # Son candle hazırda formalaşan candle-dır.
-    # Onu çıxarırıq.
+        return None
 
-    return candles[:-1]
+    # --------------------------------------------------------
+    # LAST CLOSED CANDLE
+    # --------------------------------------------------------
 
+    signal_candle = candles[-1]
 
-# ============================================================
-# RSI - WILDER RSI
-# ============================================================
+    signal_open_time = int(
+        signal_candle[0]
+    )
 
-def calculate_rsi(
-    candles,
-    period=6
-):
+    signal_key = (
+        symbol,
+        signal_open_time
+    )
 
-    if len(candles) <= period:
+    # --------------------------------------------------------
+    # DON'T PROCESS SAME CANDLE AGAIN
+    # --------------------------------------------------------
 
-        return [
-            None
-            for _ in candles
-        ]
+    if signal_key in processed_signals:
 
-    closes = [
-        candle["close"]
-        for candle in candles
+        return None
+
+    # --------------------------------------------------------
+    # ON BOT STARTUP:
+    # DON'T SEND OLD SIGNALS.
+    # ONLY START WATCHING NEW CANDLES.
+    # --------------------------------------------------------
+
+    if first_scan:
+
+        processed_signals.add(
+            signal_key
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # OHLCV
+    # --------------------------------------------------------
+
+    open_price = float(signal_candle[1])
+    high = float(signal_candle[2])
+    low = float(signal_candle[3])
+    close = float(signal_candle[4])
+    volume = float(signal_candle[5])
+
+    # --------------------------------------------------------
+    # 1. BULLISH CANDLE
+    # --------------------------------------------------------
+
+    if close <= open_price:
+
+        processed_signals.add(
+            signal_key
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # RANGE
+    # --------------------------------------------------------
+
+    candle_range = high - low
+
+    if candle_range <= 0:
+
+        processed_signals.add(
+            signal_key
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # BODY
+    # --------------------------------------------------------
+
+    body = close - open_price
+
+    body_ratio = (
+        body / candle_range
+    )
+
+    # --------------------------------------------------------
+    # 2. STRONG BULLISH BODY
+    # --------------------------------------------------------
+
+    if body_ratio < MIN_BODY_RATIO:
+
+        processed_signals.add(
+            signal_key
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # 3. PREVIOUS 10 CANDLE HIGH
+    #
+    # IMPORTANT:
+    # signal candle itself is excluded.
+    # --------------------------------------------------------
+
+    previous_candles = candles[
+        -(BREAKOUT_LOOKBACK + 1):-1
     ]
 
-    rsi = [
-        None
-        for _ in closes
+    if len(previous_candles) < BREAKOUT_LOOKBACK:
+
+        return None
+
+    previous_high = max(
+        float(c[2])
+        for c in previous_candles
+    )
+
+    # --------------------------------------------------------
+    # BREAKOUT
+    # --------------------------------------------------------
+
+    if close <= previous_high:
+
+        processed_signals.add(
+            signal_key
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # 4. VOLUME MOMENTUM
+    # --------------------------------------------------------
+
+    volume_candles = candles[
+        -(VOLUME_LOOKBACK + 1):-1
     ]
 
-    gains = []
-    losses = []
+    if len(volume_candles) < VOLUME_LOOKBACK:
 
-    for i in range(
-        1,
-        period + 1
-    ):
+        return None
 
-        change = (
-            closes[i]
-            - closes[i - 1]
+    average_volume = sum(
+        float(c[5])
+        for c in volume_candles
+    ) / len(volume_candles)
+
+    if average_volume <= 0:
+
+        processed_signals.add(
+            signal_key
         )
 
-        gains.append(
-            max(change, 0.0)
-        )
+        return None
 
-        losses.append(
-            max(-change, 0.0)
-        )
-
-    avg_gain = (
-        sum(gains)
-        / period
+    volume_ratio = (
+        volume / average_volume
     )
 
-    avg_loss = (
-        sum(losses)
-        / period
+    if volume_ratio < VOLUME_MULTIPLIER:
+
+        processed_signals.add(
+            signal_key
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # 5. VWAP
+    # --------------------------------------------------------
+
+    vwap = calculate_session_vwap(
+        candles
     )
 
-    if avg_loss == 0:
+    previous_vwap = (
+        calculate_previous_session_vwap(
+            candles
+        )
+    )
 
-        rsi[period] = 100.0
+    if vwap is None or previous_vwap is None:
 
-    else:
-
-        rs = (
-            avg_gain
-            / avg_loss
+        processed_signals.add(
+            signal_key
         )
 
-        rsi[period] = (
-            100.0
-            -
-            (
-                100.0
-                /
-                (1.0 + rs)
-            )
+        return None
+
+    # --------------------------------------------------------
+    # PRICE MUST BE ABOVE VWAP
+    # --------------------------------------------------------
+
+    if close <= vwap:
+
+        processed_signals.add(
+            signal_key
         )
 
-    for i in range(
-        period + 1,
-        len(closes)
-    ):
+        return None
 
-        change = (
-            closes[i]
-            - closes[i - 1]
+    # --------------------------------------------------------
+    # VWAP MUST BE RISING
+    # --------------------------------------------------------
+
+    if vwap <= previous_vwap:
+
+        processed_signals.add(
+            signal_key
         )
 
-        gain = max(
-            change,
-            0.0
-        )
+        return None
 
-        loss = max(
-            -change,
-            0.0
-        )
+    # --------------------------------------------------------
+    # ALL CONDITIONS PASSED
+    # --------------------------------------------------------
 
-        avg_gain = (
-            (
-                avg_gain
-                * (period - 1)
-            )
-            + gain
-        ) / period
-
-        avg_loss = (
-            (
-                avg_loss
-                * (period - 1)
-            )
-            + loss
-        ) / period
-
-        if avg_loss == 0:
-
-            rsi[i] = 100.0
-
-        else:
-
-            rs = (
-                avg_gain
-                / avg_loss
-            )
-
-            rsi[i] = (
-                100.0
-                -
-                (
-                    100.0
-                    /
-                    (1.0 + rs)
-                )
-            )
-
-    return rsi
-
-
-# ============================================================
-# NEW STATE
-# ============================================================
-
-def new_state():
+    processed_signals.add(
+        signal_key
+    )
 
     return {
 
-        "startup_initialized": False,
+        "symbol": symbol,
 
-        "last_candle_time": None,
+        "price": close,
 
-        # ----------------------------------------------------
-        # 50 candle comparison baseline
-        # ----------------------------------------------------
+        "open": open_price,
 
-        "comparison_window": [],
+        "high": high,
 
-        # ----------------------------------------------------
-        # FIRST LOW
-        # ----------------------------------------------------
+        "low": low,
 
-        "first_low": None,
+        "vwap": vwap,
 
-        "first_rsi": None,
+        "previous_vwap": previous_vwap,
 
-        "first_time": None,
+        "body_ratio": body_ratio,
 
-        "bars_since_first": 0,
+        "volume_ratio": volume_ratio,
 
-        # ----------------------------------------------------
-        # SECOND LOW
-        # ----------------------------------------------------
+        "previous_high": previous_high,
 
-        "candidate_active": False,
+        "quote_volume": quote_volume,
 
-        "second_low": None,
-
-        "second_rsi": None,
-
-        "second_time": None,
-
-        # ----------------------------------------------------
-        # RSI > 30 confirmation stage
-        # ----------------------------------------------------
-
-        "confirmation_active": False,
-
-        "confirmation_candles": 0,
-
-        "confirmation_start_time": None,
-
-        "confirmation_start_price": None,
-
-        "confirmation_start_rsi": None,
-
-        # ----------------------------------------------------
-        # INFO
-        # ----------------------------------------------------
-
-        "symbol": None,
-
-        "interval": None
+        "candle_time": signal_open_time
     }
 
 
 # ============================================================
-# RESET SETUP
+# SEND BUY SIGNAL
 # ============================================================
 
-def reset_setup(state):
+def send_buy_signal(signal):
 
-    state["first_low"] = None
+    symbol = signal["symbol"]
 
-    state["first_rsi"] = None
+    price = signal["price"]
 
-    state["first_time"] = None
+    vwap = signal["vwap"]
 
-    state["bars_since_first"] = 0
+    previous_high = signal["previous_high"]
 
-    state["candidate_active"] = False
-
-    state["second_low"] = None
-
-    state["second_rsi"] = None
-
-    state["second_time"] = None
-
-    state["confirmation_active"] = False
-
-    state["confirmation_candles"] = 0
-
-    state["confirmation_start_time"] = None
-
-    state["confirmation_start_price"] = None
-
-    state["confirmation_start_rsi"] = None
-
-    # Yeni 50-lik rolling baza qurulur.
-
-    state["comparison_window"] = []
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-def startup_initialize(
-    state,
-    candles,
-    rsi_values
-):
-
-    if len(candles) < LOOKBACK_CANDLES:
-
-        return False
-
-    state["comparison_window"] = []
-
-    start_index = (
-        len(candles)
-        - LOOKBACK_CANDLES
+    body_percent = (
+        signal["body_ratio"] * 100
     )
 
-    for i in range(
-        start_index,
-        len(candles)
-    ):
-
-        state["comparison_window"].append({
-
-            "time": candles[i]["time"],
-
-            "low": candles[i]["low"],
-
-            "rsi": rsi_values[i]
-
-        })
-
-    state["startup_initialized"] = True
-
-    state["last_candle_time"] = (
-        candles[-1]["time"]
+    volume_multiple = (
+        signal["volume_ratio"]
     )
 
-    print(
-        f"{state['symbol']} "
-        f"{state['interval']} -> "
-        f"STARTUP: previous 50 closed candles "
-        f"loaded."
+    quote_volume = (
+        signal["quote_volume"]
     )
 
-    return True
-
-
-# ============================================================
-# NEW FIRST LOW
-# ============================================================
-
-def make_new_first_low(
-    state,
-    candle,
-    rsi_value
-):
-
-    state["first_low"] = (
-        candle["low"]
-    )
-
-    state["first_rsi"] = (
-        rsi_value
-    )
-
-    state["first_time"] = (
-        candle["time"]
-    )
-
-    state["bars_since_first"] = 0
-
-    state["candidate_active"] = False
-
-    state["second_low"] = None
-
-    state["second_rsi"] = None
-
-    state["second_time"] = None
-
-    state["confirmation_active"] = False
-
-    state["confirmation_candles"] = 0
-
-    state["confirmation_start_time"] = None
-
-    state["confirmation_start_price"] = None
-
-    state["confirmation_start_rsi"] = None
-
-    print(
-        f"{state['symbol']} "
-        f"{state['interval']} -> "
-        f"NEW FIRST LOW: "
-        f"{candle['low']} | "
-        f"RSI: {rsi_value:.2f}"
-    )
-
-
-# ============================================================
-# NO FIRST LOW
-# ============================================================
-
-def process_no_first_low(
-    state,
-    candle,
-    rsi_value
-):
-
-    window = state[
-        "comparison_window"
-    ]
-
-    if len(window) < LOOKBACK_CANDLES:
-
-        window.append({
-
-            "time": candle["time"],
-
-            "low": candle["low"],
-
-            "rsi": rsi_value
-
-        })
-
-        return
-
-    lowest_previous_50 = min(
-        item["low"]
-        for item in window
-    )
-
-    if candle["low"] < lowest_previous_50:
-
-        make_new_first_low(
-            state,
-            candle,
-            rsi_value
-        )
-
-        state["comparison_window"] = []
-
-        return
-
-    window.pop(0)
-
-    window.append({
-
-        "time": candle["time"],
-
-        "low": candle["low"],
-
-        "rsi": rsi_value
-
-    })
-
-
-# ============================================================
-# VOLUME CHECK
-# ============================================================
-
-def check_volume_confirmation(
-    candles,
-    index
-):
-
-    # Əvvəlki 5 şam lazımdır.
-
-    if index < VOLUME_LOOKBACK:
-
-        return False, 0.0
-
-    current_volume = (
-        candles[index]["volume"]
-    )
-
-    previous_volumes = [
-
-        candles[j]["volume"]
-
-        for j in range(
-            index - VOLUME_LOOKBACK,
-            index
-        )
-    ]
-
-    if not previous_volumes:
-
-        return False, 0.0
-
-    average_volume = (
-        sum(previous_volumes)
-        /
-        len(previous_volumes)
-    )
-
-    if average_volume <= 0:
-
-        return False, 0.0
-
-    ratio = (
-        current_volume
-        /
-        average_volume
-    )
-
-    passed = (
-        ratio
-        >= VOLUME_MIN_RATIO
-    )
-
-    return passed, ratio
-
-
-# ============================================================
-# CONFIRMATION
-# ============================================================
-
-def process_confirmation(
-    state,
-    candle,
-    rsi_value,
-    candles,
-    index
-):
-
-    state["confirmation_candles"] += 1
-
-    second_low = state[
-        "second_low"
-    ]
-
-    # ========================================================
-    # 1. SECOND LOW PROTECTION
-    # ========================================================
-
-    if candle["low"] < second_low:
-
-        print(
-            f"{state['symbol']} "
-            f"{state['interval']} -> "
-            f"CONFIRMATION FAILED."
-        )
-
-        print(
-            f"Price broke SECOND LOW."
-        )
-
-        print(
-            f"SECOND LOW becomes NEW FIRST LOW."
-        )
-
-        state["first_low"] = (
-            state["second_low"]
-        )
-
-        state["first_rsi"] = (
-            state["second_rsi"]
-        )
-
-        state["first_time"] = (
-            state["second_time"]
-        )
-
-        state["bars_since_first"] = 0
-
-        state["candidate_active"] = False
-
-        state["second_low"] = None
-
-        state["second_rsi"] = None
-
-        state["second_time"] = None
-
-        state["confirmation_active"] = False
-
-        state["confirmation_candles"] = 0
-
-        state["confirmation_start_time"] = None
-
-        state["confirmation_start_price"] = None
-
-        state["confirmation_start_rsi"] = None
-
-        return
-
-    # ========================================================
-    # CONDITION A
-    # RSI remains above 30
-    # ========================================================
-
-    rsi_pass = (
-        rsi_value > RSI_LEVEL
-    )
-
-    # ========================================================
-    # CONDITION B
-    # PRICE MOMENTUM / RECOVERY
-    #
-    # Cari bağlanış confirmation başlanğıcındakı qiymətdən
-    # yuxarıdırsa PASS.
-    #
-    # Əlavə olaraq cari close əvvəlki close-dan aşağı
-    # deyilsə PASS.
-    # ========================================================
-
-    price_pass = False
-
-    if (
-        state["confirmation_start_price"]
-        is not None
-    ):
-
-        price_above_start = (
-            candle["close"]
-            >
-            state["confirmation_start_price"]
-        )
-
-        previous_close = None
-
-        if index > 0:
-
-            previous_close = (
-                candles[index - 1]["close"]
-            )
-
-        higher_than_previous = (
-
-            previous_close is not None
-
-            and
-
-            candle["close"]
-            >=
-            previous_close
-        )
-
-        if (
-            price_above_start
-            and
-            higher_than_previous
-        ):
-
-            price_pass = True
-
-    # ========================================================
-    # CONDITION C
-    # VOLUME
-    # ========================================================
-
-    volume_pass, volume_ratio = (
-        check_volume_confirmation(
-            candles,
-            index
-        )
-    )
-
-    # ========================================================
-    # COUNT
-    # ========================================================
-
-    passed_conditions = 0
-
-    if rsi_pass:
-        passed_conditions += 1
-
-    if price_pass:
-        passed_conditions += 1
-
-    if volume_pass:
-        passed_conditions += 1
-
-    print(
-        f"{state['symbol']} "
-        f"{state['interval']} -> "
-        f"CONFIRMATION "
-        f"{state['confirmation_candles']}/"
-        f"{CONFIRMATION_MAX_CANDLES}"
-    )
-
-    print(
-        f"RSI: "
-        f"{'PASS' if rsi_pass else 'FAIL'} "
-        f"({rsi_value:.2f})"
-    )
-
-    print(
-        f"Price momentum: "
-        f"{'PASS' if price_pass else 'FAIL'}"
-    )
-
-    print(
-        f"Volume: "
-        f"{'PASS' if volume_pass else 'FAIL'} "
-        f"(ratio: {volume_ratio:.2f})"
-    )
-
-    print(
-        f"Confirmation score: "
-        f"{passed_conditions}/3"
-    )
-
-    # ========================================================
-    # 2 / 3 PASS
-    # ========================================================
-
-    if passed_conditions >= 2:
-
-        print(
-            f"{state['symbol']} "
-            f"{state['interval']} -> "
-            f"CONFIRMATION PASSED."
-        )
-
-        print(
-            f"{state['symbol']} "
-            f"{state['interval']} -> "
-            f"SIGNAL."
-        )
-
-        send_rsi_signal(
-            state,
-            candle["close"],
-            rsi_value
-        )
-
-        reset_setup(
-            state
-        )
-
-        return
-
-    # ========================================================
-    # 3 CANDLE LIMIT
-    # ========================================================
-
-    if (
-        state["confirmation_candles"]
-        >= CONFIRMATION_MAX_CANDLES
-    ):
-
-        print(
-            f"{state['symbol']} "
-            f"{state['interval']} -> "
-            f"3 confirmation candles completed."
-        )
-
-        print(
-            f"{state['symbol']} "
-            f"{state['interval']} -> "
-            f"Confirmation failed."
-        )
-
-        # ----------------------------------------------------
-        # Confirmation uğursuz oldu.
-        #
-        # Amma qiymət hələ 2-ci dibin üstündədirsə,
-        # həmin 2-ci dib yenidən FIRST LOW kimi saxlanılır.
-        # ----------------------------------------------------
-
-        state["first_low"] = (
-            state["second_low"]
-        )
-
-        state["first_rsi"] = (
-            state["second_rsi"]
-        )
-
-        state["first_time"] = (
-            state["second_time"]
-        )
-
-        state["bars_since_first"] = 0
-
-        state["candidate_active"] = False
-
-        state["second_low"] = None
-
-        state["second_rsi"] = None
-
-        state["second_time"] = None
-
-        state["confirmation_active"] = False
-
-        state["confirmation_candles"] = 0
-
-        state["confirmation_start_time"] = None
-
-        state["confirmation_start_price"] = None
-
-        state["confirmation_start_rsi"] = None
-
-        print(
-            f"{state['symbol']} "
-            f"{state['interval']} -> "
-            f"SECOND LOW retained as NEW FIRST LOW."
-        )
-
-
-# ============================================================
-# SEND SIGNAL
-# ============================================================
-
-def send_rsi_signal(
-    state,
-    signal_price,
-    signal_rsi
-):
-
-    first_time = datetime.fromtimestamp(
-        state["first_time"] / 1000,
-        tz=timezone.utc
+    candle_time = datetime.fromtimestamp(
+        signal["candle_time"] / 1000,
+        timezone.utc
     ).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
+        "%Y-%m-%d %H:%M UTC"
     )
-
-    second_time = datetime.fromtimestamp(
-        state["second_time"] / 1000,
-        tz=timezone.utc
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
-
-    first_low = state[
-        "first_low"
-    ]
-
-    second_low = state[
-        "second_low"
-    ]
-
-    price_first_to_second = (
-        (
-            second_low
-            - first_low
-        )
-        /
-        first_low
-    ) * 100
-
-    price_second_to_signal = (
-        (
-            signal_price
-            - second_low
-        )
-        /
-        second_low
-    ) * 100
 
     message = (
 
-        "🟢 <b>RSI BULLISH DIVERGENCE</b>\n\n"
+        "🟢 <b>MOMENTUM BUY</b>\n\n"
 
-        f"<b>{state['symbol']}</b> "
-        f"— <b>{state['interval']}</b>\n\n"
+        f"<b>{symbol}</b> — {INTERVAL}\n\n"
 
-        "1️⃣ <b>FIRST LOW</b>\n"
+        f"💰 <b>Price:</b> "
+        f"{format_price(price)}\n"
 
-        f"Price: "
-        f"{first_low:.8f}\n"
+        f"📊 <b>VWAP:</b> "
+        f"{format_price(vwap)}\n"
 
-        f"RSI: "
-        f"{state['first_rsi']:.2f}\n"
+        f"🚀 <b>Breakout High:</b> "
+        f"{format_price(previous_high)}\n\n"
 
-        f"Time: "
-        f"{first_time}\n\n"
+        f"💪 <b>Candle Body:</b> "
+        f"{body_percent:.1f}%\n"
 
-        "2️⃣ <b>SECOND LOW</b>\n"
+        f"🔥 <b>Volume:</b> "
+        f"{volume_multiple:.2f}× average\n\n"
 
-        f"Price: "
-        f"{second_low:.8f}\n"
+        f"💵 <b>24H Volume:</b> "
+        f"${quote_volume:,.0f}\n\n"
 
-        f"RSI: "
-        f"{state['second_rsi']:.2f}\n"
+        f"🕐 <b>Candle:</b> "
+        f"{candle_time}\n\n"
 
-        f"Time: "
-        f"{second_time}\n\n"
-
-        "📉 <b>PRICE</b>\n"
-
-        f"{first_low:.8f}"
-        f" → "
-        f"{second_low:.8f}\n"
-
-        f"Change: "
-        f"{price_first_to_second:.2f}%\n\n"
-
-        "📈 <b>RSI</b>\n"
-
-        f"{state['first_rsi']:.2f}"
-        f" → "
-        f"{state['second_rsi']:.2f}"
-        f" → "
-        f"{signal_rsi:.2f}\n\n"
-
-        "🛡 <b>CONFIRMATION PASSED</b>\n"
-
-        "RSI recovery + price/volume confirmation\n\n"
-
-        "🚀 <b>BUY SIGNAL</b>\n"
-
-        f"Signal Price: "
-        f"{signal_price:.8f}\n"
-
-        f"RSI: "
-        f"{signal_rsi:.2f}\n"
-
-        f"Price movement from 2nd low: "
-        f"+{price_second_to_signal:.2f}%\n\n"
-
-        "⚠️ Confirmation does not guarantee "
-        "that price cannot fall again."
+        "✅ VWAP ABOVE\n"
+        "✅ VWAP RISING\n"
+        "✅ STRONG BULLISH CANDLE\n"
+        "✅ HIGH BREAKOUT\n"
+        "✅ VOLUME MOMENTUM"
     )
 
-    send_telegram(
-        message,
-        state["symbol"]
-    )
+    send_telegram(message)
 
 
 # ============================================================
-# FIRST LOW PROCESS
-# ============================================================
-
-def process_first_low(
-    state,
-    candle,
-    rsi_value,
-    candles,
-    index
-):
-
-    state["bars_since_first"] += 1
-
-    # ========================================================
-    # CONFIRMATION ACTIVE
-    # ========================================================
-
-    if state["confirmation_active"]:
-
-        process_confirmation(
-            state,
-            candle,
-            rsi_value,
-            candles,
-            index
-        )
-
-        return
-
-    # ========================================================
-    # SECOND LOW ALREADY VALID
-    #
-    # RSI 30 keçməyib
-    # ========================================================
-
-    if state["candidate_active"]:
-
-        second_low = state[
-            "second_low"
-        ]
-
-        # ----------------------------------------------------
-        # SECOND LOW BREAK
-        # ----------------------------------------------------
-
-        if candle["low"] < second_low:
-
-            print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"Price broke SECOND LOW."
-            )
-
-            print(
-                f"SECOND LOW becomes NEW FIRST LOW."
-            )
-
-            state["first_low"] = (
-                state["second_low"]
-            )
-
-            state["first_rsi"] = (
-                state["second_rsi"]
-            )
-
-            state["first_time"] = (
-                state["second_time"]
-            )
-
-            state["bars_since_first"] = 0
-
-            state["candidate_active"] = False
-
-            state["second_low"] = None
-
-            state["second_rsi"] = None
-
-            state["second_time"] = None
-
-            return
-
-        # ----------------------------------------------------
-        # RSI > 30
-        #
-        # Dərhal signal YOX.
-        # Confirmation başlayır.
-        # ----------------------------------------------------
-
-        if rsi_value > RSI_LEVEL:
-
-            state["confirmation_active"] = True
-
-            state["confirmation_candles"] = 0
-
-            state["confirmation_start_time"] = (
-                candle["time"]
-            )
-
-            state["confirmation_start_price"] = (
-                candle["close"]
-            )
-
-            state["confirmation_start_rsi"] = (
-                rsi_value
-            )
-
-            print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"RSI crossed above 30."
-            )
-
-            print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"Confirmation started."
-            )
-
-            print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"Waiting maximum "
-                f"{CONFIRMATION_MAX_CANDLES} "
-                f"closed candles."
-            )
-
-            # ------------------------------------------------
-            # Vacib:
-            # RSI 30-u keçən candle özü confirmation
-            # candle kimi hesablanmır.
-            #
-            # Ondan SONRA gələn candle-lar yoxlanılır.
-            # ------------------------------------------------
-
-            return
-
-        # ----------------------------------------------------
-        # RSI hələ 30-dan aşağıdır.
-        # ----------------------------------------------------
-
-        return
-
-    # ========================================================
-    # FIRST LOW-DAN SONRA MAXIMUM 50 ŞAM
-    # ========================================================
-
-    if (
-        state["bars_since_first"]
-        > LOOKBACK_CANDLES
-    ):
-
-        print(
-            f"{state['symbol']} "
-            f"{state['interval']} -> "
-            f"50 candles passed."
-        )
-
-        reset_setup(
-            state
-        )
-
-        return
-
-    # ========================================================
-    # SECOND LOW SEARCH
-    # ========================================================
-
-    if candle["low"] < state["first_low"]:
-
-        valid_rsi_divergence = (
-
-            state["first_rsi"]
-            < RSI_LEVEL
-
-            and
-
-            rsi_value
-            < RSI_LEVEL
-
-            and
-
-            rsi_value
-            >
-            state["first_rsi"]
-        )
-
-        if valid_rsi_divergence:
-
-            state["candidate_active"] = True
-
-            state["second_low"] = (
-                candle["low"]
-            )
-
-            state["second_rsi"] = (
-                rsi_value
-            )
-
-            state["second_time"] = (
-                candle["time"]
-            )
-
-            print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"VALID SECOND LOW FOUND"
-            )
-
-            print(
-                f"First Low: "
-                f"{state['first_low']}"
-            )
-
-            print(
-                f"First RSI: "
-                f"{state['first_rsi']:.2f}"
-            )
-
-            print(
-                f"Second Low: "
-                f"{state['second_low']}"
-            )
-
-            print(
-                f"Second RSI: "
-                f"{state['second_rsi']:.2f}"
-            )
-
-            print(
-                f"{state['symbol']} "
-                f"{state['interval']} -> "
-                f"Waiting for RSI > 30."
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Lower low var, divergence yoxdur.
-        # Cari candle yeni first low olur.
-        # ----------------------------------------------------
-
-        print(
-            f"{state['symbol']} "
-            f"{state['interval']} -> "
-            f"Lower low found, but divergence failed."
-        )
-
-        make_new_first_low(
-            state,
-            candle,
-            rsi_value
-        )
-
-        return
-
-
-# ============================================================
-# PROCESS SYMBOL + INTERVAL
-# ============================================================
-
-def process_symbol_interval(
-    symbol,
-    interval
-):
-
-    key = (
-        symbol,
-        interval
-    )
-
-    if key not in states:
-
-        states[key] = new_state()
-
-    state = states[key]
-
-    state["symbol"] = symbol
-
-    state["interval"] = interval
-
-    candles = get_closed_candles(
-        symbol,
-        interval,
-        limit=200
-    )
-
-    if len(candles) < (
-        LOOKBACK_CANDLES
-        + RSI_PERIOD
-        + VOLUME_LOOKBACK
-        + 5
-    ):
-
-        return
-
-    rsi_values = calculate_rsi(
-        candles,
-        RSI_PERIOD
-    )
-
-    # ========================================================
-    # STARTUP
-    # ========================================================
-
-    if not state[
-        "startup_initialized"
-    ]:
-
-        startup_initialize(
-            state,
-            candles,
-            rsi_values
-        )
-
-        return
-
-    # ========================================================
-    # ONLY NEW CLOSED CANDLES
-    # ========================================================
-
-    last_time = (
-        state["last_candle_time"]
-    )
-
-    new_indices = []
-
-    for i, candle in enumerate(
-        candles
-    ):
-
-        if last_time is None:
-            continue
-
-        if (
-            candle["time"]
-            >
-            last_time
-            and
-            rsi_values[i]
-            is not None
-        ):
-
-            new_indices.append(i)
-
-    if not new_indices:
-
-        return
-
-    # ========================================================
-    # PROCESS
-    # ========================================================
-
-    for i in new_indices:
-
-        candle = candles[i]
-
-        rsi_value = rsi_values[i]
-
-        if rsi_value is None:
-            continue
-
-        if state["first_low"] is None:
-
-            process_no_first_low(
-                state,
-                candle,
-                rsi_value
-            )
-
-        else:
-
-            process_first_low(
-                state,
-                candle,
-                rsi_value,
-                candles,
-                i
-            )
-
-        state["last_candle_time"] = (
-            candle["time"]
-        )
-
-
-# ============================================================
-# SCAN
+# MAIN SCAN
 # ============================================================
 
 def scan():
 
-    symbols = get_spot_usdt_symbols()
+    global first_scan
+
+    print(
+        "\n"
+        "=================================================="
+    )
+
+    print(
+        f"SCAN {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
+    )
+
+    print(
+        "=================================================="
+    )
+
+    symbols = get_symbols()
 
     if not symbols:
 
         print(
-            "No USDT Spot symbols found."
+            "[ERROR] No symbols"
         )
 
         return
 
     print(
-        f"Scanning "
-        f"{len(symbols)} USDT Spot symbols..."
+        f"[INFO] Binance Spot USDT symbols: "
+        f"{len(symbols)}"
     )
 
-    for symbol in symbols:
+    # --------------------------------------------------------
+    # 24H VOLUME
+    # --------------------------------------------------------
 
-        volume_24h = (
-            get_24h_quote_volume(
-                symbol
+    volumes = get_24h_volumes()
+
+    # --------------------------------------------------------
+    # SORT BY 24H VOLUME
+    # --------------------------------------------------------
+
+    symbols = sorted(
+        symbols,
+        key=lambda s: volumes.get(s, 0),
+        reverse=True
+    )
+
+    # Optional symbol limit
+    if MAX_SYMBOLS is not None:
+
+        symbols = symbols[
+            :MAX_SYMBOLS
+        ]
+
+    print(
+        f"[INFO] Symbols to scan: "
+        f"{len(symbols)}"
+    )
+
+    # --------------------------------------------------------
+    # ANALYZE
+    # --------------------------------------------------------
+
+    for index, symbol in enumerate(symbols, start=1):
+
+        try:
+
+            quote_volume = volumes.get(
+                symbol,
+                0
             )
-        )
 
-        if volume_24h < (
-            MIN_QUOTE_VOLUME_24H
-        ):
+            signal = analyze_symbol(
+                symbol,
+                quote_volume
+            )
 
-            continue
-
-        for interval in (
-            RSI_TIMEFRAMES
-        ):
-
-            try:
-
-                process_symbol_interval(
-                    symbol,
-                    interval
-                )
-
-            except Exception as e:
+            if signal:
 
                 print(
-                    f"Processing error "
-                    f"{symbol} "
-                    f"{interval}: "
-                    f"{e}"
+                    f"[BUY] {symbol} | "
+                    f"Price={signal['price']} | "
+                    f"VWAP={signal['vwap']} | "
+                    f"Volume={signal['volume_ratio']:.2f}x"
                 )
+
+                send_buy_signal(
+                    signal
+                )
+
+            # Progress every 50 symbols
+            if index % 50 == 0:
+
+                print(
+                    f"[PROGRESS] "
+                    f"{index}/{len(symbols)}"
+                )
+
+        except Exception as e:
+
+            print(
+                f"[ERROR] {symbol}: {e}"
+            )
+
+    first_scan = False
+
+    # --------------------------------------------------------
+    # CLEAN OLD STATE
+    # --------------------------------------------------------
+
+    if len(processed_signals) > 10000:
+
+        processed_signals.clear()
 
 
 # ============================================================
-# MAIN
+# MAIN LOOP
 # ============================================================
 
 def main():
 
-    print("=" * 60)
-
     print(
-        "BINANCE RSI BULLISH DIVERGENCE BOT"
-    )
-
-    print("=" * 60)
-
-    print(
-        f"RSI Period: "
-        f"{RSI_PERIOD}"
+        "\n"
+        "==================================================\n"
+        "   BINANCE MOMENTUM + VWAP BUY BOT\n"
+        "==================================================\n"
     )
 
     print(
-        f"RSI Level: "
-        f"< {RSI_LEVEL}"
+        f"Timeframe: {INTERVAL}"
     )
 
     print(
-        f"Timeframes: "
-        f"{', '.join(RSI_TIMEFRAMES)}"
+        f"Breakout lookback: {BREAKOUT_LOOKBACK}"
     )
 
     print(
-        f"Comparison candles: "
-        f"{LOOKBACK_CANDLES}"
+        f"Volume multiplier: {VOLUME_MULTIPLIER}x"
     )
 
     print(
-        f"Confirmation candles: "
-        f"{CONFIRMATION_MAX_CANDLES}"
+        f"Minimum body ratio: "
+        f"{MIN_BODY_RATIO * 100:.0f}%"
     )
 
     print(
-        f"Required confirmation: "
-        f"2 / 3"
+        f"Minimum 24H volume: "
+        f"${MIN_24H_QUOTE_VOLUME:,.0f}"
     )
 
     print(
-        f"Volume minimum ratio: "
-        f"{VOLUME_MIN_RATIO}"
+        "Strategy: BUY ONLY"
     )
 
     print(
-        "ATR: DISABLED"
+        "==================================================\n"
     )
-
-    print("=" * 60)
-
-    print(
-        "STRATEGY:"
-    )
-
-    print(
-        "First Low -> Second Low -> "
-        "RSI > 30 -> Confirmation -> Signal"
-    )
-
-    print("=" * 60)
 
     while True:
-
-        started = time.time()
 
         try:
 
@@ -1770,23 +885,11 @@ def main():
         except Exception as e:
 
             print(
-                "Main scan error:",
-                e
+                f"[MAIN ERROR] {e}"
             )
 
-        elapsed = (
-            time.time()
-            - started
-        )
-
-        sleep_time = max(
-            1,
-            SCAN_SECONDS
-            - elapsed
-        )
-
         time.sleep(
-            sleep_time
+            SCAN_SECONDS
         )
 
 
