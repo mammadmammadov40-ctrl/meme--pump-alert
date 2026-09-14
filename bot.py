@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 # ============================================================
 # BINANCE MOMENTUM + VWAP BUY BOT
 # ONLY BULLISH BUY SIGNALS
+# 24-HOUR COOLDOWN PER SYMBOL
 # ============================================================
 
 BINANCE_BASE_URL = "https://api.binance.com"
@@ -23,6 +24,14 @@ INTERVAL = "5m"
 
 SCAN_SECONDS = 20
 
+# ------------------------------------------------------------
+# AFTER A BUY SIGNAL:
+# THE SAME COIN CANNOT SIGNAL AGAIN FOR 24 HOURS
+# ------------------------------------------------------------
+
+COOLDOWN_HOURS = 24
+
+
 # Previous candles used for breakout
 BREAKOUT_LOOKBACK = 10
 
@@ -34,7 +43,6 @@ VOLUME_MULTIPLIER = 1.5
 MIN_BODY_RATIO = 0.60
 
 # Minimum 24h quote volume
-# Set to 0 if you don't want a volume filter.
 MIN_24H_QUOTE_VOLUME = 5_000_000
 
 # Maximum symbols checked in one cycle
@@ -48,9 +56,18 @@ MAX_SYMBOLS = None
 
 processed_signals = set()
 
-first_scan = True
+# Stores the time of the last BUY signal for each symbol
+#
+# Example:
+# {
+#     "DOGSUSDT": 1726300000,
+#     "BTCUSDT": 1726305000
+# }
+#
+# Each symbol has its own 24-hour cooldown.
+last_signal_time = {}
 
-session_vwap_cache = {}
+first_scan = True
 
 
 # ============================================================
@@ -102,7 +119,10 @@ def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 
-        print("[TELEGRAM ERROR] Missing environment variables")
+        print(
+            "[TELEGRAM ERROR] "
+            "Missing environment variables"
+        )
 
         return False
 
@@ -199,6 +219,7 @@ def get_24h_volumes():
     )
 
     if not data:
+
         return {}
 
     result = {}
@@ -241,18 +262,23 @@ def get_klines(symbol, limit=100):
     )
 
     if not data:
+
         return []
 
     # Remove currently forming candle
     now_ms = int(
-        datetime.now(timezone.utc).timestamp() * 1000
+        datetime.now(
+            timezone.utc
+        ).timestamp() * 1000
     )
 
     closed = []
 
     for candle in data:
 
-        close_time = int(candle[6])
+        close_time = int(
+            candle[6]
+        )
 
         if close_time <= now_ms:
 
@@ -266,10 +292,13 @@ def get_klines(symbol, limit=100):
 #
 # VWAP resets at 00:00 UTC every day.
 #
-# Typical Price = (High + Low + Close) / 3
+# Typical Price =
+# (High + Low + Close) / 3
 #
-# VWAP = Sum(Typical Price * Volume) /
-#        Sum(Volume)
+# VWAP =
+# Sum(Typical Price * Volume)
+# /
+# Sum(Volume)
 # ============================================================
 
 def calculate_session_vwap(candles):
@@ -287,7 +316,9 @@ def calculate_session_vwap(candles):
 
     for candle in candles:
 
-        open_time = int(candle[0])
+        open_time = int(
+            candle[0]
+        )
 
         candle_date = datetime.fromtimestamp(
             open_time / 1000,
@@ -295,12 +326,24 @@ def calculate_session_vwap(candles):
         ).date()
 
         if candle_date != today:
+
             continue
 
-        high = float(candle[2])
-        low = float(candle[3])
-        close = float(candle[4])
-        volume = float(candle[5])
+        high = float(
+            candle[2]
+        )
+
+        low = float(
+            candle[3]
+        )
+
+        close = float(
+            candle[4]
+        )
+
+        volume = float(
+            candle[5]
+        )
 
         typical_price = (
             high + low + close
@@ -323,10 +366,7 @@ def calculate_session_vwap(candles):
 
 
 # ============================================================
-# CALCULATE VWAP BEFORE LAST CANDLE
-#
-# This is important because we want to know whether
-# VWAP itself is rising.
+# CALCULATE PREVIOUS VWAP
 # ============================================================
 
 def calculate_previous_session_vwap(candles):
@@ -347,18 +387,71 @@ def calculate_previous_session_vwap(candles):
 def format_price(price):
 
     if price >= 1000:
+
         return f"{price:.2f}"
 
     if price >= 1:
+
         return f"{price:.4f}"
 
     if price >= 0.01:
+
         return f"{price:.6f}"
 
     if price >= 0.0001:
+
         return f"{price:.8f}"
 
     return f"{price:.10f}"
+
+
+# ============================================================
+# CHECK 24-HOUR COOLDOWN
+# ============================================================
+
+def symbol_is_in_cooldown(symbol):
+
+    if symbol not in last_signal_time:
+
+        return False
+
+    current_time = time.time()
+
+    elapsed = (
+        current_time -
+        last_signal_time[symbol]
+    )
+
+    cooldown_seconds = (
+        COOLDOWN_HOURS * 60 * 60
+    )
+
+    if elapsed < cooldown_seconds:
+
+        remaining = (
+            cooldown_seconds -
+            elapsed
+        )
+
+        remaining_hours = (
+            remaining / 3600
+        )
+
+        print(
+            f"[COOLDOWN] {symbol} | "
+            f"{remaining_hours:.1f}h remaining"
+        )
+
+        return True
+
+    # Cooldown expired
+    del last_signal_time[symbol]
+
+    print(
+        f"[COOLDOWN EXPIRED] {symbol}"
+    )
+
+    return False
 
 
 # ============================================================
@@ -378,14 +471,15 @@ def analyze_symbol(symbol, quote_volume):
         return None
 
     # --------------------------------------------------------
+    # 24-HOUR SYMBOL COOLDOWN
+    # --------------------------------------------------------
+
+    if symbol_is_in_cooldown(symbol):
+
+        return None
+
+    # --------------------------------------------------------
     # GET CANDLES
-    # Need at least:
-    #
-    # 10 breakout candles
-    # 20 volume candles
-    # current signal candle
-    #
-    # plus extra candles for VWAP.
     # --------------------------------------------------------
 
     candles = get_klines(
@@ -422,8 +516,7 @@ def analyze_symbol(symbol, quote_volume):
 
     # --------------------------------------------------------
     # ON BOT STARTUP:
-    # DON'T SEND OLD SIGNALS.
-    # ONLY START WATCHING NEW CANDLES.
+    # DON'T SEND OLD SIGNALS
     # --------------------------------------------------------
 
     if first_scan:
@@ -438,11 +531,25 @@ def analyze_symbol(symbol, quote_volume):
     # OHLCV
     # --------------------------------------------------------
 
-    open_price = float(signal_candle[1])
-    high = float(signal_candle[2])
-    low = float(signal_candle[3])
-    close = float(signal_candle[4])
-    volume = float(signal_candle[5])
+    open_price = float(
+        signal_candle[1]
+    )
+
+    high = float(
+        signal_candle[2]
+    )
+
+    low = float(
+        signal_candle[3]
+    )
+
+    close = float(
+        signal_candle[4]
+    )
+
+    volume = float(
+        signal_candle[5]
+    )
 
     # --------------------------------------------------------
     # 1. BULLISH CANDLE
@@ -494,9 +601,6 @@ def analyze_symbol(symbol, quote_volume):
 
     # --------------------------------------------------------
     # 3. PREVIOUS 10 CANDLE HIGH
-    #
-    # IMPORTANT:
-    # signal candle itself is excluded.
     # --------------------------------------------------------
 
     previous_candles = candles[
@@ -707,10 +811,38 @@ def send_buy_signal(signal):
         "✅ VWAP RISING\n"
         "✅ STRONG BULLISH CANDLE\n"
         "✅ HIGH BREAKOUT\n"
-        "✅ VOLUME MOMENTUM"
+        "✅ VOLUME MOMENTUM\n\n"
+
+        "⏳ <b>24H COOLDOWN STARTED</b>"
     )
 
-    send_telegram(message)
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # START COOLDOWN ONLY AFTER TELEGRAM MESSAGE
+    # IS SUCCESSFULLY SENT.
+    # --------------------------------------------------------
+
+    sent = send_telegram(
+        message
+    )
+
+    if sent:
+
+        last_signal_time[symbol] = time.time()
+
+        print(
+            f"[COOLDOWN START] "
+            f"{symbol} | "
+            f"{COOLDOWN_HOURS} hours"
+        )
+
+    else:
+
+        print(
+            f"[COOLDOWN NOT STARTED] "
+            f"{symbol} | "
+            f"Telegram failed"
+        )
 
 
 # ============================================================
@@ -727,7 +859,8 @@ def scan():
     )
 
     print(
-        f"SCAN {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
+        f"SCAN "
+        f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
     )
 
     print(
@@ -761,11 +894,17 @@ def scan():
 
     symbols = sorted(
         symbols,
-        key=lambda s: volumes.get(s, 0),
+        key=lambda s: volumes.get(
+            s,
+            0
+        ),
         reverse=True
     )
 
-    # Optional symbol limit
+    # --------------------------------------------------------
+    # OPTIONAL SYMBOL LIMIT
+    # --------------------------------------------------------
+
     if MAX_SYMBOLS is not None:
 
         symbols = symbols[
@@ -781,7 +920,10 @@ def scan():
     # ANALYZE
     # --------------------------------------------------------
 
-    for index, symbol in enumerate(symbols, start=1):
+    for index, symbol in enumerate(
+        symbols,
+        start=1
+    ):
 
         try:
 
@@ -799,21 +941,24 @@ def scan():
 
                 print(
                     f"[BUY] {symbol} | "
-                    f"Price={signal['price']} | "
-                    f"VWAP={signal['vwap']} | "
-                    f"Volume={signal['volume_ratio']:.2f}x"
+                    f"Price="
+                    f"{signal['price']} | "
+                    f"VWAP="
+                    f"{signal['vwap']} | "
+                    f"Volume="
+                    f"{signal['volume_ratio']:.2f}x"
                 )
 
                 send_buy_signal(
                     signal
                 )
 
-            # Progress every 50 symbols
             if index % 50 == 0:
 
                 print(
                     f"[PROGRESS] "
-                    f"{index}/{len(symbols)}"
+                    f"{index}/"
+                    f"{len(symbols)}"
                 )
 
         except Exception as e:
@@ -825,7 +970,7 @@ def scan():
     first_scan = False
 
     # --------------------------------------------------------
-    # CLEAN OLD STATE
+    # CLEAN OLD PROCESSED CANDLE STATE
     # --------------------------------------------------------
 
     if len(processed_signals) > 10000:
@@ -851,11 +996,13 @@ def main():
     )
 
     print(
-        f"Breakout lookback: {BREAKOUT_LOOKBACK}"
+        f"Breakout lookback: "
+        f"{BREAKOUT_LOOKBACK}"
     )
 
     print(
-        f"Volume multiplier: {VOLUME_MULTIPLIER}x"
+        f"Volume multiplier: "
+        f"{VOLUME_MULTIPLIER}x"
     )
 
     print(
@@ -866,6 +1013,11 @@ def main():
     print(
         f"Minimum 24H volume: "
         f"${MIN_24H_QUOTE_VOLUME:,.0f}"
+    )
+
+    print(
+        f"Symbol cooldown: "
+        f"{COOLDOWN_HOURS} hours"
     )
 
     print(
