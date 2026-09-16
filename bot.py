@@ -6,16 +6,30 @@ from datetime import datetime, timezone
 
 # ============================================================
 # BINANCE MOMENTUM + VWAP BUY BOT
-# ONLY BULLISH BUY SIGNALS
+# ============================================================
 #
-# LOGIC:
-# 1. Every 20 seconds the bot checks Binance.
-# 2. Only the latest CLOSED 5m candle is analyzed.
-# 3. Every new closed candle is checked independently.
-# 4. If ALL conditions pass -> BUY signal.
-# 5. If 1 or 2 conditions fail -> DEBUG log.
-# 6. If 3+ conditions fail -> no debug log.
-# 7. Same symbol has 24-hour cooldown after successful BUY.
+# TIMEFRAME:
+# 5m
+#
+# BUY CONDITIONS:
+#
+# 1. Latest CLOSED candle must be bullish
+# 2. Bullish body >= 80% of total candle range
+# 3. Current candle volume > EACH of previous 10 candles
+# 4. Current candle range > EACH of previous 10 candles
+# 5. Buy Volume > Sell Volume
+# 6. Current close breaks previous 10 candle high
+# 7. Current close > VWAP
+# 8. Current VWAP > previous VWAP
+# 9. 24H quote volume >= $10M
+#
+# AFTER SIGNAL:
+# Same coin is blocked for 50 CLOSED 5m candles.
+#
+# OLD SYSTEM REMOVED:
+# - 20 candle average volume
+# - 1.5x volume multiplier
+# - 24 hour cooldown
 # ============================================================
 
 
@@ -31,44 +45,32 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 INTERVAL = "5m"
 
-# Check Binance every 20 seconds
 SCAN_SECONDS = 20
 
 
 # ============================================================
-# SAME COIN COOLDOWN
+# PREVIOUS CANDLE COMPARISON
 # ============================================================
 
-COOLDOWN_HOURS = 24
-
-
-# ============================================================
-# BREAKOUT
-# ============================================================
-
-BREAKOUT_LOOKBACK = 10
+LOOKBACK_CANDLES = 10
 
 
 # ============================================================
-# VOLUME MOMENTUM
+# STRONG BULLISH BODY
 # ============================================================
 
-VOLUME_LOOKBACK = 20
-VOLUME_MULTIPLIER = 1.5
+MIN_BODY_RATIO = 0.80
 
 
 # ============================================================
-# STRONG BULLISH CANDLE
+# 50-CANDLE COOLDOWN
 # ============================================================
 
-MIN_BODY_RATIO = 0.60
+COOLDOWN_CANDLES = 50
 
 
 # ============================================================
 # MINIMUM 24H QUOTE VOLUME
-#
-# IMPORTANT:
-# $10,000,000
 # ============================================================
 
 MIN_24H_QUOTE_VOLUME = 10_000_000
@@ -76,8 +78,6 @@ MIN_24H_QUOTE_VOLUME = 10_000_000
 
 # ============================================================
 # ALL BINANCE SPOT USDT SYMBOLS
-#
-# None = scan all eligible symbols
 # ============================================================
 
 MAX_SYMBOLS = None
@@ -87,23 +87,27 @@ MAX_SYMBOLS = None
 # SESSION STATE
 # ============================================================
 
-# Prevent processing the exact same candle repeatedly.
+# Prevent processing same candle more than once.
 processed_signals = set()
 
 
 # ============================================================
-# LAST SUCCESSFUL BUY TIME
+# COOLDOWN STATE
 #
-# Same coin cannot signal again for 24 hours.
+# symbol:
+# {
+#     "signal_candle": candle_open_time,
+#     "signal_index": global candle index
+# }
+#
+# We use candle timestamps instead of wall-clock time.
 # ============================================================
 
-last_signal_time = {}
+cooldown_state = {}
 
 
 # ============================================================
-# LAST CLOSED CANDLE SEEN PER SYMBOL
-#
-# Used to recognize a new closed candle.
+# LAST CLOSED CANDLE
 # ============================================================
 
 last_closed_candle = {}
@@ -116,7 +120,7 @@ last_closed_candle = {}
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "MomentumVWAPBot/1.0"
+    "User-Agent": "MomentumVWAPBot/2.0"
 })
 
 
@@ -293,7 +297,7 @@ def get_24h_volumes():
 # GET CLOSED 5M CANDLES
 # ============================================================
 
-def get_klines(symbol, limit=100):
+def get_klines(symbol, limit=300):
 
     data = binance_get(
         "/api/v3/klines",
@@ -322,7 +326,7 @@ def get_klines(symbol, limit=100):
             candle[6]
         )
 
-        # Only fully closed candles
+        # Only fully closed candles.
         if close_time <= now_ms:
 
             closed.append(candle)
@@ -355,6 +359,7 @@ def calculate_session_vwap(candles):
     ).date()
 
     cumulative_pv = 0.0
+
     cumulative_volume = 0.0
 
     for candle in candles:
@@ -389,11 +394,14 @@ def calculate_session_vwap(candles):
         )
 
         typical_price = (
-            high + low + close
+            high +
+            low +
+            close
         ) / 3.0
 
         cumulative_pv += (
-            typical_price * volume
+            typical_price *
+            volume
         )
 
         cumulative_volume += volume
@@ -409,10 +417,12 @@ def calculate_session_vwap(candles):
 
 
 # ============================================================
-# PREVIOUS SESSION VWAP
+# PREVIOUS VWAP
+#
+# VWAP calculated without latest signal candle.
 # ============================================================
 
-def calculate_previous_session_vwap(candles):
+def calculate_previous_vwap(candles):
 
     if len(candles) < 2:
 
@@ -449,49 +459,87 @@ def format_price(price):
 
 
 # ============================================================
-# 24-HOUR COOLDOWN CHECK
+# FORMAT VOLUME
 # ============================================================
 
-def symbol_is_in_cooldown(symbol):
+def format_volume(value):
 
-    if symbol not in last_signal_time:
+    if value >= 1_000_000:
+
+        return f"${value / 1_000_000:.2f}M"
+
+    if value >= 1_000:
+
+        return f"${value / 1_000:.2f}K"
+
+    return f"${value:.2f}"
+
+
+# ============================================================
+# COOLDOWN CHECK
+#
+# IMPORTANT:
+#
+# Signal candle itself = candle 0
+#
+# Next closed candles:
+# 1, 2, 3 ... 50
+#
+# During these 50 candles:
+# NO NEW SIGNAL.
+#
+# After candle 50:
+# NEW SIGNAL IS ALLOWED.
+# ============================================================
+
+def is_in_cooldown(
+    symbol,
+    current_candle_time
+):
+
+    if symbol not in cooldown_state:
 
         return False
 
-    current_time = time.time()
+    signal_candle_time = cooldown_state[
+        symbol
+    ]
 
-    elapsed = (
-        current_time -
-        last_signal_time[symbol]
+    interval_seconds = 5 * 60
+
+    elapsed_candles = int(
+        (
+            current_candle_time -
+            signal_candle_time
+        ) /
+        (interval_seconds * 1000)
     )
 
-    cooldown_seconds = (
-        COOLDOWN_HOURS * 60 * 60
-    )
-
-    if elapsed < cooldown_seconds:
+    # Signal candle = 0
+    #
+    # 1 through 50 = blocked
+    if elapsed_candles <= COOLDOWN_CANDLES:
 
         remaining = (
-            cooldown_seconds -
-            elapsed
-        )
-
-        remaining_hours = (
-            remaining / 3600
+            COOLDOWN_CANDLES -
+            elapsed_candles
         )
 
         print(
-            f"[COOLDOWN] {symbol} | "
-            f"{remaining_hours:.1f}h remaining"
+            f"[50-CANDLE COOLDOWN] "
+            f"{symbol} | "
+            f"{remaining} candles remaining"
         )
 
         return True
 
-    # Cooldown expired
-    del last_signal_time[symbol]
+    # Cooldown finished.
+
+    del cooldown_state[symbol]
 
     print(
-        f"[COOLDOWN EXPIRED] {symbol}"
+        f"[COOLDOWN EXPIRED] "
+        f"{symbol}"
     )
 
     return False
@@ -500,8 +548,8 @@ def symbol_is_in_cooldown(symbol):
 # ============================================================
 # DEBUG
 #
-# Only show when 1 or 2 conditions fail.
-# 3+ failures = SILENT.
+# Only print when 1 or 2 conditions fail.
+# 3+ failures = silent.
 # ============================================================
 
 def print_debug_if_needed(
@@ -517,17 +565,15 @@ def print_debug_if_needed(
         if not passed
     ]
 
-    failed_count = len(failed)
+    failed_count = len(
+        failed
+    )
 
-    # 3 or more failures:
-    # don't write debug log
-    if failed_count > 2:
+    if failed_count == 0:
 
         return
 
-    # All conditions passed:
-    # BUY signal handles this
-    if failed_count == 0:
+    if failed_count > 2:
 
         return
 
@@ -539,6 +585,7 @@ def print_debug_if_needed(
     )
 
     print("")
+
     print(
         "--------------------------------------------------"
     )
@@ -582,19 +629,10 @@ def analyze_symbol(
 ):
 
     # ========================================================
-    # 24H VOLUME FILTER
+    # 24H VOLUME
     # ========================================================
 
     if quote_volume < MIN_24H_QUOTE_VOLUME:
-
-        return None
-
-
-    # ========================================================
-    # 24H COOLDOWN
-    # ========================================================
-
-    if symbol_is_in_cooldown(symbol):
 
         return None
 
@@ -608,13 +646,17 @@ def analyze_symbol(
         limit=300
     )
 
-    if len(candles) < 30:
+    minimum_required = (
+        LOOKBACK_CANDLES + 2
+    )
+
+    if len(candles) < minimum_required:
 
         return None
 
 
     # ========================================================
-    # LAST CLOSED CANDLE
+    # LATEST CLOSED CANDLE
     # ========================================================
 
     signal_candle = candles[-1]
@@ -630,7 +672,7 @@ def analyze_symbol(
 
 
     # ========================================================
-    # SAME CANDLE ALREADY PROCESSED
+    # SAME CANDLE PROCESSED
     # ========================================================
 
     if signal_key in processed_signals:
@@ -639,9 +681,7 @@ def analyze_symbol(
 
 
     # ========================================================
-    # MARK CANDLE AS PROCESSED
-    #
-    # Every closed candle is processed exactly once.
+    # MARK AS PROCESSED
     # ========================================================
 
     processed_signals.add(
@@ -650,7 +690,21 @@ def analyze_symbol(
 
 
     # ========================================================
-    # OHLCV
+    # 50 CANDLE COOLDOWN
+    #
+    # Check before expensive calculations.
+    # ========================================================
+
+    if is_in_cooldown(
+        symbol,
+        signal_open_time
+    ):
+
+        return None
+
+
+    # ========================================================
+    # CURRENT OHLCV
     # ========================================================
 
     open_price = float(
@@ -673,9 +727,39 @@ def analyze_symbol(
         signal_candle[5]
     )
 
+    # Binance kline index [7]:
+    # Quote Asset Volume
+    quote_asset_volume = float(
+        signal_candle[7]
+    )
+
+    # Binance kline index [10]:
+    # Taker Buy Quote Asset Volume
+    buy_quote_volume = float(
+        signal_candle[10]
+    )
+
+    sell_quote_volume = (
+        quote_asset_volume -
+        buy_quote_volume
+    )
+
 
     # ========================================================
-    # ALL CONDITIONS
+    # PREVIOUS 10 CANDLES
+    # ========================================================
+
+    previous_candles = candles[
+        -(LOOKBACK_CANDLES + 1):-1
+    ]
+
+    if len(previous_candles) < LOOKBACK_CANDLES:
+
+        return None
+
+
+    # ========================================================
+    # CHECKS
     # ========================================================
 
     checks = []
@@ -694,150 +778,214 @@ def analyze_symbol(
             "Bullish Candle",
             bullish,
             (
-                f"Close={format_price(close)} "
-                f"<= Open={format_price(open_price)}"
-                if not bullish
+                f"Close {format_price(close)} "
+                f"> Open {format_price(open_price)}"
+                if bullish
                 else
-                f"Close={format_price(close)} "
-                f"> Open={format_price(open_price)}"
+                f"Close {format_price(close)} "
+                f"<= Open {format_price(open_price)}"
             )
         )
     )
 
 
     # ========================================================
-    # RANGE
+    # CURRENT RANGE
     # ========================================================
 
-    candle_range = (
+    current_range = (
         high - low
     )
 
-    if candle_range <= 0:
-
-        checks.append(
-            (
-                "Strong Bullish Body",
-                False,
-                "Candle range <= 0"
-            )
-        )
-
-        checks.append(
-            (
-                "10-Candle Breakout",
-                False,
-                "Invalid candle range"
-            )
-        )
-
-        checks.append(
-            (
-                "Volume Momentum",
-                False,
-                "Invalid candle range"
-            )
-        )
-
-        checks.append(
-            (
-                "Price > VWAP",
-                False,
-                "Invalid candle range"
-            )
-        )
-
-        checks.append(
-            (
-                "VWAP Rising",
-                False,
-                "Invalid candle range"
-            )
-        )
-
-        print_debug_if_needed(
-            symbol,
-            signal_candle,
-            checks
-        )
-
-        return None
-
 
     # ========================================================
-    # 2. STRONG BULLISH BODY
+    # 2. BODY >= 80%
     # ========================================================
 
-    body = (
-        close - open_price
-    )
+    if current_range <= 0:
 
-    body_ratio = (
-        body /
-        candle_range
-    )
+        body_ratio = 0.0
 
-    body_pass = (
-        body_ratio >= MIN_BODY_RATIO
-    )
+        body_pass = False
 
-    checks.append(
-        (
-            "Strong Bullish Body",
-            body_pass,
-            (
-                f"{body_ratio * 100:.1f}% "
-                f"< {MIN_BODY_RATIO * 100:.0f}%"
-                if not body_pass
-                else
-                f"{body_ratio * 100:.1f}%"
-            )
-        )
-    )
-
-
-    # ========================================================
-    # 3. PREVIOUS 10 CANDLE HIGH
-    # ========================================================
-
-    previous_candles = candles[
-        -(BREAKOUT_LOOKBACK + 1):-1
-    ]
-
-    if len(previous_candles) < BREAKOUT_LOOKBACK:
-
-        breakout_pass = False
-
-        previous_high = None
-
-        breakout_value = (
-            "Not enough previous candles"
+        body_value = (
+            "Range <= 0"
         )
 
     else:
 
-        previous_high = max(
-            float(c[2])
-            for c in previous_candles
+        body = (
+            close -
+            open_price
         )
 
-        breakout_pass = (
-            close > previous_high
+        body_ratio = (
+            body /
+            current_range
         )
 
-        if breakout_pass:
+        body_pass = (
+            body_ratio >=
+            MIN_BODY_RATIO
+        )
 
-            breakout_value = (
-                f"Close {format_price(close)} "
-                f"> High {format_price(previous_high)}"
-            )
+        body_value = (
+            f"{body_ratio * 100:.1f}%"
+        )
 
-        else:
+    checks.append(
+        (
+            "Bullish Body >= 80%",
+            body_pass,
+            body_value
+        )
+    )
 
-            breakout_value = (
-                f"Close {format_price(close)} "
-                f"<= High {format_price(previous_high)}"
-            )
+
+    # ========================================================
+    # 3. VOLUME > ALL PREVIOUS 10
+    # ========================================================
+
+    previous_volumes = [
+        float(c[5])
+        for c in previous_candles
+    ]
+
+    max_previous_volume = max(
+        previous_volumes
+    )
+
+    volume_pass = (
+        volume >
+        max_previous_volume
+    )
+
+    if volume_pass:
+
+        volume_value = (
+            f"{volume:.2f} > "
+            f"{max_previous_volume:.2f}"
+        )
+
+    else:
+
+        volume_value = (
+            f"{volume:.2f} <= "
+            f"{max_previous_volume:.2f}"
+        )
+
+    checks.append(
+        (
+            "Volume > Previous 10",
+            volume_pass,
+            volume_value
+        )
+    )
+
+
+    # ========================================================
+    # 4. RANGE > ALL PREVIOUS 10
+    # ========================================================
+
+    previous_ranges = [
+
+        float(c[2]) -
+        float(c[3])
+
+        for c in previous_candles
+    ]
+
+    max_previous_range = max(
+        previous_ranges
+    )
+
+    range_pass = (
+        current_range >
+        max_previous_range
+    )
+
+    if range_pass:
+
+        range_value = (
+            f"{current_range:.8f} > "
+            f"{max_previous_range:.8f}"
+        )
+
+    else:
+
+        range_value = (
+            f"{current_range:.8f} <= "
+            f"{max_previous_range:.8f}"
+        )
+
+    checks.append(
+        (
+            "Range > Previous 10",
+            range_pass,
+            range_value
+        )
+    )
+
+
+    # ========================================================
+    # 5. BUY > SELL
+    # ========================================================
+
+    buy_sell_pass = (
+        buy_quote_volume >
+        sell_quote_volume
+    )
+
+    if buy_sell_pass:
+
+        buy_sell_value = (
+            f"Buy {format_volume(buy_quote_volume)} "
+            f"> Sell {format_volume(sell_quote_volume)}"
+        )
+
+    else:
+
+        buy_sell_value = (
+            f"Buy {format_volume(buy_quote_volume)} "
+            f"<= Sell {format_volume(sell_quote_volume)}"
+        )
+
+    checks.append(
+        (
+            "Buy Volume > Sell Volume",
+            buy_sell_pass,
+            buy_sell_value
+        )
+    )
+
+
+    # ========================================================
+    # 6. 10-CANDLE BREAKOUT
+    # ========================================================
+
+    previous_high = max(
+        float(c[2])
+        for c in previous_candles
+    )
+
+    breakout_pass = (
+        close >
+        previous_high
+    )
+
+    if breakout_pass:
+
+        breakout_value = (
+            f"Close {format_price(close)} "
+            f"> High {format_price(previous_high)}"
+        )
+
+    else:
+
+        breakout_value = (
+            f"Close {format_price(close)} "
+            f"<= High {format_price(previous_high)}"
+        )
 
     checks.append(
         (
@@ -849,78 +997,7 @@ def analyze_symbol(
 
 
     # ========================================================
-    # 4. VOLUME MOMENTUM
-    # ========================================================
-
-    volume_candles = candles[
-        -(VOLUME_LOOKBACK + 1):-1
-    ]
-
-    if len(volume_candles) < VOLUME_LOOKBACK:
-
-        volume_pass = False
-
-        average_volume = 0.0
-
-        volume_ratio = 0.0
-
-        volume_value = (
-            "Not enough previous candles"
-        )
-
-    else:
-
-        average_volume = sum(
-            float(c[5])
-            for c in volume_candles
-        ) / len(volume_candles)
-
-        if average_volume <= 0:
-
-            volume_pass = False
-
-            volume_ratio = 0.0
-
-            volume_value = (
-                "Average volume <= 0"
-            )
-
-        else:
-
-            volume_ratio = (
-                volume /
-                average_volume
-            )
-
-            volume_pass = (
-                volume_ratio >=
-                VOLUME_MULTIPLIER
-            )
-
-            if volume_pass:
-
-                volume_value = (
-                    f"{volume_ratio:.2f}x"
-                )
-
-            else:
-
-                volume_value = (
-                    f"{volume_ratio:.2f}x "
-                    f"< {VOLUME_MULTIPLIER:.2f}x"
-                )
-
-    checks.append(
-        (
-            "Volume Momentum",
-            volume_pass,
-            volume_value
-        )
-    )
-
-
-    # ========================================================
-    # 5. VWAP
+    # 7. VWAP
     # ========================================================
 
     vwap = calculate_session_vwap(
@@ -928,7 +1005,7 @@ def analyze_symbol(
     )
 
     previous_vwap = (
-        calculate_previous_session_vwap(
+        calculate_previous_vwap(
             candles
         )
     )
@@ -944,7 +1021,8 @@ def analyze_symbol(
     else:
 
         price_vwap_pass = (
-            close > vwap
+            close >
+            vwap
         )
 
         if price_vwap_pass:
@@ -971,7 +1049,7 @@ def analyze_symbol(
 
 
     # ========================================================
-    # 6. VWAP RISING
+    # 8. VWAP RISING
     # ========================================================
 
     if (
@@ -982,27 +1060,28 @@ def analyze_symbol(
         vwap_rising_pass = False
 
         vwap_rising_value = (
-            "Previous VWAP unavailable"
+            "VWAP unavailable"
         )
 
     else:
 
         vwap_rising_pass = (
-            vwap > previous_vwap
+            vwap >
+            previous_vwap
         )
 
         if vwap_rising_pass:
 
             vwap_rising_value = (
                 f"{format_price(previous_vwap)} "
-                f"→ {format_price(vwap)}"
+                f"-> {format_price(vwap)}"
             )
 
         else:
 
             vwap_rising_value = (
                 f"{format_price(previous_vwap)} "
-                f"→ {format_price(vwap)} "
+                f"-> {format_price(vwap)} "
                 f"(not rising)"
             )
 
@@ -1016,7 +1095,7 @@ def analyze_symbol(
 
 
     # ========================================================
-    # 7. 24H QUOTE VOLUME
+    # 9. 24H QUOTE VOLUME
     # ========================================================
 
     quote_volume_pass = (
@@ -1026,26 +1105,29 @@ def analyze_symbol(
 
     checks.append(
         (
-            "24H Volume",
+            "24H Volume >= $10M",
             quote_volume_pass,
             (
-                f"${quote_volume:,.0f} "
-                f"< ${MIN_24H_QUOTE_VOLUME:,.0f}"
-                if not quote_volume_pass
-                else
                 f"${quote_volume:,.0f}"
+                if quote_volume_pass
+                else
+                f"${quote_volume:,.0f} "
+                f"< $10,000,000"
             )
         )
     )
 
 
     # ========================================================
-    # COUNT FAILED CONDITIONS
+    # COUNT FAILED
     # ========================================================
 
     failed_conditions = [
+
         item
+
         for item in checks
+
         if not item[1]
     ]
 
@@ -1056,8 +1138,6 @@ def analyze_symbol(
 
     # ========================================================
     # DEBUG
-    #
-    # Only 1 or 2 failed conditions are shown.
     # ========================================================
 
     if failed_count > 0:
@@ -1067,13 +1147,6 @@ def analyze_symbol(
             signal_candle,
             checks
         )
-
-
-    # ========================================================
-    # ALL CONDITIONS MUST PASS
-    # ========================================================
-
-    if failed_count != 0:
 
         return None
 
@@ -1094,17 +1167,27 @@ def analyze_symbol(
 
         "low": low,
 
+        "range": current_range,
+
         "vwap": vwap,
 
         "previous_vwap": previous_vwap,
 
         "body_ratio": body_ratio,
 
-        "volume_ratio": volume_ratio,
+        "volume": volume,
 
-        "previous_high": previous_high,
+        "previous_max_volume": max_previous_volume,
+
+        "previous_max_range": max_previous_range,
+
+        "buy_volume": buy_quote_volume,
+
+        "sell_volume": sell_quote_volume,
 
         "quote_volume": quote_volume,
+
+        "previous_high": previous_high,
 
         "candle_time": signal_open_time
     }
@@ -1129,8 +1212,28 @@ def send_buy_signal(signal):
         100
     )
 
-    volume_multiple = (
-        signal["volume_ratio"]
+    current_volume = (
+        signal["volume"]
+    )
+
+    previous_max_volume = (
+        signal["previous_max_volume"]
+    )
+
+    current_range = (
+        signal["range"]
+    )
+
+    previous_max_range = (
+        signal["previous_max_range"]
+    )
+
+    buy_volume = (
+        signal["buy_volume"]
+    )
+
+    sell_volume = (
+        signal["sell_volume"]
     )
 
     quote_volume = (
@@ -1160,11 +1263,26 @@ def send_buy_signal(signal):
         f"🚀 <b>Breakout High:</b> "
         f"{format_price(previous_high)}\n\n"
 
-        f"💪 <b>Candle Body:</b> "
+        f"💪 <b>Bullish Body:</b> "
         f"{body_percent:.1f}%\n"
 
-        f"🔥 <b>Volume:</b> "
-        f"{volume_multiple:.2f}× average\n\n"
+        f"🔥 <b>Current Volume:</b> "
+        f"{current_volume:.2f}\n"
+
+        f"📊 <b>Previous Max Volume:</b> "
+        f"{previous_max_volume:.2f}\n\n"
+
+        f"📏 <b>Current Range:</b> "
+        f"{current_range:.8f}\n"
+
+        f"📏 <b>Previous Max Range:</b> "
+        f"{previous_max_range:.8f}\n\n"
+
+        f"🟢 <b>Buy Volume:</b> "
+        f"{format_volume(buy_volume)}\n"
+
+        f"🔴 <b>Sell Volume:</b> "
+        f"{format_volume(sell_volume)}\n\n"
 
         f"💵 <b>24H Volume:</b> "
         f"${quote_volume:,.0f}\n\n"
@@ -1172,19 +1290,22 @@ def send_buy_signal(signal):
         f"🕐 <b>Candle:</b> "
         f"{candle_time}\n\n"
 
-        "✅ VWAP ABOVE\n"
+        "✅ BULLISH CANDLE\n"
+        "✅ BODY ≥ 80%\n"
+        "✅ VOLUME > PREVIOUS 10\n"
+        "✅ RANGE > PREVIOUS 10\n"
+        "✅ BUY > SELL\n"
+        "✅ 10-CANDLE BREAKOUT\n"
+        "✅ PRICE > VWAP\n"
         "✅ VWAP RISING\n"
-        "✅ STRONG BULLISH CANDLE\n"
-        "✅ HIGH BREAKOUT\n"
-        "✅ VOLUME MOMENTUM\n"
         "✅ 24H VOLUME ≥ $10M\n\n"
 
-        "⏳ <b>24H COOLDOWN STARTED</b>"
+        "⏳ <b>50-CANDLE COOLDOWN STARTED</b>"
     )
 
 
     # ========================================================
-    # SEND TELEGRAM FIRST
+    # SEND TELEGRAM
     # ========================================================
 
     sent = send_telegram(
@@ -1193,19 +1314,20 @@ def send_buy_signal(signal):
 
 
     # ========================================================
-    # ONLY START COOLDOWN IF TELEGRAM SUCCESSFUL
+    # START 50-CANDLE COOLDOWN
+    # ONLY IF TELEGRAM SUCCESSFUL
     # ========================================================
 
     if sent:
 
-        last_signal_time[symbol] = (
-            time.time()
-        )
+        cooldown_state[
+            symbol
+        ] = signal["candle_time"]
 
         print(
             f"[COOLDOWN START] "
             f"{symbol} | "
-            f"{COOLDOWN_HOURS} hours"
+            f"{COOLDOWN_CANDLES} candles"
         )
 
     else:
@@ -1223,6 +1345,7 @@ def send_buy_signal(signal):
 def scan():
 
     print("")
+
     print(
         "=================================================="
     )
@@ -1238,7 +1361,7 @@ def scan():
 
 
     # ========================================================
-    # GET SYMBOLS
+    # SYMBOLS
     # ========================================================
 
     symbols = get_symbols()
@@ -1259,7 +1382,7 @@ def scan():
 
 
     # ========================================================
-    # GET 24H VOLUMES
+    # 24H VOLUMES
     # ========================================================
 
     volumes = get_24h_volumes()
@@ -1297,7 +1420,7 @@ def scan():
 
 
     # ========================================================
-    # ANALYZE EACH SYMBOL
+    # ANALYZE
     # ========================================================
 
     for index, symbol in enumerate(
@@ -1321,14 +1444,20 @@ def scan():
 
             if signal:
 
+                print("")
+
                 print(
                     f"[BUY] {symbol} | "
                     f"Price="
                     f"{format_price(signal['price'])} | "
                     f"VWAP="
                     f"{format_price(signal['vwap'])} | "
-                    f"Volume="
-                    f"{signal['volume_ratio']:.2f}x"
+                    f"Body="
+                    f"{signal['body_ratio'] * 100:.1f}% | "
+                    f"Buy="
+                    f"{format_volume(signal['buy_volume'])} | "
+                    f"Sell="
+                    f"{format_volume(signal['sell_volume'])}"
                 )
 
 
@@ -1358,7 +1487,7 @@ def scan():
 
 
     # ========================================================
-    # CLEAN OLD CANDLE STATE
+    # CLEAN OLD PROCESSED STATE
     # ========================================================
 
     if len(processed_signals) > 20000:
@@ -1367,12 +1496,13 @@ def scan():
 
 
 # ============================================================
-# MAIN LOOP
+# MAIN
 # ============================================================
 
 def main():
 
     print("")
+
     print(
         "=================================================="
     )
@@ -1394,23 +1524,33 @@ def main():
     )
 
     print(
-        f"Breakout lookback: "
-        f"{BREAKOUT_LOOKBACK} candles"
+        f"Previous candle comparison: "
+        f"{LOOKBACK_CANDLES}"
     )
 
     print(
-        f"Volume multiplier: "
-        f"{VOLUME_MULTIPLIER}x"
-    )
-
-    print(
-        f"Volume lookback: "
-        f"{VOLUME_LOOKBACK} candles"
-    )
-
-    print(
-        f"Minimum body ratio: "
+        f"Minimum bullish body: "
         f"{MIN_BODY_RATIO * 100:.0f}%"
+    )
+
+    print(
+        "Volume rule: "
+        "CURRENT > ALL PREVIOUS 10"
+    )
+
+    print(
+        "Range rule: "
+        "CURRENT > ALL PREVIOUS 10"
+    )
+
+    print(
+        "Buy/Sell rule: "
+        "BUY > SELL"
+    )
+
+    print(
+        "Breakout: "
+        "PREVIOUS 10 CANDLE HIGH"
     )
 
     print(
@@ -1419,18 +1559,13 @@ def main():
     )
 
     print(
-        f"Symbol cooldown: "
-        f"{COOLDOWN_HOURS} hours"
+        f"Cooldown: "
+        f"{COOLDOWN_CANDLES} CLOSED CANDLES"
     )
 
     print(
         "Candle processing: "
         "CLOSED CANDLES ONLY"
-    )
-
-    print(
-        "Debug: "
-        "ONLY 1-2 FAILED CONDITIONS"
     )
 
     print(
