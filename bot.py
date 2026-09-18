@@ -5,60 +5,48 @@ from datetime import datetime, timezone
 
 
 # ============================================================
-# BINANCE TOP 100 EMA20 / EMA50 BULLISH BREAKOUT BOT
+# BINANCE GAINERS + EMA20 / EMA50 BUY BOT
 # ============================================================
 #
 # TIMEFRAME:
-#   5m
+#   1H
 #
-# COINS:
-#   Binance Spot USDT
-#   Top 100 by Binance 24H quote volume
+# SCAN:
+#   Every 20 seconds
 #
-# STRATEGY:
+# UNIVERSE:
+#   ALL Binance Spot USDT pairs
 #
-# 1. Bullish breakout candle.
+# FILTER 1:
+#   24H Quote Volume >= 20,000,000 USDT
 #
-# 2. Breakout candle OPEN:
-#      > EMA20
-#      > EMA50
+# FILTER 2:
+#   Binance 24H price change >= +3%
 #
-# 3. Breakout candle CLOSE:
-#      > EMA20
-#      > EMA50
+# FILTER 3:
+#   EMA20 > EMA50
 #
-# 4. Breakout candle BODY must be >= 90%
-#    of total candle range.
+# FILTER 4:
+#   Last CLOSED 1H candle:
 #
-# 5. Breakout candle CLOSE must break
-#    the previous 20 candles HIGH.
+#       OPEN  > EMA20
+#       OPEN  > EMA50
 #
-# 6. After breakout:
-#    wait for 2 CLOSED candles.
+#       CLOSE > EMA20
+#       CLOSE > EMA50
 #
-# 7. If either of those 2 candles has a HIGH
-#    above breakout candle HIGH:
-#       CANCEL setup.
+# SIGNAL:
+#   BUY signal when all conditions are satisfied.
 #
-# 8. If both candles remain below breakout HIGH:
-#       BUY SIGNAL after 2nd candle CLOSE.
+# COOLDOWN:
+#   24 hours per symbol after signal.
 #
-# 9. After signal:
-#       NO MORE SIGNAL for this coin.
-#
-# 10. RESET:
-#       20 consecutive CLOSED candles must have:
-#
-#       OPEN  < EMA20 AND EMA50
-#       CLOSE < EMA20 AND EMA50
-#
-#       Then the coin becomes READY again.
-#
-# IMPORTANT:
-#   EMA20 > EMA50 is NOT required.
-#
-#   Breakout must be confirmed by CLOSE,
-#   not by wick.
+# NO:
+#   Top 100
+#   Breakout
+#   90% body
+#   Confirmation candles
+#   Reset candles
 #
 # ============================================================
 
@@ -79,43 +67,37 @@ TELEGRAM_CHAT_ID = os.getenv(
 # SETTINGS
 # ============================================================
 
-INTERVAL = "5m"
+INTERVAL = "1h"
 
 SCAN_SECONDS = 20
 
-TOP_COINS = 100
+MIN_24H_QUOTE_VOLUME = 20_000_000
+
+MIN_24H_GAIN_PERCENT = 3.0
 
 EMA_FAST = 20
+
 EMA_SLOW = 50
 
-BREAKOUT_LOOKBACK = 20
+COOLDOWN_HOURS = 24
 
-CONFIRMATION_CANDLES = 2
+COOLDOWN_SECONDS = (
+    COOLDOWN_HOURS * 60 * 60
+)
 
-RESET_CANDLES = 20
-
-MIN_BODY_RATIO = 0.90
-
-KLINE_LIMIT = 200
+KLINE_LIMIT = 100
 
 
 # ============================================================
 # STATE
 # ============================================================
 
-# READY
-# WAIT_CONFIRMATION
-# SIGNALLED
+# symbol -> cooldown start timestamp
+cooldowns = {}
 
-coin_state = {}
 
-breakout_data = {}
-
-reset_count = {}
-
-last_closed_candle = {}
-
-processed_signals = set()
+# symbol -> last processed closed candle open time
+last_processed_candle = {}
 
 
 # ============================================================
@@ -125,7 +107,7 @@ processed_signals = set()
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "BinanceTop100EMABot/2.0"
+    "User-Agent": "BinanceGainersEMABot/1.0"
 })
 
 
@@ -133,7 +115,10 @@ session.headers.update({
 # BINANCE REQUEST
 # ============================================================
 
-def binance_get(endpoint, params=None):
+def binance_get(
+    endpoint,
+    params=None
+):
 
     url = BINANCE_BASE_URL + endpoint
 
@@ -172,7 +157,8 @@ def send_telegram(message):
 
         print(
             "[TELEGRAM ERROR] "
-            "Missing environment variables"
+            "Missing TELEGRAM_BOT_TOKEN "
+            "or TELEGRAM_CHAT_ID"
         )
 
         return False
@@ -203,7 +189,9 @@ def send_telegram(message):
 
         if response.ok:
 
-            print("[TELEGRAM] Sent")
+            print(
+                "[TELEGRAM] Signal sent"
+            )
 
             return True
 
@@ -236,9 +224,9 @@ def get_spot_usdt_symbols():
 
     if not data:
 
-        return []
+        return set()
 
-    symbols = []
+    symbols = set()
 
     for item in data.get(
         "symbols",
@@ -269,7 +257,7 @@ def get_spot_usdt_symbols():
 
         if symbol:
 
-            symbols.append(
+            symbols.add(
                 symbol
             )
 
@@ -277,56 +265,25 @@ def get_spot_usdt_symbols():
 
 
 # ============================================================
-# GET 24H VOLUME
+# GET BINANCE 24H GAINERS
+# ============================================================
+#
+# Returns:
+#
+# symbol
+# priceChangePercent
+# quoteVolume
+#
+# Then:
+#
+# 1. Spot USDT only
+# 2. Volume >= 20M
+# 3. Gain >= +3%
+# 4. Sort highest gain first
+#
 # ============================================================
 
-def get_24h_volumes():
-
-    data = binance_get(
-        "/api/v3/ticker/24hr"
-    )
-
-    if not data:
-
-        return {}
-
-    volumes = {}
-
-    for item in data:
-
-        symbol = item.get(
-            "symbol"
-        )
-
-        if not symbol:
-
-            continue
-
-        try:
-
-            quote_volume = float(
-                item.get(
-                    "quoteVolume",
-                    0
-                )
-            )
-
-            volumes[symbol] = (
-                quote_volume
-            )
-
-        except Exception:
-
-            continue
-
-    return volumes
-
-
-# ============================================================
-# GET TOP 100
-# ============================================================
-
-def get_top_100_symbols():
+def get_gainers():
 
     spot_symbols = (
         get_spot_usdt_symbols()
@@ -336,36 +293,96 @@ def get_top_100_symbols():
 
         return []
 
-    volumes = (
-        get_24h_volumes()
+    data = binance_get(
+        "/api/v3/ticker/24hr"
     )
 
-    if not volumes:
+    if not data:
 
         return []
 
-    eligible = [
-        symbol
-        for symbol in spot_symbols
-        if symbol in volumes
-    ]
+    gainers = []
 
-    eligible.sort(
-        key=lambda symbol:
-        volumes.get(
-            symbol,
-            0
-        ),
+    for item in data:
+
+        symbol = item.get(
+            "symbol"
+        )
+
+        if symbol not in spot_symbols:
+
+            continue
+
+        try:
+
+            change_percent = float(
+                item.get(
+                    "priceChangePercent",
+                    0
+                )
+            )
+
+            quote_volume = float(
+                item.get(
+                    "quoteVolume",
+                    0
+                )
+            )
+
+        except Exception:
+
+            continue
+
+        # ====================================================
+        # 24H VOLUME FILTER
+        # ====================================================
+
+        if (
+            quote_volume
+            < MIN_24H_QUOTE_VOLUME
+        ):
+
+            continue
+
+        # ====================================================
+        # 24H GAIN FILTER
+        # ====================================================
+
+        if (
+            change_percent
+            < MIN_24H_GAIN_PERCENT
+        ):
+
+            continue
+
+        gainers.append({
+
+            "symbol": symbol,
+
+            "change_percent":
+                change_percent,
+
+            "quote_volume":
+                quote_volume
+
+        })
+
+
+    # ========================================================
+    # HIGHEST GAIN FIRST
+    # ========================================================
+
+    gainers.sort(
+        key=lambda x:
+        x["change_percent"],
         reverse=True
     )
 
-    return eligible[
-        :TOP_COINS
-    ]
+    return gainers
 
 
 # ============================================================
-# GET CLOSED KLINES
+# GET CLOSED 1H KLINES
 # ============================================================
 
 def get_closed_klines(
@@ -400,6 +417,7 @@ def get_closed_klines(
             candle[6]
         )
 
+        # Only completely closed candles
         if close_time <= now_ms:
 
             closed.append(
@@ -427,6 +445,7 @@ def calculate_ema(
         (period + 1)
     )
 
+    # SMA seed
     ema = sum(
         values[:period]
     ) / period
@@ -448,27 +467,37 @@ def calculate_ema(
 
 def candle_open(candle):
 
-    return float(candle[1])
+    return float(
+        candle[1]
+    )
 
 
 def candle_high(candle):
 
-    return float(candle[2])
+    return float(
+        candle[2]
+    )
 
 
 def candle_low(candle):
 
-    return float(candle[3])
+    return float(
+        candle[3]
+    )
 
 
 def candle_close(candle):
 
-    return float(candle[4])
+    return float(
+        candle[4]
+    )
 
 
 def candle_time(candle):
 
-    return int(candle[0])
+    return int(
+        candle[0]
+    )
 
 
 # ============================================================
@@ -501,10 +530,39 @@ def format_price(price):
 
 
 # ============================================================
+# FORMAT VOLUME
+# ============================================================
+
+def format_volume(volume):
+
+    if volume >= 1_000_000_000:
+
+        return (
+            f"{volume / 1_000_000_000:.2f}B"
+        )
+
+    if volume >= 1_000_000:
+
+        return (
+            f"{volume / 1_000_000:.2f}M"
+        )
+
+    if volume >= 1_000:
+
+        return (
+            f"{volume / 1_000:.2f}K"
+        )
+
+    return f"{volume:.2f}"
+
+
+# ============================================================
 # FORMAT TIME
 # ============================================================
 
-def format_time(timestamp_ms):
+def format_time(
+    timestamp_ms
+):
 
     return datetime.fromtimestamp(
         timestamp_ms / 1000,
@@ -515,23 +573,72 @@ def format_time(timestamp_ms):
 
 
 # ============================================================
-# GET EMA VALUES
+# COOLDOWN
 # ============================================================
 
-def get_ema_values(
-    candles,
-    index
+def is_on_cooldown(
+    symbol
 ):
 
-    if index < EMA_SLOW - 1:
+    signal_time = cooldowns.get(
+        symbol
+    )
+
+    if signal_time is None:
+
+        return False
+
+    elapsed = (
+        time.time()
+        - signal_time
+    )
+
+    if elapsed >= COOLDOWN_SECONDS:
+
+        cooldowns.pop(
+            symbol,
+            None
+        )
+
+        print(
+            f"[COOLDOWN EXPIRED] "
+            f"{symbol}"
+        )
+
+        return False
+
+    remaining = (
+        COOLDOWN_SECONDS
+        - elapsed
+    )
+
+    remaining_hours = (
+        remaining / 3600
+    )
+
+    print(
+        f"[COOLDOWN] {symbol} | "
+        f"{remaining_hours:.1f}h remaining"
+    )
+
+    return True
+
+
+# ============================================================
+# GET EMA VALUES FOR LAST CLOSED CANDLE
+# ============================================================
+
+def get_latest_ema_values(
+    candles
+):
+
+    if len(candles) < EMA_SLOW:
 
         return None, None
 
     closes = [
         candle_close(c)
-        for c in candles[
-            :index + 1
-        ]
+        for c in candles
     ]
 
     ema20 = calculate_ema(
@@ -548,21 +655,27 @@ def get_ema_values(
 
 
 # ============================================================
-# RESET CANDLE
+# CHECK STRATEGY
 # ============================================================
 
-def candle_is_reset_candle(
-    candle,
-    ema20,
-    ema50
+def check_strategy(
+    symbol,
+    candles,
+    gain_percent,
+    quote_volume
 ):
 
-    if (
-        ema20 is None
-        or ema50 is None
-    ):
+    if len(candles) < EMA_SLOW:
 
-        return False
+        return None
+
+
+    # ========================================================
+    # LAST CLOSED 1H CANDLE
+    # ========================================================
+
+    candle = candles[-1]
+
 
     open_price = candle_open(
         candle
@@ -572,56 +685,15 @@ def candle_is_reset_candle(
         candle
     )
 
-    return (
-        open_price < ema20
-        and
-        open_price < ema50
-        and
-        close_price < ema20
-        and
-        close_price < ema50
-    )
-
-
-# ============================================================
-# CHECK BREAKOUT
-# ============================================================
-
-def check_breakout(
-    candles,
-    index
-):
-
-    if index < BREAKOUT_LOOKBACK:
-
-        return None
-
-    candle = candles[index]
-
-    open_price = candle_open(
-        candle
-    )
-
-    high = candle_high(
-        candle
-    )
-
-    low = candle_low(
-        candle
-    )
-
-    close = candle_close(
-        candle
-    )
-
 
     # ========================================================
     # EMA
     # ========================================================
 
-    ema20, ema50 = get_ema_values(
-        candles,
-        index
+    ema20, ema50 = (
+        get_latest_ema_values(
+            candles
+        )
     )
 
     if (
@@ -633,16 +705,22 @@ def check_breakout(
 
 
     # ========================================================
-    # 1. BULLISH CANDLE
+    # CONDITION 1
+    #
+    # EMA20 > EMA50
     # ========================================================
 
-    if close <= open_price:
+    if not (
+        ema20 > ema50
+    ):
 
         return None
 
 
     # ========================================================
-    # 2. OPEN ABOVE BOTH EMAs
+    # CONDITION 2
+    #
+    # OPEN ABOVE BOTH EMAs
     # ========================================================
 
     if not (
@@ -655,110 +733,44 @@ def check_breakout(
 
 
     # ========================================================
-    # 3. CLOSE ABOVE BOTH EMAs
+    # CONDITION 3
+    #
+    # CLOSE ABOVE BOTH EMAs
     # ========================================================
 
     if not (
-        close > ema20
+        close_price > ema20
         and
-        close > ema50
+        close_price > ema50
     ):
 
         return None
 
 
     # ========================================================
-    # 4. BODY >= 90%
-    #
-    # Body:
-    #     Close - Open
-    #
-    # Total range:
-    #     High - Low
-    # ========================================================
-
-    candle_range = (
-        high - low
-    )
-
-    if candle_range <= 0:
-
-        return None
-
-    body = (
-        close - open_price
-    )
-
-    body_ratio = (
-        body /
-        candle_range
-    )
-
-    if body_ratio < MIN_BODY_RATIO:
-
-        return None
-
-
-    # ========================================================
-    # 5. PREVIOUS 20 HIGH
-    # ========================================================
-
-    previous_candles = candles[
-        index - BREAKOUT_LOOKBACK:index
-    ]
-
-    if len(
-        previous_candles
-    ) < BREAKOUT_LOOKBACK:
-
-        return None
-
-    previous_20_high = max(
-        candle_high(c)
-        for c in previous_candles
-    )
-
-
-    # ========================================================
-    # 6. BREAKOUT BY CLOSE
-    #
-    # Wick does NOT count.
-    # ========================================================
-
-    if close <= previous_20_high:
-
-        return None
-
-
-    # ========================================================
-    # BREAKOUT FOUND
+    # ALL CONDITIONS PASSED
     # ========================================================
 
     return {
 
-        "index": index,
+        "symbol": symbol,
 
         "open": open_price,
 
-        "high": high,
-
-        "low": low,
-
-        "close": close,
+        "close": close_price,
 
         "ema20": ema20,
 
         "ema50": ema50,
 
-        "body_ratio": body_ratio,
+        "gain_percent":
+            gain_percent,
 
-        "previous_20_high": (
-            previous_20_high
-        ),
+        "quote_volume":
+            quote_volume,
 
-        "open_time": candle_time(
-            candle
-        )
+        "candle_time":
+            candle_time(candle)
     }
 
 
@@ -767,528 +779,222 @@ def check_breakout(
 # ============================================================
 
 def send_buy_signal(
-    symbol,
     data
 ):
 
-    breakout_close = (
-        data["close"]
-    )
-
-    breakout_high = (
-        data["high"]
-    )
-
-    ema20 = data["ema20"]
-
-    ema50 = data["ema50"]
-
-    previous_20_high = (
-        data["previous_20_high"]
-    )
-
-    body_percent = (
-        data["body_ratio"] * 100
-    )
-
-    second_candle_close = (
-        data["second_candle_close"]
-    )
-
-    signal_price = (
-        second_candle_close
-    )
-
-    breakout_time = (
-        data["open_time"]
-    )
-
-    second_candle_time = (
-        data["second_candle_time"]
-    )
-
+    symbol = data[
+        "symbol"
+    ]
 
     message = (
 
-        "🟢 <b>EMA20 / EMA50 BREAKOUT BUY</b>\n\n"
+        "🟢 <b>EMA20 / EMA50 BUY SIGNAL</b>\n\n"
 
-        f"<b>{symbol}</b> — {INTERVAL}\n\n"
+        f"<b>{symbol}</b> — 1H\n\n"
 
-        "🚀 <b>BREAKOUT CANDLE</b>\n"
+        "📈 <b>BINANCE GAINER</b>\n"
+
+        f"24H Change: "
+        f"+{data['gain_percent']:.2f}%\n"
+
+        f"24H Volume: "
+        f"{format_volume(data['quote_volume'])} USDT\n\n"
+
+        "📊 <b>EMA</b>\n"
+
+        f"EMA20: "
+        f"{format_price(data['ema20'])}\n"
+
+        f"EMA50: "
+        f"{format_price(data['ema50'])}\n\n"
+
+        "🕯 <b>LAST CLOSED 1H CANDLE</b>\n"
 
         f"Open: "
         f"{format_price(data['open'])}\n"
 
         f"Close: "
-        f"{format_price(breakout_close)}\n"
+        f"{format_price(data['close'])}\n\n"
 
-        f"High: "
-        f"{format_price(breakout_high)}\n"
+        "✅ EMA20 > EMA50\n"
+        "✅ Open > EMA20 & EMA50\n"
+        "✅ Close > EMA20 & EMA50\n"
+        "✅ 24H Gain ≥ +3%\n"
+        "✅ 24H Volume ≥ 20M USDT\n\n"
 
-        f"Body: "
-        f"{body_percent:.1f}%\n"
+        f"💰 <b>SIGNAL PRICE:</b> "
+        f"{format_price(data['close'])}\n\n"
 
-        f"Previous 20 High: "
-        f"{format_price(previous_20_high)}\n\n"
+        f"🕐 Candle: "
+        f"{format_time(data['candle_time'])}\n\n"
 
-        "📊 <b>EMAs</b>\n"
-
-        f"EMA20: "
-        f"{format_price(ema20)}\n"
-
-        f"EMA50: "
-        f"{format_price(ema50)}\n\n"
-
-        "⏳ <b>2-CANDLE CONFIRMATION</b>\n"
-
-        f"2nd Candle Close: "
-        f"{format_price(second_candle_close)}\n"
-
-        f"Breakout High: "
-        f"{format_price(breakout_high)}\n\n"
-
-        "🟢 <b>SIGNAL PRICE</b>\n"
-
-        f"{format_price(signal_price)}\n\n"
-
-        "✅ Bullish candle\n"
-        "✅ Body ≥ 90%\n"
-        "✅ Open above EMA20 & EMA50\n"
-        "✅ Close above EMA20 & EMA50\n"
-        "✅ 20-candle HIGH broken by CLOSE\n"
-        "✅ 2 confirmation candles passed\n\n"
-
-        f"🕐 Breakout: "
-        f"{format_time(breakout_time)}\n"
-
-        f"🕐 Confirmation: "
-        f"{format_time(second_candle_time)}\n\n"
-
-        "🔒 <b>RESET REQUIRED FOR NEXT SIGNAL</b>"
+        "🔒 <b>24H COOLDOWN</b>"
     )
 
 
-    send_telegram(
+    sent = send_telegram(
         message
     )
 
+    return sent
+
 
 # ============================================================
-# ANALYZE SYMBOL
+# ANALYZE ONE SYMBOL
 # ============================================================
 
-def analyze_symbol(symbol):
+def analyze_symbol(
+    item
+):
+
+    symbol = item[
+        "symbol"
+    ]
+
+    gain_percent = item[
+        "change_percent"
+    ]
+
+    quote_volume = item[
+        "quote_volume"
+    ]
+
+
+    # ========================================================
+    # COOLDOWN
+    # ========================================================
+
+    if is_on_cooldown(
+        symbol
+    ):
+
+        return
+
+
+    # ========================================================
+    # GET 1H CLOSED CANDLES
+    # ========================================================
 
     candles = get_closed_klines(
         symbol
     )
 
-    if len(candles) < 80:
+    if len(candles) < EMA_SLOW:
 
         return
 
 
     latest = candles[-1]
 
-    latest_open_time = candle_time(
+    latest_time = candle_time(
         latest
     )
 
 
     # ========================================================
-    # ONLY PROCESS NEW CLOSED CANDLE
+    # ONLY PROCESS EACH CLOSED CANDLE ONCE
     # ========================================================
 
     previous_time = (
-        last_closed_candle.get(
+        last_processed_candle.get(
             symbol
         )
     )
 
-    if previous_time == latest_open_time:
+    if previous_time == latest_time:
 
         return
 
-    last_closed_candle[symbol] = (
-        latest_open_time
+
+    last_processed_candle[
+        symbol
+    ] = latest_time
+
+
+    # ========================================================
+    # CHECK STRATEGY
+    # ========================================================
+
+    signal = check_strategy(
+        symbol,
+        candles,
+        gain_percent,
+        quote_volume
+    )
+
+    if not signal:
+
+        return
+
+
+    # ========================================================
+    # SEND TELEGRAM
+    # ========================================================
+
+    sent = send_buy_signal(
+        signal
     )
 
 
     # ========================================================
-    # INITIALIZE STATE
+    # START COOLDOWN ONLY AFTER
+    # SUCCESSFUL TELEGRAM SEND
     # ========================================================
 
-    if symbol not in coin_state:
+    if sent:
 
-        coin_state[symbol] = "READY"
-
-        reset_count[symbol] = 0
-
-
-    state = coin_state[symbol]
-
-
-    # ========================================================
-    # WAIT FOR 2 CONFIRMATION CANDLES
-    # ========================================================
-
-    if state == "WAIT_CONFIRMATION":
-
-        data = breakout_data.get(
+        cooldowns[
             symbol
+        ] = time.time()
+
+        print(
+            f"[BUY] {symbol} | "
+            f"24H +{gain_percent:.2f}% | "
+            f"Volume="
+            f"{format_volume(quote_volume)} | "
+            f"EMA20="
+            f"{format_price(signal['ema20'])} | "
+            f"EMA50="
+            f"{format_price(signal['ema50'])} | "
+            f"Signal="
+            f"{format_price(signal['close'])}"
         )
 
-        if not data:
+    else:
 
-            coin_state[symbol] = "READY"
-
-            return
-
-
-        breakout_high = (
-            data["high"]
+        print(
+            f"[WARNING] {symbol} | "
+            "Telegram failed - "
+            "cooldown NOT started"
         )
 
 
-        # ====================================================
-        # CHECK CURRENT CONFIRMATION CANDLE HIGH
-        # ====================================================
+# ============================================================
+# CLEAN OLD STATE
+# ============================================================
 
-        current_high = candle_high(
-            latest
-        )
+def cleanup_state(
+    current_symbols
+):
 
-        if current_high > breakout_high:
+    current_set = set(
+        current_symbols
+    )
 
-            print(
-                f"[CANCEL] {symbol} | "
-                f"Confirmation HIGH "
-                f"{format_price(current_high)} "
-                f"> Breakout HIGH "
-                f"{format_price(breakout_high)}"
-            )
+    # ========================================================
+    # Last processed candle state
+    # ========================================================
 
-            coin_state[symbol] = "SIGNALLED"
+    for symbol in list(
+        last_processed_candle.keys()
+    ):
 
-            reset_count[symbol] = 0
+        if symbol not in current_set:
 
-            breakout_data.pop(
+            last_processed_candle.pop(
                 symbol,
                 None
             )
-
-            return
-
-
-        # ====================================================
-        # COUNT CONFIRMATION CANDLE
-        # ====================================================
-
-        data["confirmation_count"] += 1
-
-        confirmation_count = (
-            data["confirmation_count"]
-        )
-
-
-        print(
-            f"[CONFIRM] {symbol} | "
-            f"{confirmation_count}/"
-            f"{CONFIRMATION_CANDLES} | "
-            f"High="
-            f"{format_price(current_high)} | "
-            f"Breakout High="
-            f"{format_price(breakout_high)} | "
-            f"Close="
-            f"{format_price(candle_close(latest))}"
-        )
-
-
-        # ====================================================
-        # FIRST CANDLE
-        # ====================================================
-
-        if confirmation_count == 1:
-
-            data["first_candle_close"] = (
-                candle_close(latest)
-            )
-
-            data["first_candle_time"] = (
-                candle_time(latest)
-            )
-
-            return
-
-
-        # ====================================================
-        # SECOND CANDLE
-        # ====================================================
-
-        if confirmation_count == 2:
-
-            data["second_candle_close"] = (
-                candle_close(latest)
-            )
-
-            data["second_candle_time"] = (
-                candle_time(latest)
-            )
-
-
-            # ================================================
-            # SIGNAL
-            # ================================================
-
-            signal_key = (
-                symbol,
-                data["open_time"]
-            )
-
-
-            if signal_key not in processed_signals:
-
-                processed_signals.add(
-                    signal_key
-                )
-
-                print("")
-                print(
-                    "=================================================="
-                )
-
-                print(
-                    f"[BUY SIGNAL] {symbol}"
-                )
-
-                print(
-                    f"Breakout Close: "
-                    f"{format_price(data['close'])}"
-                )
-
-                print(
-                    f"Breakout High: "
-                    f"{format_price(data['high'])}"
-                )
-
-                print(
-                    f"2nd Candle Close: "
-                    f"{format_price(data['second_candle_close'])}"
-                )
-
-                print(
-                    f"Signal Price: "
-                    f"{format_price(data['second_candle_close'])}"
-                )
-
-                print(
-                    "=================================================="
-                )
-
-
-                send_buy_signal(
-                    symbol,
-                    data
-                )
-
-
-            # ================================================
-            # LOCK UNTIL RESET
-            # ================================================
-
-            coin_state[symbol] = (
-                "SIGNALLED"
-            )
-
-            reset_count[symbol] = 0
-
-            breakout_data.pop(
-                symbol,
-                None
-            )
-
-            return
-
-
-        return
-
-
-    # ========================================================
-    # SIGNALLED STATE
-    #
-    # No new signal until reset.
-    # ========================================================
-
-    if state == "SIGNALLED":
-
-        index = len(candles) - 1
-
-        ema20, ema50 = get_ema_values(
-            candles,
-            index
-        )
-
-        if (
-            ema20 is None
-            or ema50 is None
-        ):
-
-            return
-
-
-        if candle_is_reset_candle(
-            latest,
-            ema20,
-            ema50
-        ):
-
-            reset_count[symbol] += 1
-
-            print(
-                f"[RESET] {symbol} | "
-                f"{reset_count[symbol]}/"
-                f"{RESET_CANDLES} | "
-                f"Open="
-                f"{format_price(candle_open(latest))} | "
-                f"Close="
-                f"{format_price(candle_close(latest))} | "
-                f"EMA20="
-                f"{format_price(ema20)} | "
-                f"EMA50="
-                f"{format_price(ema50)}"
-            )
-
-        else:
-
-            if reset_count.get(
-                symbol,
-                0
-            ) > 0:
-
-                print(
-                    f"[RESET BROKEN] {symbol} | "
-                    "Counter returned to 0"
-                )
-
-            reset_count[symbol] = 0
-
-
-        # ====================================================
-        # RESET COMPLETE
-        # ====================================================
-
-        if (
-            reset_count[symbol]
-            >= RESET_CANDLES
-        ):
-
-            print(
-                f"[RESET COMPLETE] {symbol} | "
-                f"{RESET_CANDLES} consecutive candles "
-                "below EMA20 & EMA50"
-            )
-
-            coin_state[symbol] = (
-                "READY"
-            )
-
-            reset_count[symbol] = 0
-
-        return
-
-
-    # ========================================================
-    # READY STATE
-    # ========================================================
-
-    if state == "READY":
-
-        index = len(candles) - 1
-
-        breakout = check_breakout(
-            candles,
-            index
-        )
-
-        if not breakout:
-
-            return
-
-
-        # ====================================================
-        # BREAKOUT FOUND
-        # ====================================================
-
-        print("")
-        print(
-            "=================================================="
-        )
-
-        print(
-            f"[BREAKOUT] {symbol}"
-        )
-
-        print(
-            f"Open: "
-            f"{format_price(breakout['open'])}"
-        )
-
-        print(
-            f"Close: "
-            f"{format_price(breakout['close'])}"
-        )
-
-        print(
-            f"High: "
-            f"{format_price(breakout['high'])}"
-        )
-
-        print(
-            f"Body: "
-            f"{breakout['body_ratio'] * 100:.1f}%"
-        )
-
-        print(
-            f"Previous 20 High: "
-            f"{format_price(breakout['previous_20_high'])}"
-        )
-
-        print(
-            f"EMA20: "
-            f"{format_price(breakout['ema20'])}"
-        )
-
-        print(
-            f"EMA50: "
-            f"{format_price(breakout['ema50'])}"
-        )
-
-        print(
-            "[WAIT] Next 2 CLOSED candles..."
-        )
-
-        print(
-            "=================================================="
-        )
-
-
-        # ====================================================
-        # SAVE BREAKOUT
-        # ====================================================
-
-        breakout[
-            "confirmation_count"
-        ] = 0
-
-        breakout_data[symbol] = (
-            breakout
-        )
-
-        coin_state[symbol] = (
-            "WAIT_CONFIRMATION"
-        )
-
-        return
 
 
 # ============================================================
@@ -1313,87 +1019,92 @@ def scan():
 
 
     # ========================================================
-    # GET CURRENT BINANCE TOP 100
+    # GET BINANCE GAINERS
     # ========================================================
 
-    symbols = get_top_100_symbols()
+    gainers = get_gainers()
 
-    if not symbols:
+    if not gainers:
 
         print(
-            "[ERROR] Could not get Binance Top 100"
+            "[INFO] No Binance Gainers "
+            "meeting filters."
         )
 
         return
 
 
     print(
-        f"[INFO] Binance Top {len(symbols)}"
-    )
-
-
-    current_symbols = set(
-        symbols
+        f"[INFO] Eligible Gainers: "
+        f"{len(gainers)}"
     )
 
 
     # ========================================================
-    # REMOVE STATE OF COINS NO LONGER IN TOP 100
+    # SHOW GAINERS
     # ========================================================
 
-    for symbol in list(
-        coin_state.keys()
+    print(
+        "[GAINERS]"
+    )
+
+    for rank, item in enumerate(
+        gainers,
+        start=1
     ):
 
-        if symbol not in current_symbols:
+        print(
+            f"{rank}. "
+            f"{item['symbol']} | "
+            f"+{item['change_percent']:.2f}% | "
+            f"Volume="
+            f"{format_volume(item['quote_volume'])}"
+        )
 
-            coin_state.pop(
-                symbol,
-                None
-            )
 
-            breakout_data.pop(
-                symbol,
-                None
-            )
+    # ========================================================
+    # CLEAN STATE
+    # ========================================================
 
-            reset_count.pop(
-                symbol,
-                None
-            )
-
-            last_closed_candle.pop(
-                symbol,
-                None
-            )
+    cleanup_state(
+        [
+            item["symbol"]
+            for item in gainers
+        ]
+    )
 
 
     # ========================================================
     # ANALYZE
     # ========================================================
 
-    for index, symbol in enumerate(
-        symbols,
+    for index, item in enumerate(
+        gainers,
         start=1
     ):
+
+        symbol = item[
+            "symbol"
+        ]
 
         try:
 
             analyze_symbol(
-                symbol
+                item
             )
-
-            if index % 10 == 0:
-
-                print(
-                    f"[PROGRESS] "
-                    f"{index}/{len(symbols)}"
-                )
 
         except Exception as e:
 
             print(
-                f"[ERROR] {symbol}: {e}"
+                f"[ERROR] "
+                f"{symbol}: {e}"
+            )
+
+        if index % 10 == 0:
+
+            print(
+                f"[PROGRESS] "
+                f"{index}/{len(gainers)}"
             )
 
 
@@ -1409,7 +1120,7 @@ def main():
     )
 
     print(
-        "   BINANCE TOP 100 EMA20 / EMA50 BUY BOT"
+        "   BINANCE GAINERS EMA20 / EMA50 BUY BOT"
     )
 
     print(
@@ -1426,8 +1137,13 @@ def main():
     )
 
     print(
-        f"Binance Top coins: "
-        f"{TOP_COINS}"
+        f"Minimum 24H gain: "
+        f"+{MIN_24H_GAIN_PERCENT:.1f}%"
+    )
+
+    print(
+        f"Minimum 24H quote volume: "
+        f"{format_volume(MIN_24H_QUOTE_VOLUME)} USDT"
     )
 
     print(
@@ -1436,43 +1152,36 @@ def main():
     )
 
     print(
-        f"Breakout lookback: "
-        f"{BREAKOUT_LOOKBACK} candles"
+        "EMA20 > EMA50: REQUIRED"
     )
 
     print(
-        "Breakout: CLOSE above previous 20 HIGH"
+        "Open > EMA20 & EMA50: REQUIRED"
     )
 
     print(
-        f"Minimum bullish body: "
-        f"{MIN_BODY_RATIO * 100:.0f}%"
+        "Close > EMA20 & EMA50: REQUIRED"
     )
 
     print(
-        f"Confirmation candles: "
-        f"{CONFIRMATION_CANDLES}"
+        f"Cooldown: "
+        f"{COOLDOWN_HOURS} hours"
     )
 
     print(
-        f"Reset candles: "
-        f"{RESET_CANDLES}"
+        "Top 100: DISABLED"
     )
 
     print(
-        "Reset: OPEN + CLOSE below both EMAs"
+        "Breakout: DISABLED"
     )
 
     print(
-        "EMA20 > EMA50 requirement: NONE"
+        "Confirmation candles: DISABLED"
     )
 
     print(
-        "24H minimum volume filter: NONE"
-    )
-
-    print(
-        "24H cooldown: NONE"
+        "Reset candles: DISABLED"
     )
 
     print(
@@ -1483,7 +1192,7 @@ def main():
 
 
     # ========================================================
-    # LOOP
+    # MAIN LOOP
     # ========================================================
 
     while True:
