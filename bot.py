@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 # STRATEGY
 #
 # 1. Binance Spot USDT pairs only
-# 2. 24H gain >= +3%
+# 2. 24H gain between 0% and +5%
 # 3. 24H quote volume >= 20,000,000 USDT
 # 4. Timeframe = 1H
 # 5. EMA20 > EMA50
@@ -30,21 +30,6 @@ from datetime import datetime, timezone
 # - It only remembers that candle as the starting point.
 # - It waits for the NEXT newly closed 1H candle.
 #
-# Therefore:
-# START BOT
-#      ↓
-# Remember current closed candle
-#      ↓
-# NO SIGNAL
-#      ↓
-# Next 1H candle closes
-#      ↓
-# Check strategy
-#      ↓
-# If conditions pass -> BUY
-#      ↓
-# 24H cooldown
-#
 # ============================================================
 
 
@@ -62,7 +47,10 @@ INTERVAL = "1h"
 SCAN_SECONDS = 20
 
 MIN_24H_QUOTE_VOLUME = 20_000_000
-MIN_24H_GAIN_PERCENT = 3.0
+
+# 24H gain range
+MIN_24H_GAIN_PERCENT = 0.0
+MAX_24H_GAIN_PERCENT = 5.0
 
 EMA_FAST = 20
 EMA_SLOW = 50
@@ -129,7 +117,10 @@ def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 
-        print("[TELEGRAM ERROR] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing")
+        print(
+            "[TELEGRAM ERROR] "
+            "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing"
+        )
 
         return False
 
@@ -208,11 +199,15 @@ def get_spot_usdt_symbols():
 # GET BINANCE GAINERS
 # ============================================================
 #
-# Binance 24H ticker provides:
-# - priceChangePercent
-# - quoteVolume
+# Only coins with:
 #
-# We use these values to create the gainers list.
+# 0% <= 24H gain <= +5%
+#
+# and:
+#
+# 24H quote volume >= 20M USDT
+#
+# are selected.
 #
 # ============================================================
 
@@ -253,11 +248,24 @@ def get_gainers():
 
             continue
 
-        # Minimum 24H gain
+        # ====================================================
+        # MINIMUM 24H GAIN
+        # ====================================================
+
         if gain_percent < MIN_24H_GAIN_PERCENT:
             continue
 
-        # Minimum 24H quote volume
+        # ====================================================
+        # MAXIMUM 24H GAIN
+        # ====================================================
+
+        if gain_percent > MAX_24H_GAIN_PERCENT:
+            continue
+
+        # ====================================================
+        # MINIMUM 24H VOLUME
+        # ====================================================
+
         if quote_volume < MIN_24H_QUOTE_VOLUME:
             continue
 
@@ -267,7 +275,7 @@ def get_gainers():
             "quote_volume": quote_volume
         })
 
-    # Highest gain first
+    # Sort by highest gain first
     gainers.sort(
         key=lambda x: x["gain_percent"],
         reverse=True
@@ -407,6 +415,7 @@ def check_strategy(candles):
 
     # ========================================================
     # CONDITION 1
+    # EMA20 > EMA50
     # ========================================================
 
     if not (ema20 > ema50):
@@ -415,6 +424,7 @@ def check_strategy(candles):
 
     # ========================================================
     # CONDITION 2
+    # OPEN > EMA20 AND EMA50
     # ========================================================
 
     if not (
@@ -427,6 +437,7 @@ def check_strategy(candles):
 
     # ========================================================
     # CONDITION 3
+    # CLOSE > EMA20 AND EMA50
     # ========================================================
 
     if not (
@@ -511,7 +522,8 @@ def send_buy_signal(
 
         f"⏱ Timeframe: <b>1H</b>\n\n"
 
-        f"📈 <b>24H Gain:</b> +{gain_percent:.2f}%\n"
+        f"📈 <b>24H Gain:</b> "
+        f"{gain_percent:+.2f}%\n"
 
         f"💰 <b>24H Volume:</b> "
         f"{format_volume(quote_volume)} USDT\n\n"
@@ -572,17 +584,6 @@ def analyze_symbol(
 
     # ========================================================
     # STARTUP PROTECTION
-    # ========================================================
-    #
-    # IMPORTANT:
-    #
-    # If this symbol has never been seen since startup,
-    # DO NOT analyze the existing candle.
-    #
-    # Just remember it.
-    #
-    # The strategy starts with the NEXT newly closed candle.
-    #
     # ========================================================
 
     previous_time = last_processed_candle.get(symbol)
@@ -646,9 +647,7 @@ def analyze_symbol(
     )
 
     # ========================================================
-    # VERY IMPORTANT
-    #
-    # COOLDOWN STARTS ONLY AFTER SUCCESSFUL TELEGRAM SEND
+    # COOLDOWN ONLY AFTER SUCCESSFUL SEND
     # ========================================================
 
     if sent:
@@ -677,7 +676,7 @@ def cleanup_state(active_symbols):
     active_set = set(active_symbols)
 
     # Remove candle tracking for symbols
-    # that are no longer in the +3% gainers list.
+    # that are no longer in the 0%-5% gainers list.
 
     for symbol in list(last_processed_candle.keys()):
 
@@ -707,7 +706,10 @@ def main():
     )
 
     print(
-        f"Minimum 24H gain: +{MIN_24H_GAIN_PERCENT:.2f}%"
+        f"24H gain range: "
+        f"{MIN_24H_GAIN_PERCENT:.2f}% "
+        f"to "
+        f"+{MAX_24H_GAIN_PERCENT:.2f}%"
     )
 
     print(
@@ -747,7 +749,7 @@ def main():
             if not gainers:
 
                 print(
-                    "[INFO] No eligible gainers found"
+                    "[INFO] No eligible coins found"
                 )
 
                 time.sleep(SCAN_SECONDS)
@@ -784,7 +786,6 @@ def main():
                     quote_volume=quote_volume
                 )
 
-                # Progress every 10 symbols
                 if index % 10 == 0:
 
                     print(
