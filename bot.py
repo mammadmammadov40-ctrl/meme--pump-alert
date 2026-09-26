@@ -2,111 +2,97 @@ import os
 import time
 import requests
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ============================================================
-# BINANCE GAINERS + EMA BUY BOT
+# BINANCE 5M HIGH / DIB BREAKOUT ALERT BOT
 # ============================================================
 #
-# STRATEGY
+# YALNIZ ALERT
+# AVTOMATIK ORDER YOXDUR
 #
-# 1. Binance Spot USDT pairs only
-# 2. 24H gain between 0% and +5%
-# 3. 24H quote volume >= 20,000,000 USDT
-# 4. Timeframe = 1H
-# 5. EMA20 > EMA50
-# 6. Latest NEW closed 1H candle:
-#       Open  > EMA20
-#       Open  > EMA50
-#       Close > EMA20
-#       Close > EMA50
-# 7. BUY signal
-# 8. After successful Telegram signal -> 24H cooldown
+# STRATEGIYA:
 #
-# IMPORTANT STARTUP BEHAVIOR
+# 1. Binance Spot USDT cütləri
+# 2. 24h quote volume-a görə TOP 100
+# 3. 5 dəqiqəlik timeframe
+# 4. Son 100 BAĞLANMIŞ şam
 #
-# When bot starts:
-# - It does NOT analyze the already-closed candle.
-# - It only remembers that candle as the starting point.
-# - It waits for the NEXT newly closed 1H candle.
+# HIGH QAYDASI:
+# - High-ın solunda ən azı 10 şam olmalıdır.
+# - High > əvvəlki 10 şamın bütün High qiymətləri
+# - Sağda 10 şam gözlənilmir.
+#
+# DIB QAYDASI:
+# - Aktiv DIB-dən aşağı yeni qiymət gəlsə,
+#   yeni DIB yaranır.
+# - Aradakı kiçik təpələr yeni High sayılmır,
+#   əgər yeni DIB yaranmayıbsa.
+#
+# HIGH QIRILMASI:
+# - Qiymət target High-ı keçməlidir.
+# - 5M şam target High-ın ÜSTÜNDƏ BAĞLANMALIDIR.
+# - Bundan sonra Telegram siqnalı göndərilir.
 #
 # ============================================================
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-BINANCE_BASE_URL = "https://api.binance.com"
+# =========================
+# ENV
+# =========================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-INTERVAL = "1h"
 
-SCAN_SECONDS = 20
+# =========================
+# SETTINGS
+# =========================
 
-MIN_24H_QUOTE_VOLUME = 20_000_000
+BINANCE_URL = "https://api.binance.com"
 
-# 24H gain range
-MIN_24H_GAIN_PERCENT = 0.0
-MAX_24H_GAIN_PERCENT = 5.0
+INTERVAL = "5m"
 
-EMA_FAST = 20
-EMA_SLOW = 50
+TOP_COINS = 100
 
-COOLDOWN_HOURS = 24
+CANDLE_LIMIT = 100
 
-KLINE_LIMIT = 100
+LEFT_HIGH_CANDLES = 10
+
+SCAN_SECONDS = 15
+
+REQUEST_TIMEOUT = 10
+
+MAX_WORKERS = 10
+
+# Eyni breakout-un təkrar göndərilməsinin qarşısını alır
+SIGNAL_COOLDOWN_SECONDS = 24 * 60 * 60
 
 
-# ============================================================
+# =========================
 # SESSION
-# ============================================================
+# =========================
 
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "GainersEMABot/1.0"
+    "User-Agent": "Mozilla/5.0"
 })
 
 
-# ============================================================
-# STATE
-# ============================================================
+# =========================
+# MEMORY
+# =========================
 
-# symbol -> timestamp when cooldown started
-cooldowns = {}
+last_signal = {}
 
-# symbol -> latest processed closed candle open time
+# Hər symbol üçün son işlənmiş candle open time
 last_processed_candle = {}
 
-
-# ============================================================
-# HTTP GET
-# ============================================================
-
-def binance_get(endpoint, params=None):
-
-    url = BINANCE_BASE_URL + endpoint
-
-    try:
-
-        response = session.get(
-            url,
-            params=params,
-            timeout=10
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
-    except Exception as e:
-
-        print(f"[BINANCE ERROR] {endpoint} | {e}")
-
-        return None
+# İlk scan zamanı köhnə breakout siqnallarını
+# göndərməmək üçün istifadə olunur
+initialized_symbols = set()
 
 
 # ============================================================
@@ -116,12 +102,8 @@ def binance_get(endpoint, params=None):
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-
-        print(
-            "[TELEGRAM ERROR] "
-            "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing"
-        )
-
+        print("Telegram ENV dəyişənləri yoxdur.")
+        print(message)
         return False
 
     url = (
@@ -131,558 +113,550 @@ def send_telegram(message):
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
+        "text": message
     }
 
     try:
-
-        response = session.post(
+        r = session.post(
             url,
             json=payload,
-            timeout=10
+            timeout=REQUEST_TIMEOUT
         )
 
-        response.raise_for_status()
-
-        data = response.json()
-
-        if data.get("ok") is True:
-
+        if r.ok:
             return True
 
-        print(f"[TELEGRAM ERROR] {data}")
+        print(
+            "Telegram error:",
+            r.status_code,
+            r.text[:300]
+        )
 
-        return False
+    except Exception as e:
+        print("Telegram exception:", e)
+
+    return False
+
+
+# ============================================================
+# BINANCE REQUEST
+# ============================================================
+
+def binance_get(path, params=None):
+
+    url = BINANCE_URL + path
+
+    r = session.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT
+    )
+
+    r.raise_for_status()
+
+    return r.json()
+
+
+# ============================================================
+# TOP 100 USDT COINS
+# ============================================================
+
+def get_top_100_symbols():
+
+    try:
+
+        tickers = binance_get(
+            "/api/v3/ticker/24hr"
+        )
+
+        symbols = []
+
+        for x in tickers:
+
+            symbol = x.get("symbol", "")
+
+            # Yalnız USDT
+            if not symbol.endswith("USDT"):
+                continue
+
+            # 24h quote volume
+            try:
+                quote_volume = float(
+                    x.get("quoteVolume", 0)
+                )
+            except:
+                quote_volume = 0
+
+            if quote_volume <= 0:
+                continue
+
+            symbols.append(
+                (
+                    symbol,
+                    quote_volume
+                )
+            )
+
+        # Həcmə görə sıralama
+        symbols.sort(
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        return [
+            x[0]
+            for x in symbols[:TOP_COINS]
+        ]
 
     except Exception as e:
 
-        print(f"[TELEGRAM ERROR] {e}")
-
-        return False
-
-
-# ============================================================
-# GET SPOT USDT SYMBOLS
-# ============================================================
-
-def get_spot_usdt_symbols():
-
-    data = binance_get("/api/v3/exchangeInfo")
-
-    if not data:
-
-        return set()
-
-    symbols = set()
-
-    for item in data.get("symbols", []):
-
-        symbol = item.get("symbol")
-        status = item.get("status")
-        quote_asset = item.get("quoteAsset")
-        spot_allowed = item.get("isSpotTradingAllowed")
-
-        if (
-            status == "TRADING"
-            and quote_asset == "USDT"
-            and spot_allowed is True
-        ):
-
-            symbols.add(symbol)
-
-    return symbols
-
-
-# ============================================================
-# GET BINANCE GAINERS
-# ============================================================
-#
-# Only coins with:
-#
-# 0% <= 24H gain <= +5%
-#
-# and:
-#
-# 24H quote volume >= 20M USDT
-#
-# are selected.
-#
-# ============================================================
-
-def get_gainers():
-
-    spot_symbols = get_spot_usdt_symbols()
-
-    if not spot_symbols:
-
-        return []
-
-    data = binance_get("/api/v3/ticker/24hr")
-
-    if not data:
-
-        return []
-
-    gainers = []
-
-    for ticker in data:
-
-        symbol = ticker.get("symbol")
-
-        if symbol not in spot_symbols:
-            continue
-
-        try:
-
-            gain_percent = float(
-                ticker.get("priceChangePercent", 0)
-            )
-
-            quote_volume = float(
-                ticker.get("quoteVolume", 0)
-            )
-
-        except (TypeError, ValueError):
-
-            continue
-
-        # ====================================================
-        # MINIMUM 24H GAIN
-        # ====================================================
-
-        if gain_percent < MIN_24H_GAIN_PERCENT:
-            continue
-
-        # ====================================================
-        # MAXIMUM 24H GAIN
-        # ====================================================
-
-        if gain_percent > MAX_24H_GAIN_PERCENT:
-            continue
-
-        # ====================================================
-        # MINIMUM 24H VOLUME
-        # ====================================================
-
-        if quote_volume < MIN_24H_QUOTE_VOLUME:
-            continue
-
-        gainers.append({
-            "symbol": symbol,
-            "gain_percent": gain_percent,
-            "quote_volume": quote_volume
-        })
-
-    # Sort by highest gain first
-    gainers.sort(
-        key=lambda x: x["gain_percent"],
-        reverse=True
-    )
-
-    return gainers
-
-
-# ============================================================
-# GET CLOSED KLINES
-# ============================================================
-
-def get_closed_klines(symbol):
-
-    data = binance_get(
-        "/api/v3/klines",
-        params={
-            "symbol": symbol,
-            "interval": INTERVAL,
-            "limit": KLINE_LIMIT
-        }
-    )
-
-    if not data:
-
-        return []
-
-    now_ms = int(time.time() * 1000)
-
-    closed = []
-
-    for candle in data:
-
-        close_time = int(candle[6])
-
-        # Ignore currently forming candle
-        if close_time <= now_ms:
-
-            closed.append(candle)
-
-    return closed
-
-
-# ============================================================
-# EMA
-# ============================================================
-
-def calculate_ema(values, period):
-
-    if len(values) < period:
-
-        return None
-
-    multiplier = 2 / (period + 1)
-
-    # SMA seed
-    ema = sum(values[:period]) / period
-
-    for price in values[period:]:
-
-        ema = (
-            (price - ema) * multiplier
-            + ema
+        print(
+            "Top symbols error:",
+            e
         )
 
-    return ema
+        return []
 
 
 # ============================================================
-# COOLDOWN
+# GET 100 CLOSED 5M CANDLES
 # ============================================================
 
-def get_cooldown_remaining(symbol):
+def get_closed_candles(symbol):
 
-    started = cooldowns.get(symbol)
+    try:
 
-    if started is None:
+        data = binance_get(
+            "/api/v3/klines",
+            {
+                "symbol": symbol,
+                "interval": INTERVAL,
+                "limit": CANDLE_LIMIT + 1
+            }
+        )
 
-        return 0
+        now_ms = int(
+            time.time() * 1000
+        )
 
-    elapsed = time.time() - started
+        candles = []
 
-    remaining = (
-        COOLDOWN_HOURS * 3600
-        - elapsed
-    )
+        for c in data:
 
-    if remaining <= 0:
+            open_time = int(c[0])
+            close_time = int(c[6])
 
-        del cooldowns[symbol]
+            # Hələ bağlanmamış şamı at
+            if close_time >= now_ms:
+                continue
 
-        return 0
+            candles.append({
+                "open_time": open_time,
+                "close_time": close_time,
 
-    return remaining
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
 
+                "volume": float(c[5])
+            })
 
-def is_on_cooldown(symbol):
+        # Son 100 bağlanmış şam
+        candles = candles[-CANDLE_LIMIT:]
 
-    remaining = get_cooldown_remaining(symbol)
+        return candles
 
-    return remaining > 0
+    except Exception as e:
+
+        print(
+            f"{symbol}: candle error:",
+            e
+        )
+
+        return []
 
 
 # ============================================================
-# STRATEGY CHECK
+# HIGH VALIDATION
 # ============================================================
 
-def check_strategy(candles):
+def is_valid_high(candles, index):
 
-    if len(candles) < EMA_SLOW:
+    """
+    High yalnız əvvəlində ən azı 10 şam olduqda keçərlidir.
 
-        return None
+    Məsələn:
 
-    closes = [
-        float(candle[4])
-        for candle in candles
+    əvvəlki 10 şamın High-ları:
+    100
+    101
+    99
+    102
+    ...
+
+    yeni High = 105
+
+    105 hamısından yüksəkdirsə:
+    VALID HIGH
+    """
+
+    if index < LEFT_HIGH_CANDLES:
+        return False
+
+    current_high = candles[index]["high"]
+
+    previous_highs = [
+        candles[j]["high"]
+        for j in range(
+            index - LEFT_HIGH_CANDLES,
+            index
+        )
     ]
 
-    ema20 = calculate_ema(
-        closes,
-        EMA_FAST
-    )
+    return current_high > max(previous_highs)
 
-    ema50 = calculate_ema(
-        closes,
-        EMA_SLOW
-    )
 
-    if ema20 is None or ema50 is None:
+# ============================================================
+# STRATEGY
+# ============================================================
 
+def analyze_symbol(symbol, candles):
+
+    if len(candles) < LEFT_HIGH_CANDLES + 2:
         return None
 
-    latest = candles[-1]
+    #
+    # STATE
+    #
+    # target_high:
+    # Hazırda qırılması gözlənilən High
+    #
+    # active_dib:
+    # Hazırkı aktiv DIB
+    #
 
-    open_price = float(latest[1])
-    close_price = float(latest[4])
+    target_high = None
+    target_high_index = None
 
-    # ========================================================
-    # CONDITION 1
-    # EMA20 > EMA50
-    # ========================================================
+    active_dib = None
+    active_dib_index = None
 
-    if not (ema20 > ema50):
+    #
+    # Əvvəlcə keçmişdə formalaşmış struktur qurulur.
+    #
 
-        return None
+    started = False
 
-    # ========================================================
-    # CONDITION 2
-    # OPEN > EMA20 AND EMA50
-    # ========================================================
-
-    if not (
-        open_price > ema20
-        and
-        open_price > ema50
+    for i in range(
+        LEFT_HIGH_CANDLES,
+        len(candles)
     ):
 
-        return None
+        candle = candles[i]
 
-    # ========================================================
-    # CONDITION 3
-    # CLOSE > EMA20 AND EMA50
-    # ========================================================
+        # ==================================================
+        # 1. Hələ struktur başlamayıbsa,
+        #    ilk valid High axtar
+        # ==================================================
 
-    if not (
-        close_price > ema20
-        and
-        close_price > ema50
-    ):
+        if not started:
 
-        return None
+            if is_valid_high(candles, i):
 
-    return {
-        "ema20": ema20,
-        "ema50": ema50,
-        "open": open_price,
-        "close": close_price
-    }
+                target_high = candle["high"]
+                target_high_index = i
+
+                started = True
+
+            continue
+
+        # ==================================================
+        # 2. TARGET HIGH ARTİQ VAR
+        # ==================================================
+
+        # --------------------------------------------------
+        # Əgər yeni DIB yaranırsa
+        # --------------------------------------------------
+
+        if active_dib is None:
+
+            # İlk DIB:
+            #
+            # target High-dan sonra ən aşağı low
+            #
+            if i > target_high_index:
+
+                active_dib = candle["low"]
+                active_dib_index = i
+
+        else:
+
+            #
+            # Cari aktiv DIB-dən aşağı düşdüsə:
+            # yeni DIB yaranır
+            #
+
+            if candle["low"] < active_dib:
+
+                active_dib = candle["low"]
+                active_dib_index = i
+
+        # ==================================================
+        # 3. BREAKOUT
+        # ==================================================
+
+        if target_high is not None:
+
+            #
+            # Şam həm High-ı keçməlidir,
+            # həm də üstündə bağlanmalıdır.
+            #
+
+            if (
+                candle["high"] > target_high
+                and
+                candle["close"] > target_high
+            ):
+
+                return {
+                    "type": "BREAKOUT",
+
+                    "symbol": symbol,
+
+                    "target_high": target_high,
+
+                    "breakout_price": candle["close"],
+
+                    "dib": active_dib,
+
+                    "candle_index": i,
+
+                    "candle": candle
+                }
+
+        # ==================================================
+        # 4. YENİ VALID HIGH
+        # ==================================================
+        #
+        # Çox vacib:
+        #
+        # DIB-dən sonra qiymət qalxır.
+        #
+        # Əgər yeni zirvə:
+        # - əvvəlki 10 şamdan yüksəkdirsə
+        #
+        # həmin zirvə yeni High kimi qəbul edilir.
+        #
+        # Amma bu High əvvəlki target High-ı
+        # qıra bilməyibsə, yeni target olur.
+        #
+        # ==================================================
+
+        if i > active_dib_index:
+
+            if is_valid_high(candles, i):
+
+                new_high = candle["high"]
+
+                #
+                # Əgər bu High əvvəlki target High-dan
+                # aşağıdırsa, əvvəlki High qırılmayıb.
+                #
+                # Buna görə yeni High target ola bilər.
+                #
+
+                if new_high < target_high:
+
+                    target_high = new_high
+                    target_high_index = i
+
+                    #
+                    # Bu yeni High-dan sonra yaranacaq
+                    # yeni DIB üçün gözləməyə davam edilir.
+                    #
+
+                elif new_high == target_high:
+
+                    # Eyni səviyyədirsə dəyişmir
+                    pass
+
+        # ==================================================
+        # 5. Əgər yeni High formalaşdısa,
+        #    aktiv DIB həmin High-dan əvvəlki DIB olaraq qalır.
+        #
+        # Yeni DIB yalnız əvvəlki DIB aşağı qırıldıqda yaranır.
+        # ==================================================
+
+    return None
 
 
 # ============================================================
-# FORMAT VOLUME
+# SIGNAL MESSAGE
 # ============================================================
 
-def format_volume(value):
+def make_signal_message(signal):
 
-    if value >= 1_000_000_000:
+    symbol = signal["symbol"]
 
-        return f"{value / 1_000_000_000:.2f}B"
+    high_price = signal["target_high"]
 
-    if value >= 1_000_000:
+    close_price = signal["breakout_price"]
 
-        return f"{value / 1_000_000:.2f}M"
+    dib_price = signal["dib"]
 
-    if value >= 1_000:
+    candle = signal["candle"]
 
-        return f"{value / 1_000:.2f}K"
+    breakout_percent = (
+        (close_price - high_price)
+        / high_price
+        * 100
+    )
 
-    return f"{value:.0f}"
-
-
-# ============================================================
-# FORMAT TIME
-# ============================================================
-
-def format_utc(ms):
-
-    dt = datetime.fromtimestamp(
-        ms / 1000,
+    utc_time = datetime.fromtimestamp(
+        candle["close_time"] / 1000,
         tz=timezone.utc
-    )
-
-    return dt.strftime(
-        "%Y-%m-%d %H:%M UTC"
-    )
-
-
-# ============================================================
-# SEND BUY SIGNAL
-# ============================================================
-
-def send_buy_signal(
-    symbol,
-    gain_percent,
-    quote_volume,
-    result,
-    candle
-):
-
-    close_price = result["close"]
-    ema20 = result["ema20"]
-    ema50 = result["ema50"]
-
-    candle_open_time = int(candle[0])
-
-    candle_time = format_utc(
-        candle_open_time
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
     )
 
     message = (
-        f"🟢 <b>BUY SIGNAL</b>\n\n"
-
-        f"<b>{symbol}</b>\n"
-
-        f"⏱ Timeframe: <b>1H</b>\n\n"
-
-        f"📈 <b>24H Gain:</b> "
-        f"{gain_percent:+.2f}%\n"
-
-        f"💰 <b>24H Volume:</b> "
-        f"{format_volume(quote_volume)} USDT\n\n"
-
-        f"📊 <b>EMA20:</b> {ema20:.8f}\n"
-        f"📊 <b>EMA50:</b> {ema50:.8f}\n\n"
-
-        f"🕯 <b>Candle Open:</b> "
-        f"{result['open']:.8f}\n"
-
-        f"🕯 <b>Candle Close:</b> "
-        f"{close_price:.8f}\n\n"
-
-        f"💵 <b>Signal Price:</b> "
-        f"{close_price:.8f}\n\n"
-
-        f"🕐 <b>Candle:</b> {candle_time}\n\n"
-
-        f"⏳ <b>24H COOLDOWN</b>"
+        "🚨 5M BREAKOUT SIGNAL 🚨\n\n"
+        f"🪙 {symbol}\n"
+        f"📈 High: {high_price:g}\n"
+        f"💰 Close: {close_price:g}\n"
+        f"📉 Active DIB: {dib_price:g}\n\n"
+        f"🔥 Breakout: +{breakout_percent:.2f}%\n"
+        f"⏱ Candle: {utc_time}\n\n"
+        "⚠️ ALERT ONLY — NO AUTO ORDER"
     )
 
-    return send_telegram(message)
+    return message
 
 
 # ============================================================
-# ANALYZE SYMBOL
+# PROCESS SYMBOL
 # ============================================================
 
-def analyze_symbol(
-    symbol,
-    gain_percent,
-    quote_volume
-):
+def process_symbol(symbol):
 
-    # ========================================================
-    # CHECK COOLDOWN
-    # ========================================================
+    candles = get_closed_candles(symbol)
 
-    if is_on_cooldown(symbol):
+    if len(candles) < LEFT_HIGH_CANDLES + 2:
+        return None
 
-        return
+    latest_candle_time = candles[-1]["open_time"]
 
-    # ========================================================
-    # GET CLOSED CANDLES
-    # ========================================================
+    #
+    # Eyni bağlanmış şamı təkrar analiz etmə
+    #
 
-    candles = get_closed_klines(symbol)
+    if (
+        symbol in last_processed_candle
+        and
+        last_processed_candle[symbol]
+        == latest_candle_time
+    ):
+        return None
 
-    if not candles:
+    last_processed_candle[symbol] = latest_candle_time
 
-        return
-
-    latest_candle = candles[-1]
-
-    latest_time = int(
-        latest_candle[0]
+    signal = analyze_symbol(
+        symbol,
+        candles
     )
 
-    # ========================================================
-    # STARTUP PROTECTION
-    # ========================================================
+    if signal is None:
+        return None
 
-    previous_time = last_processed_candle.get(symbol)
+    #
+    # İlk scan zamanı köhnə siqnal göndərmə.
+    #
+    # Bot artıq işləyərkən yaranan yeni breakout
+    # göndəriləcək.
+    #
 
-    if previous_time is None:
+    if symbol not in initialized_symbols:
 
-        last_processed_candle[symbol] = latest_time
+        initialized_symbols.add(symbol)
 
-        print(
-            f"[INIT] {symbol} | "
-            f"Baseline candle saved | "
-            f"Waiting for next 1H close"
-        )
+        return None
 
+    initialized_symbols.add(symbol)
+
+    #
+    # 24 saat cooldown
+    #
+
+    now = time.time()
+
+    previous_signal = last_signal.get(symbol)
+
+    if previous_signal is not None:
+
+        if now - previous_signal < SIGNAL_COOLDOWN_SECONDS:
+            return None
+
+    last_signal[symbol] = now
+
+    return signal
+
+
+# ============================================================
+# MAIN SCAN
+# ============================================================
+
+def scan():
+
+    symbols = get_top_100_symbols()
+
+    if not symbols:
+        print("Top 100 tapılmadı.")
         return
-
-    # ========================================================
-    # SAME CANDLE
-    # ========================================================
-
-    if previous_time == latest_time:
-
-        return
-
-    # ========================================================
-    # NEW CLOSED CANDLE
-    # ========================================================
-
-    last_processed_candle[symbol] = latest_time
 
     print(
-        f"[NEW 1H CANDLE] {symbol} | "
-        f"{format_utc(latest_time)}"
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+        f"Scanning {len(symbols)} symbols..."
     )
 
-    # ========================================================
-    # CHECK STRATEGY
-    # ========================================================
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
 
-    result = check_strategy(candles)
+        futures = {
+            executor.submit(
+                process_symbol,
+                symbol
+            ): symbol
+            for symbol in symbols
+        }
 
-    if result is None:
+        for future in as_completed(futures):
 
-        print(
-            f"[NO SIGNAL] {symbol} | "
-            f"1H conditions not satisfied"
-        )
+            symbol = futures[future]
 
-        return
+            try:
 
-    # ========================================================
-    # SEND TELEGRAM
-    # ========================================================
+                signal = future.result()
 
-    sent = send_buy_signal(
-        symbol=symbol,
-        gain_percent=gain_percent,
-        quote_volume=quote_volume,
-        result=result,
-        candle=latest_candle
-    )
+                if signal:
 
-    # ========================================================
-    # COOLDOWN ONLY AFTER SUCCESSFUL SEND
-    # ========================================================
+                    message = make_signal_message(
+                        signal
+                    )
 
-    if sent:
+                    print("\n" + message + "\n")
 
-        cooldowns[symbol] = time.time()
+                    send_telegram(
+                        message
+                    )
 
-        print(
-            f"[SIGNAL SENT] {symbol} | "
-            f"24H cooldown started"
-        )
+            except Exception as e:
 
-    else:
-
-        print(
-            f"[SIGNAL NOT SENT] {symbol} | "
-            f"Cooldown NOT started"
-        )
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
-
-def cleanup_state(active_symbols):
-
-    active_set = set(active_symbols)
-
-    # Remove candle tracking for symbols
-    # that are no longer in the 0%-5% gainers list.
-
-    for symbol in list(last_processed_candle.keys()):
-
-        if symbol not in active_set:
-
-            del last_processed_candle[symbol]
+                print(
+                    f"{symbol}: processing error:",
+                    e
+                )
 
 
 # ============================================================
@@ -692,128 +666,37 @@ def cleanup_state(active_symbols):
 def main():
 
     print("=" * 60)
-
-    print("BINANCE GAINERS + EMA BUY BOT")
-
+    print("BINANCE 5M HIGH / DIB BREAKOUT ALERT BOT")
     print("=" * 60)
-
+    print("ALERT ONLY")
+    print("NO AUTOMATIC ORDER")
     print(
-        f"Timeframe: {INTERVAL}"
+        f"Top coins: {TOP_COINS}"
     )
-
     print(
-        f"Scan interval: {SCAN_SECONDS} seconds"
+        f"Candles: {CANDLE_LIMIT}"
     )
-
     print(
-        f"24H gain range: "
-        f"{MIN_24H_GAIN_PERCENT:.2f}% "
-        f"to "
-        f"+{MAX_24H_GAIN_PERCENT:.2f}%"
+        f"High left candles: {LEFT_HIGH_CANDLES}"
     )
-
-    print(
-        f"Minimum 24H volume: "
-        f"{MIN_24H_QUOTE_VOLUME:,} USDT"
-    )
-
-    print(
-        f"EMA: {EMA_FAST}/{EMA_SLOW}"
-    )
-
-    print(
-        f"Cooldown: {COOLDOWN_HOURS} hours"
-    )
-
-    print(
-        "Startup mode: WAIT FOR NEW 1H CANDLE"
-    )
-
     print("=" * 60)
 
     while True:
 
         try:
 
-            print(
-                f"\n[SCAN] "
-                f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
-            )
-
-            # =================================================
-            # GET CURRENT GAINERS
-            # =================================================
-
-            gainers = get_gainers()
-
-            if not gainers:
-
-                print(
-                    "[INFO] No eligible coins found"
-                )
-
-                time.sleep(SCAN_SECONDS)
-
-                continue
-
-            print(
-                f"[GAINERS] "
-                f"{len(gainers)} coins meet filters"
-            )
-
-            active_symbols = [
-                item["symbol"]
-                for item in gainers
-            ]
-
-            cleanup_state(active_symbols)
-
-            # =================================================
-            # ANALYZE
-            # =================================================
-
-            for index, item in enumerate(gainers, start=1):
-
-                symbol = item["symbol"]
-
-                gain_percent = item["gain_percent"]
-
-                quote_volume = item["quote_volume"]
-
-                analyze_symbol(
-                    symbol=symbol,
-                    gain_percent=gain_percent,
-                    quote_volume=quote_volume
-                )
-
-                if index % 10 == 0:
-
-                    print(
-                        f"[PROGRESS] "
-                        f"{index}/{len(gainers)}"
-                    )
-
-            # =================================================
-            # WAIT
-            # =================================================
-
-            time.sleep(SCAN_SECONDS)
-
-        except KeyboardInterrupt:
-
-            print(
-                "\n[BOT STOPPED]"
-            )
-
-            break
+            scan()
 
         except Exception as e:
 
             print(
-                f"[MAIN ERROR] {e}"
+                "MAIN ERROR:",
+                e
             )
 
-            time.sleep(SCAN_SECONDS)
+        time.sleep(
+            SCAN_SECONDS
+        )
 
 
 # ============================================================
@@ -821,5 +704,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
