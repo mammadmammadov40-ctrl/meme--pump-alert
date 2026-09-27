@@ -1,98 +1,36 @@
 import os
 import time
 import requests
-from datetime import datetime, timezone
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ============================================================
-# BINANCE 5M HIGH / DIB BREAKOUT ALERT BOT
+# CONFIG
 # ============================================================
-#
-# YALNIZ ALERT
-# AVTOMATIK ORDER YOXDUR
-#
-# STRATEGIYA:
-#
-# 1. Binance Spot USDT cütləri
-# 2. 24h quote volume-a görə TOP 100
-# 3. 5 dəqiqəlik timeframe
-# 4. Son 100 BAĞLANMIŞ şam
-#
-# HIGH QAYDASI:
-# - High-ın solunda ən azı 10 şam olmalıdır.
-# - High > əvvəlki 10 şamın bütün High qiymətləri
-# - Sağda 10 şam gözlənilmir.
-#
-# DIB QAYDASI:
-# - Aktiv DIB-dən aşağı yeni qiymət gəlsə,
-#   yeni DIB yaranır.
-# - Aradakı kiçik təpələr yeni High sayılmır,
-#   əgər yeni DIB yaranmayıbsa.
-#
-# HIGH QIRILMASI:
-# - Qiymət target High-ı keçməlidir.
-# - 5M şam target High-ın ÜSTÜNDƏ BAĞLANMALIDIR.
-# - Bundan sonra Telegram siqnalı göndərilir.
-#
-# ============================================================
-
-
-# =========================
-# ENV
-# =========================
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-
-# =========================
-# SETTINGS
-# =========================
 
 BINANCE_URL = "https://api.binance.com"
-
 INTERVAL = "5m"
 
 TOP_COINS = 100
-
 CANDLE_LIMIT = 100
 
 LEFT_HIGH_CANDLES = 10
 
+MIN_BREAKOUT_PERCENT = 1.0
+
 SCAN_SECONDS = 15
-
 REQUEST_TIMEOUT = 10
-
 MAX_WORKERS = 10
 
-# Eyni breakout-un təkrar göndərilməsinin qarşısını alır
 SIGNAL_COOLDOWN_SECONDS = 24 * 60 * 60
 
+AZ_TZ = ZoneInfo("Asia/Baku")
 
-# =========================
-# SESSION
-# =========================
-
-session = requests.Session()
-
-session.headers.update({
-    "User-Agent": "Mozilla/5.0"
-})
-
-
-# =========================
-# MEMORY
-# =========================
-
-last_signal = {}
-
-# Hər symbol üçün son işlənmiş candle open time
-last_processed_candle = {}
-
-# İlk scan zamanı köhnə breakout siqnallarını
-# göndərməmək üçün istifadə olunur
-initialized_symbols = set()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 # ============================================================
@@ -100,438 +38,299 @@ initialized_symbols = set()
 # ============================================================
 
 def send_telegram(message):
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram ENV dəyişənləri yoxdur.")
-        print(message)
-        return False
+        print("Telegram env variables missing")
+        return
 
     url = (
         f"https://api.telegram.org/bot"
         f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
-    payload = {
+    data = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message
     }
 
     try:
-        r = session.post(
+        requests.post(
             url,
-            json=payload,
+            data=data,
+            timeout=REQUEST_TIMEOUT
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def format_time(ms):
+    dt = datetime.fromtimestamp(
+        ms / 1000,
+        tz=AZ_TZ
+    )
+
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ============================================================
+# BINANCE
+# ============================================================
+
+def get_top_symbols():
+    url = f"{BINANCE_URL}/api/v3/ticker/24hr"
+
+    try:
+        r = requests.get(
+            url,
             timeout=REQUEST_TIMEOUT
         )
 
-        if r.ok:
-            return True
+        r.raise_for_status()
 
-        print(
-            "Telegram error:",
-            r.status_code,
-            r.text[:300]
-        )
+        data = r.json()
 
     except Exception as e:
-        print("Telegram exception:", e)
-
-    return False
-
-
-# ============================================================
-# BINANCE REQUEST
-# ============================================================
-
-def binance_get(path, params=None):
-
-    url = BINANCE_URL + path
-
-    r = session.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT
-    )
-
-    r.raise_for_status()
-
-    return r.json()
-
-
-# ============================================================
-# TOP 100 USDT COINS
-# ============================================================
-
-def get_top_100_symbols():
-
-    try:
-
-        tickers = binance_get(
-            "/api/v3/ticker/24hr"
-        )
-
-        symbols = []
-
-        for x in tickers:
-
-            symbol = x.get("symbol", "")
-
-            # Yalnız USDT
-            if not symbol.endswith("USDT"):
-                continue
-
-            # 24h quote volume
-            try:
-                quote_volume = float(
-                    x.get("quoteVolume", 0)
-                )
-            except:
-                quote_volume = 0
-
-            if quote_volume <= 0:
-                continue
-
-            symbols.append(
-                (
-                    symbol,
-                    quote_volume
-                )
-            )
-
-        # Həcmə görə sıralama
-        symbols.sort(
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        return [
-            x[0]
-            for x in symbols[:TOP_COINS]
-        ]
-
-    except Exception as e:
-
-        print(
-            "Top symbols error:",
-            e
-        )
-
+        print("Ticker error:", e)
         return []
 
+    symbols = []
+
+    for x in data:
+
+        symbol = x.get("symbol", "")
+
+        if not symbol.endswith("USDT"):
+            continue
+
+        # Spot only
+        if any(
+            symbol.endswith(x)
+            for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"]
+        ):
+            continue
+
+        try:
+            volume = float(x.get("quoteVolume", 0))
+        except:
+            continue
+
+        symbols.append(
+            (symbol, volume)
+        )
+
+    symbols.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    return [
+        x[0]
+        for x in symbols[:TOP_COINS]
+    ]
+
 
 # ============================================================
-# GET 100 CLOSED 5M CANDLES
+# CANDLES
 # ============================================================
 
 def get_closed_candles(symbol):
 
+    url = f"{BINANCE_URL}/api/v3/klines"
+
+    params = {
+        "symbol": symbol,
+        "interval": INTERVAL,
+        "limit": CANDLE_LIMIT + 1
+    }
+
     try:
 
-        data = binance_get(
-            "/api/v3/klines",
-            {
-                "symbol": symbol,
-                "interval": INTERVAL,
-                "limit": CANDLE_LIMIT + 1
-            }
+        r = requests.get(
+            url,
+            params=params,
+            timeout=REQUEST_TIMEOUT
         )
 
-        now_ms = int(
-            time.time() * 1000
-        )
+        r.raise_for_status()
 
-        candles = []
-
-        for c in data:
-
-            open_time = int(c[0])
-            close_time = int(c[6])
-
-            # Hələ bağlanmamış şamı at
-            if close_time >= now_ms:
-                continue
-
-            candles.append({
-                "open_time": open_time,
-                "close_time": close_time,
-
-                "open": float(c[1]),
-                "high": float(c[2]),
-                "low": float(c[3]),
-                "close": float(c[4]),
-
-                "volume": float(c[5])
-            })
-
-        # Son 100 bağlanmış şam
-        candles = candles[-CANDLE_LIMIT:]
-
-        return candles
+        data = r.json()
 
     except Exception as e:
-
-        print(
-            f"{symbol}: candle error:",
-            e
-        )
-
+        print(f"{symbol} candle error:", e)
         return []
+
+    candles = []
+
+    now_ms = int(time.time() * 1000)
+
+    for k in data:
+
+        open_time = int(k[0])
+        close_time = int(k[6])
+
+        # Açıq şamı götürmə
+        if close_time > now_ms:
+            continue
+
+        candles.append({
+            "open_time": open_time,
+            "close_time": close_time,
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4])
+        })
+
+    return candles[-CANDLE_LIMIT:]
 
 
 # ============================================================
-# HIGH VALIDATION
+# HIGH
 # ============================================================
 
 def is_valid_high(candles, index):
-
-    """
-    High yalnız əvvəlində ən azı 10 şam olduqda keçərlidir.
-
-    Məsələn:
-
-    əvvəlki 10 şamın High-ları:
-    100
-    101
-    99
-    102
-    ...
-
-    yeni High = 105
-
-    105 hamısından yüksəkdirsə:
-    VALID HIGH
-    """
 
     if index < LEFT_HIGH_CANDLES:
         return False
 
     current_high = candles[index]["high"]
 
-    previous_highs = [
-        candles[j]["high"]
-        for j in range(
-            index - LEFT_HIGH_CANDLES,
-            index
-        )
+    left = candles[
+        index - LEFT_HIGH_CANDLES:index
     ]
 
-    return current_high > max(previous_highs)
+    for c in left:
+        if current_high <= c["high"]:
+            return False
+
+    return True
 
 
 # ============================================================
-# STRATEGY
+# FIND HIGHEST VALID HIGH
 # ============================================================
 
-def analyze_symbol(symbol, candles):
+def find_initial_high(candles):
 
-    if len(candles) < LEFT_HIGH_CANDLES + 2:
-        return None
-
-    #
-    # STATE
-    #
-    # target_high:
-    # Hazırda qırılması gözlənilən High
-    #
-    # active_dib:
-    # Hazırkı aktiv DIB
-    #
-
-    target_high = None
-    target_high_index = None
-
-    active_dib = None
-    active_dib_index = None
-
-    #
-    # Əvvəlcə keçmişdə formalaşmış struktur qurulur.
-    #
-
-    started = False
+    candidates = []
 
     for i in range(
         LEFT_HIGH_CANDLES,
         len(candles)
     ):
 
-        candle = candles[i]
+        if is_valid_high(candles, i):
 
-        # ==================================================
-        # 1. Hələ struktur başlamayıbsa,
-        #    ilk valid High axtar
-        # ==================================================
+            candidates.append(i)
 
-        if not started:
+    if not candidates:
+        return None
 
-            if is_valid_high(candles, i):
-
-                target_high = candle["high"]
-                target_high_index = i
-
-                started = True
-
-            continue
-
-        # ==================================================
-        # 2. TARGET HIGH ARTİQ VAR
-        # ==================================================
-
-        # --------------------------------------------------
-        # Əgər yeni DIB yaranırsa
-        # --------------------------------------------------
-
-        if active_dib is None:
-
-            # İlk DIB:
-            #
-            # target High-dan sonra ən aşağı low
-            #
-            if i > target_high_index:
-
-                active_dib = candle["low"]
-                active_dib_index = i
-
-        else:
-
-            #
-            # Cari aktiv DIB-dən aşağı düşdüsə:
-            # yeni DIB yaranır
-            #
-
-            if candle["low"] < active_dib:
-
-                active_dib = candle["low"]
-                active_dib_index = i
-
-        # ==================================================
-        # 3. BREAKOUT
-        # ==================================================
-
-        if target_high is not None:
-
-            #
-            # Şam həm High-ı keçməlidir,
-            # həm də üstündə bağlanmalıdır.
-            #
-
-            if (
-                candle["high"] > target_high
-                and
-                candle["close"] > target_high
-            ):
-
-                return {
-                    "type": "BREAKOUT",
-
-                    "symbol": symbol,
-
-                    "target_high": target_high,
-
-                    "breakout_price": candle["close"],
-
-                    "dib": active_dib,
-
-                    "candle_index": i,
-
-                    "candle": candle
-                }
-
-        # ==================================================
-        # 4. YENİ VALID HIGH
-        # ==================================================
-        #
-        # Çox vacib:
-        #
-        # DIB-dən sonra qiymət qalxır.
-        #
-        # Əgər yeni zirvə:
-        # - əvvəlki 10 şamdan yüksəkdirsə
-        #
-        # həmin zirvə yeni High kimi qəbul edilir.
-        #
-        # Amma bu High əvvəlki target High-ı
-        # qıra bilməyibsə, yeni target olur.
-        #
-        # ==================================================
-
-        if i > active_dib_index:
-
-            if is_valid_high(candles, i):
-
-                new_high = candle["high"]
-
-                #
-                # Əgər bu High əvvəlki target High-dan
-                # aşağıdırsa, əvvəlki High qırılmayıb.
-                #
-                # Buna görə yeni High target ola bilər.
-                #
-
-                if new_high < target_high:
-
-                    target_high = new_high
-                    target_high_index = i
-
-                    #
-                    # Bu yeni High-dan sonra yaranacaq
-                    # yeni DIB üçün gözləməyə davam edilir.
-                    #
-
-                elif new_high == target_high:
-
-                    # Eyni səviyyədirsə dəyişmir
-                    pass
-
-        # ==================================================
-        # 5. Əgər yeni High formalaşdısa,
-        #    aktiv DIB həmin High-dan əvvəlki DIB olaraq qalır.
-        #
-        # Yeni DIB yalnız əvvəlki DIB aşağı qırıldıqda yaranır.
-        # ==================================================
-
-    return None
+    # Son formalaşmış valid High
+    return candidates[-1]
 
 
 # ============================================================
-# SIGNAL MESSAGE
+# STATE
 # ============================================================
 
-def make_signal_message(signal):
+class SymbolState:
 
-    symbol = signal["symbol"]
+    def __init__(self):
 
-    high_price = signal["target_high"]
+        self.initialized = False
 
-    close_price = signal["breakout_price"]
+        # Hazırkı əsas HIGH
+        self.target_high = None
+        self.target_high_index = None
 
-    dib_price = signal["dib"]
+        # Hazırkı aktiv DIB
+        self.active_dib = None
+        self.active_dib_index = None
 
-    candle = signal["candle"]
+        # DIB-dən sonra yaranan rally-nin ən yüksək nöqtəsi
+        self.rally_peak = None
+        self.rally_peak_index = None
 
-    breakout_percent = (
-        (close_price - high_price)
-        / high_price
-        * 100
+        # DIB-dən sonra valid High gözlənilir
+        self.waiting_for_valid_high = False
+
+        # Son siqnal vaxtı
+        self.last_signal_time = 0
+
+        # Son işlənmiş şam
+        self.last_candle_time = None
+
+
+states = {}
+
+
+# ============================================================
+# STATE RESET
+# ============================================================
+
+def reset_state():
+
+    return SymbolState()
+
+
+# ============================================================
+# BUILD INITIAL STRUCTURE
+# ============================================================
+
+def initialize_structure(symbol, candles):
+
+    state = SymbolState()
+
+    if len(candles) < LEFT_HIGH_CANDLES + 2:
+        return state
+
+    high_index = find_initial_high(candles)
+
+    if high_index is None:
+        return state
+
+    high = candles[high_index]
+
+    state.target_high = high["high"]
+    state.target_high_index = high_index
+
+    # --------------------------------------------------------
+    # İlk HIGH-dan sonra ilk DIB
+    #
+    # İlk HIGH-dan sonra qiymətin etdiyi minimum low götürülür.
+    # Sonrakı rally həmin DIB-dən başlayır.
+    # --------------------------------------------------------
+
+    after_high = candles[
+        high_index + 1:
+    ]
+
+    if not after_high:
+        return state
+
+    min_index = min(
+        range(len(after_high)),
+        key=lambda i: after_high[i]["low"]
     )
 
-    utc_time = datetime.fromtimestamp(
-        candle["close_time"] / 1000,
-        tz=timezone.utc
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
+    dib_index = (
+        high_index +
+        1 +
+        min_index
     )
 
-    message = (
-        "🚨 5M BREAKOUT SIGNAL 🚨\n\n"
-        f"🪙 {symbol}\n"
-        f"📈 High: {high_price:g}\n"
-        f"💰 Close: {close_price:g}\n"
-        f"📉 Active DIB: {dib_price:g}\n\n"
-        f"🔥 Breakout: +{breakout_percent:.2f}%\n"
-        f"⏱ Candle: {utc_time}\n\n"
-        "⚠️ ALERT ONLY — NO AUTO ORDER"
-    )
+    state.active_dib = candles[dib_index]["low"]
+    state.active_dib_index = dib_index
 
-    return message
+    state.initialized = True
+
+    state.last_candle_time = candles[-1]["close_time"]
+
+    return state
 
 
 # ============================================================
@@ -542,121 +341,315 @@ def process_symbol(symbol):
 
     candles = get_closed_candles(symbol)
 
-    if len(candles) < LEFT_HIGH_CANDLES + 2:
+    if len(candles) < LEFT_HIGH_CANDLES + 5:
         return None
 
-    latest_candle_time = candles[-1]["open_time"]
+    if symbol not in states:
 
-    #
-    # Eyni bağlanmış şamı təkrar analiz etmə
-    #
+        state = initialize_structure(
+            symbol,
+            candles
+        )
 
-    if (
-        symbol in last_processed_candle
-        and
-        last_processed_candle[symbol]
-        == latest_candle_time
-    ):
+        states[symbol] = state
+
+        # İlk quruluşda köhnə breakout-u siqnal etmə
         return None
 
-    last_processed_candle[symbol] = latest_candle_time
+    state = states[symbol]
 
-    signal = analyze_symbol(
-        symbol,
-        candles
-    )
+    # --------------------------------------------------------
+    # Yalnız yeni bağlanmış şamlarla işləyirik
+    # --------------------------------------------------------
 
-    if signal is None:
+    new_candles = []
+
+    for c in candles:
+
+        if (
+            state.last_candle_time is None
+            or c["close_time"] > state.last_candle_time
+        ):
+            new_candles.append(c)
+
+    if not new_candles:
         return None
 
-    #
-    # İlk scan zamanı köhnə siqnal göndərmə.
-    #
-    # Bot artıq işləyərkən yaranan yeni breakout
-    # göndəriləcək.
-    #
+    signal = None
 
-    if symbol not in initialized_symbols:
+    for candle in new_candles:
 
-        initialized_symbols.add(symbol)
+        current_close = candle["close"]
+        current_high = candle["high"]
+        current_low = candle["low"]
 
-        return None
+        # ====================================================
+        # 1. TARGET HIGH YOXDURSA
+        # ====================================================
 
-    initialized_symbols.add(symbol)
+        if state.target_high is None:
 
-    #
-    # 24 saat cooldown
-    #
+            # Hazırkı rally peak-i saxla
+            if (
+                state.rally_peak is None
+                or current_high > state.rally_peak
+            ):
 
-    now = time.time()
+                state.rally_peak = current_high
 
-    previous_signal = last_signal.get(symbol)
+                state.rally_peak_index = (
+                    candles.index(candle)
+                    if candle in candles
+                    else None
+                )
 
-    if previous_signal is not None:
+            # Valid High olub-olmadığını yoxla
+            try:
+                idx = candles.index(candle)
+            except ValueError:
+                idx = None
 
-        if now - previous_signal < SIGNAL_COOLDOWN_SECONDS:
-            return None
+            if (
+                idx is not None
+                and idx >= LEFT_HIGH_CANDLES
+                and is_valid_high(candles, idx)
+            ):
 
-    last_signal[symbol] = now
+                state.target_high = current_high
+                state.target_high_index = idx
+
+                state.waiting_for_valid_high = False
+
+                state.rally_peak = current_high
+                state.rally_peak_index = idx
+
+            state.last_candle_time = candle["close_time"]
+
+            continue
+
+        # ====================================================
+        # 2. BREAKOUT YOXLAMASI
+        # ====================================================
+
+        breakout_percent = (
+            (current_close - state.target_high)
+            / state.target_high
+        ) * 100
+
+        if (
+            current_close > state.target_high
+            and breakout_percent >= MIN_BREAKOUT_PERCENT
+        ):
+
+            now = time.time()
+
+            if (
+                now - state.last_signal_time
+                >= SIGNAL_COOLDOWN_SECONDS
+            ):
+
+                high_candle = candles[
+                    state.target_high_index
+                ]
+
+                dib_candle = candles[
+                    state.active_dib_index
+                ]
+
+                signal = {
+                    "symbol": symbol,
+
+                    "high": state.target_high,
+                    "high_time": high_candle["close_time"],
+
+                    "dib": state.active_dib,
+                    "dib_time": dib_candle["close_time"],
+
+                    "breakout_close": current_close,
+                    "breakout_time": candle["close_time"],
+
+                    "breakout_percent": breakout_percent
+                }
+
+                state.last_signal_time = now
+
+            # Breakout olduqdan sonra yeni struktur
+            # axtarmaq üçün state-i sıfırla.
+            state.target_high = None
+            state.target_high_index = None
+
+            state.active_dib = None
+            state.active_dib_index = None
+
+            state.rally_peak = None
+            state.rally_peak_index = None
+
+            state.waiting_for_valid_high = True
+
+            state.last_candle_time = candle["close_time"]
+
+            if signal:
+                return signal
+
+            continue
+
+        # ====================================================
+        # 3. RALLY PEAK-I YENİLƏ
+        # ====================================================
+
+        if (
+            state.rally_peak is None
+            or current_high > state.rally_peak
+        ):
+
+            state.rally_peak = current_high
+
+            try:
+                state.rally_peak_index = candles.index(candle)
+            except:
+                state.rally_peak_index = None
+
+        # ====================================================
+        # 4. AKTİV DIB QIRILIB?
+        # ====================================================
+
+        if (
+            state.active_dib is not None
+            and current_low < state.active_dib
+        ):
+
+            # ------------------------------------------------
+            # Yeni DIB
+            # ------------------------------------------------
+
+            new_dib = current_low
+
+            try:
+                new_dib_index = candles.index(candle)
+            except:
+                new_dib_index = None
+
+            old_rally_peak = state.rally_peak
+            old_rally_peak_index = (
+                state.rally_peak_index
+            )
+
+            # ------------------------------------------------
+            # Əvvəlki DIB-dən gələn rally peak-i
+            # valid High-dır?
+            # ------------------------------------------------
+
+            valid_peak = False
+
+            if (
+                old_rally_peak_index is not None
+                and old_rally_peak_index >= LEFT_HIGH_CANDLES
+            ):
+
+                valid_peak = is_valid_high(
+                    candles,
+                    old_rally_peak_index
+                )
+
+            # ------------------------------------------------
+            # Əgər peak 10 sol şam şərtinə uyğundursa
+            # yeni HIGH target olur.
+            #
+            # Əks halda həmin peak TAMAMİLƏ İGNOR olunur.
+            # ------------------------------------------------
+
+            if valid_peak:
+
+                state.target_high = old_rally_peak
+                state.target_high_index = (
+                    old_rally_peak_index
+                )
+
+                state.waiting_for_valid_high = False
+
+            else:
+
+                state.target_high = None
+                state.target_high_index = None
+
+                state.waiting_for_valid_high = True
+
+            # Yeni DIB aktiv olur
+            state.active_dib = new_dib
+            state.active_dib_index = new_dib_index
+
+            # Yeni rally başlayır
+            state.rally_peak = None
+            state.rally_peak_index = None
+
+            state.last_candle_time = candle["close_time"]
+
+            continue
+
+        # ====================================================
+        # 5. ƏGƏR TARGET HIGH YOXDURSA
+        #    YENİ VALID HIGH AXTAR
+        # ====================================================
+
+        if (
+            state.target_high is None
+            and state.active_dib is not None
+        ):
+
+            try:
+                idx = candles.index(candle)
+            except:
+                idx = None
+
+            if (
+                idx is not None
+                and idx >= LEFT_HIGH_CANDLES
+                and is_valid_high(candles, idx)
+            ):
+
+                # Yeni valid High
+                state.target_high = current_high
+                state.target_high_index = idx
+
+                state.waiting_for_valid_high = False
+
+                state.rally_peak = current_high
+                state.rally_peak_index = idx
+
+        state.last_candle_time = candle["close_time"]
 
     return signal
 
 
 # ============================================================
-# MAIN SCAN
+# TELEGRAM MESSAGE
 # ============================================================
 
-def scan():
+def make_signal_message(signal):
 
-    symbols = get_top_100_symbols()
+    breakout = signal["breakout_percent"]
 
-    if not symbols:
-        print("Top 100 tapılmadı.")
-        return
+    return (
+        "🚨 5M BREAKOUT SIGNAL 🚨\n\n"
 
-    print(
-        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-        f"Scanning {len(symbols)} symbols..."
+        f"🪙 Coin: {signal['symbol']}\n\n"
+
+        "📈 HIGH\n"
+        f"Price: {signal['high']:.8f}\n"
+        f"Time: {format_time(signal['high_time'])}\n\n"
+
+        "📉 DIB\n"
+        f"Price: {signal['dib']:.8f}\n"
+        f"Time: {format_time(signal['dib_time'])}\n\n"
+
+        "🔥 BREAKOUT\n"
+        f"Close: {signal['breakout_close']:.8f}\n"
+        f"Time: {format_time(signal['breakout_time'])}\n"
+        f"Breakout: +{breakout:.2f}%\n\n"
+
+        "✅ Breakout >= 1%\n"
+        "⚠️ ALERT ONLY — NO AUTO ORDER"
     )
-
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
-
-        futures = {
-            executor.submit(
-                process_symbol,
-                symbol
-            ): symbol
-            for symbol in symbols
-        }
-
-        for future in as_completed(futures):
-
-            symbol = futures[future]
-
-            try:
-
-                signal = future.result()
-
-                if signal:
-
-                    message = make_signal_message(
-                        signal
-                    )
-
-                    print("\n" + message + "\n")
-
-                    send_telegram(
-                        message
-                    )
-
-            except Exception as e:
-
-                print(
-                    f"{symbol}: processing error:",
-                    e
-                )
 
 
 # ============================================================
@@ -665,38 +658,85 @@ def scan():
 
 def main():
 
-    print("=" * 60)
-    print("BINANCE 5M HIGH / DIB BREAKOUT ALERT BOT")
-    print("=" * 60)
-    print("ALERT ONLY")
-    print("NO AUTOMATIC ORDER")
-    print(
-        f"Top coins: {TOP_COINS}"
-    )
-    print(
-        f"Candles: {CANDLE_LIMIT}"
-    )
-    print(
-        f"High left candles: {LEFT_HIGH_CANDLES}"
-    )
-    print("=" * 60)
+    print("==========================================")
+    print("BINANCE 5M HIGH / DIB BREAKOUT BOT")
+    print("ALERT ONLY — NO AUTO ORDER")
+    print("==========================================")
 
     while True:
 
         try:
 
-            scan()
+            symbols = get_top_symbols()
+
+            if not symbols:
+
+                print("No symbols found")
+                time.sleep(SCAN_SECONDS)
+                continue
+
+            print(
+                f"\nScanning {len(symbols)} symbols..."
+            )
+
+            with ThreadPoolExecutor(
+                max_workers=MAX_WORKERS
+            ) as executor:
+
+                futures = {
+                    executor.submit(
+                        process_symbol,
+                        symbol
+                    ): symbol
+                    for symbol in symbols
+                }
+
+                for future in as_completed(futures):
+
+                    symbol = futures[future]
+
+                    try:
+
+                        signal = future.result()
+
+                        if signal:
+
+                            print(
+                                f"🚨 SIGNAL: {symbol} "
+                                f"+{signal['breakout_percent']:.2f}%"
+                            )
+
+                            message = (
+                                make_signal_message(
+                                    signal
+                                )
+                            )
+
+                            send_telegram(
+                                message
+                            )
+
+                    except Exception as e:
+
+                        print(
+                            f"{symbol} processing error:",
+                            e
+                        )
+
+            print(
+                f"Next scan in {SCAN_SECONDS}s..."
+            )
+
+            time.sleep(SCAN_SECONDS)
 
         except Exception as e:
 
             print(
-                "MAIN ERROR:",
+                "MAIN LOOP ERROR:",
                 e
             )
 
-        time.sleep(
-            SCAN_SECONDS
-        )
+            time.sleep(10)
 
 
 # ============================================================
