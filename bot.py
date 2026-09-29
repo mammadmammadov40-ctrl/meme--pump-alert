@@ -4,6 +4,7 @@ import requests
 
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from collections import deque
 
 
 # ============================================================
@@ -17,17 +18,17 @@ INTERVAL = "15m"
 
 TOP_COINS = 100
 
+# Struktur üçün son 100 bağlanmış 15M şam
+STRUCTURE_CANDLES = 100
+
 # HIGH üçün solda minimum 10 şam
 LEFT_HIGH_CANDLES = 10
 
-# HIGH 1 breakout minimum
+# HIGH 1 üzərində minimum breakout
 MIN_BREAKOUT_PERCENT = 1.0
 
-# Binance-i hər 30 saniyədə yoxla
+# Scan intervalı
 SCAN_SECONDS = 30
-
-# Railway heartbeat hər 60 saniyə
-HEARTBEAT_SECONDS = 60
 
 REQUEST_TIMEOUT = 10
 
@@ -40,18 +41,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ============================================================
 # BOT START TIME
 # ============================================================
-#
-# ÇOX VACİB:
-#
-# Bot başladıqdan ƏVVƏL bağlanmış şamlar siqnal üçün istifadə
-# olunmayacaq.
-#
-# Məsələn bot 23:42-də başlayıbsa:
-#
-# 23:30 şamı istifadə olunmur.
-# 23:45 bağlanandan sonra ilk dəfə istifadə olunur.
-#
-# ============================================================
 
 BOT_START_TIME_MS = int(time.time() * 1000)
 
@@ -63,9 +52,7 @@ BOT_START_TIME_MS = int(time.time() * 1000)
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-
-        print("⚠️ Telegram variables missing")
-
+        print("Telegram variables missing")
         return
 
     url = (
@@ -85,22 +72,14 @@ def send_telegram(message):
         )
 
         if not r.ok:
-
-            print(
-                "❌ Telegram error:",
-                r.text
-            )
+            print("Telegram error:", r.text)
 
         else:
-
-            print("📨 Telegram alert sent")
+            print("📨 TELEGRAM ALERT SENT")
 
     except Exception as e:
 
-        print(
-            "❌ Telegram exception:",
-            e
-        )
+        print("Telegram exception:", e)
 
 
 # ============================================================
@@ -134,10 +113,7 @@ def get_top_symbols():
 
     except Exception as e:
 
-        print(
-            "❌ Top coins error:",
-            e
-        )
+        print("Top coins error:", e)
 
         return []
 
@@ -145,16 +121,11 @@ def get_top_symbols():
 
     for item in data:
 
-        symbol = item.get(
-            "symbol",
-            ""
-        )
+        symbol = item.get("symbol", "")
 
         if not symbol.endswith("USDT"):
-
             continue
 
-        # Leveraged tokens
         if symbol.endswith(
             (
                 "UPUSDT",
@@ -163,7 +134,6 @@ def get_top_symbols():
                 "BEARUSDT"
             )
         ):
-
             continue
 
         try:
@@ -196,7 +166,67 @@ def get_top_symbols():
 
 
 # ============================================================
-# GET LATEST CLOSED 15M CANDLE
+# GET LAST 100 CLOSED CANDLES
+# ============================================================
+
+def get_history(symbol):
+
+    try:
+
+        r = requests.get(
+            f"{BINANCE_URL}/api/v3/klines",
+            params={
+                "symbol": symbol,
+                "interval": INTERVAL,
+                "limit": STRUCTURE_CANDLES + 1
+            },
+            timeout=REQUEST_TIMEOUT
+        )
+
+        r.raise_for_status()
+
+        data = r.json()
+
+    except Exception as e:
+
+        print(
+            f"{symbol} history error:",
+            e
+        )
+
+        return []
+
+    now_ms = int(
+        time.time() * 1000
+    )
+
+    candles = []
+
+    for k in data:
+
+        close_time = int(k[6])
+
+        # Yalnız bağlanmış şam
+        if close_time > now_ms:
+            continue
+
+        candles.append(
+            {
+                "open_time": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "close_time": close_time
+            }
+        )
+
+    # Son 100 bağlanmış şam
+    return candles[-STRUCTURE_CANDLES:]
+
+
+# ============================================================
+# GET LATEST CLOSED CANDLE
 # ============================================================
 
 def get_latest_closed_candle(symbol):
@@ -226,10 +256,6 @@ def get_latest_closed_candle(symbol):
 
         return None
 
-    if not data:
-
-        return None
-
     now_ms = int(
         time.time() * 1000
     )
@@ -240,7 +266,6 @@ def get_latest_closed_candle(symbol):
 
         close_time = int(k[6])
 
-        # Şam bağlanmış olmalıdır
         if close_time <= now_ms:
 
             closed = {
@@ -256,38 +281,39 @@ def get_latest_closed_candle(symbol):
 
 
 # ============================================================
-# SYMBOL STATE
+# STATE
 # ============================================================
 
 class State:
 
     def __init__(self):
 
-        # ----------------------------------------------------
-        # Yalnız bot başladıqdan sonra gələn şamlar
-        # ----------------------------------------------------
-
-        self.candles = []
+        # Son 100 şam
+        self.candles = deque(
+            maxlen=STRUCTURE_CANDLES
+        )
 
         self.last_candle_time = None
 
+        # Neçə şam işlənib
+        self.bars_seen = 0
+
         # ----------------------------------------------------
-        # DIB 1 CANDIDATE
+        # DIB 1
         # ----------------------------------------------------
 
         self.dib1_candidate = None
-        self.dib1_candidate_index = None
         self.dib1_candidate_time = None
 
         self.dib1_rising = False
 
         # ----------------------------------------------------
-        # HIGH 1 CANDIDATE
+        # HIGH 1
         # ----------------------------------------------------
 
         self.high1_candidate = None
-        self.high1_candidate_index = None
         self.high1_candidate_time = None
+        self.high1_candidate_bar = None
 
         # ----------------------------------------------------
         # CONFIRMED DIB 1 / HIGH 1
@@ -300,11 +326,10 @@ class State:
         self.high1_time = None
 
         # ----------------------------------------------------
-        # DIB 2 CANDIDATE
+        # DIB 2
         # ----------------------------------------------------
 
         self.dib2_candidate = None
-        self.dib2_candidate_index = None
         self.dib2_candidate_time = None
 
         self.dib2_rising = False
@@ -313,38 +338,58 @@ class State:
         # STATE
         # ----------------------------------------------------
 
-        self.state = "SEARCH_DIB1"
+        self.phase = "SEARCH_DIB1"
 
 
 states = {}
 
 
 # ============================================================
-# RESET DIB 1 SEARCH
+# RESET TO DIB 1 SEARCH
 # ============================================================
 
-def reset_dib1_search(state):
+def reset_to_dib1(state):
 
     state.dib1_candidate = None
-    state.dib1_candidate_index = None
     state.dib1_candidate_time = None
-
     state.dib1_rising = False
 
     state.high1_candidate = None
-    state.high1_candidate_index = None
     state.high1_candidate_time = None
+    state.high1_candidate_bar = None
 
-    state.state = "SEARCH_DIB1"
+    state.dib1 = None
+    state.dib1_time = None
+
+    state.high1 = None
+    state.high1_time = None
+
+    state.dib2_candidate = None
+    state.dib2_candidate_time = None
+    state.dib2_rising = False
+
+    state.phase = "SEARCH_DIB1"
 
 
 # ============================================================
-# SEARCH DIB 1
+# RESET AFTER SIGNAL
 # ============================================================
 
-def search_dib1(state, index, symbol):
+def reset_after_signal(state):
 
-    candle = state.candles[index]
+    reset_to_dib1(state)
+
+
+# ============================================================
+# PROCESS SEARCH DIB 1
+# ============================================================
+
+def process_search_dib1(
+    state,
+    candle,
+    symbol,
+    log_enabled=True
+):
 
     # --------------------------------------------------------
     # İlk LOW
@@ -354,18 +399,17 @@ def search_dib1(state, index, symbol):
 
         state.dib1_candidate = candle["low"]
 
-        state.dib1_candidate_index = index
-
         state.dib1_candidate_time = (
             candle["close_time"]
         )
 
-        print(
-            f"📉 {symbol} | "
-            f"DIB 1 candidate: "
-            f"{candle['low']:.8f} | "
-            f"{local_time(candle['close_time'])}"
-        )
+        if log_enabled:
+
+            print(
+                f"📉 {symbol} | "
+                f"DIB candidate: "
+                f"{candle['low']:.8f}"
+            )
 
         return
 
@@ -375,165 +419,99 @@ def search_dib1(state, index, symbol):
 
     if not state.dib1_rising:
 
-        # Daha aşağı LOW yaranıb
+        # Daha aşağı LOW gəlibsə,
+        # əvvəlki DIB namizədi tamamilə silinir.
         if candle["low"] < state.dib1_candidate:
 
             state.dib1_candidate = candle["low"]
-
-            state.dib1_candidate_index = index
 
             state.dib1_candidate_time = (
                 candle["close_time"]
             )
 
-            print(
-                f"📉 {symbol} | "
-                f"DIB 1 NEW LOW: "
-                f"{candle['low']:.8f} | "
-                f"{local_time(candle['close_time'])}"
-            )
+            if log_enabled:
+
+                print(
+                    f"📉 {symbol} | "
+                    f"DIB NEW LOW: "
+                    f"{candle['low']:.8f}"
+                )
 
             return
 
         # ----------------------------------------------------
-        # Qiymət DIB-dən yuxarı qalxmağa başladı
+        # Qiymət DIB-dən yuxarı qalxmağa başlayıb
         # ----------------------------------------------------
 
         if candle["close"] > state.dib1_candidate:
 
             state.dib1_rising = True
 
-            print(
-                f"📈 {symbol} | "
-                f"RISE FROM DIB 1: "
-                f"{state.dib1_candidate:.8f}"
-            )
+            if log_enabled:
 
-            # HIGH üçün minimum 10 şam solda
-            if index >= LEFT_HIGH_CANDLES:
+                print(
+                    f"📈 {symbol} | "
+                    f"RISE FROM DIB: "
+                    f"{state.dib1_candidate:.8f}"
+                )
+
+            # HIGH namizədi üçün 10 sol şam
+            if state.bars_seen >= LEFT_HIGH_CANDLES:
 
                 state.high1_candidate = candle["high"]
-
-                state.high1_candidate_index = index
 
                 state.high1_candidate_time = (
                     candle["close_time"]
                 )
 
-            state.state = "TRACK_HIGH1"
+                state.high1_candidate_bar = (
+                    state.bars_seen
+                )
+
+            state.phase = "TRACK_HIGH1"
 
 
 # ============================================================
-# TRACK HIGH 1
+# PROCESS HIGH 1
 # ============================================================
 
-def track_high1(state, index, symbol):
-
-    candle = state.candles[index]
-
-    # --------------------------------------------------------
-    # DIB 1 hələ təsdiqlənməyib.
-    #
-    # Əgər saved DIB aşağı qırılırsa:
-    # əvvəlki DIB/HIGH strukturu silinir.
-    # --------------------------------------------------------
-
-    if candle["low"] < state.dib1_candidate:
-
-        print(
-            f"🔄 {symbol} | "
-            f"DIB candidate broken: "
-            f"{candle['low']:.8f}"
-        )
-
-        reset_dib1_search(state)
-
-        # Cari şam yeni DIB kimi izlənə bilər
-        search_dib1(
-            state,
-            index,
-            symbol
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # HIGH 1
-    # --------------------------------------------------------
-
-    if (
-        state.high1_candidate is None
-        and index >= LEFT_HIGH_CANDLES
-    ):
-
-        state.high1_candidate = candle["high"]
-
-        state.high1_candidate_index = index
-
-        state.high1_candidate_time = (
-            candle["close_time"]
-        )
-
-        print(
-            f"📈 {symbol} | "
-            f"HIGH 1 candidate: "
-            f"{candle['high']:.8f} | "
-            f"{local_time(candle['close_time'])}"
-        )
-
-    elif (
-        state.high1_candidate is not None
-        and candle["high"] > state.high1_candidate
-    ):
-
-        old_high = state.high1_candidate
-
-        state.high1_candidate = candle["high"]
-
-        state.high1_candidate_index = index
-
-        state.high1_candidate_time = (
-            candle["close_time"]
-        )
-
-        print(
-            f"📈 {symbol} | "
-            f"HIGH 1 NEW HIGH: "
-            f"{old_high:.8f} → "
-            f"{state.high1_candidate:.8f}"
-        )
-
-
-# ============================================================
-# CONFIRM DIB 1 + HIGH 1
-# ============================================================
-
-def check_dib1_confirmation(
+def process_track_high1(
     state,
-    index,
-    symbol
+    candle,
+    symbol,
+    log_enabled=True
 ):
 
-    candle = state.candles[index]
-
-    if state.dib1_candidate is None:
-
-        return False
-
-    if state.high1_candidate is None:
-
-        return False
-
     # --------------------------------------------------------
-    # Saved DIB aşağı qırıldı.
+    # ÇOX VACİB:
     #
-    # Eyni anda:
+    # Əvvəl DIB-in qırılıb-qırılmadığını yoxlayırıq.
     #
-    # DIB 1 = saved LOW
-    # HIGH 1 = saved HIGH
+    # Əgər qırılıbsa, bu şam HIGH 1-ə əlavə edilmir.
+    # Çünki HIGH 1 DIB-dən sonrakı yüksəlişdə yaranmış
+    # ən yüksək qiymət olmalıdır.
     # --------------------------------------------------------
 
     if candle["low"] < state.dib1_candidate:
+
+        # ----------------------------------------------------
+        # DIB 1 + HIGH 1 TƏSDİQ
+        # ----------------------------------------------------
+
+        if state.high1_candidate is None:
+
+            # HIGH üçün 10 sol şam şərti ödənməyib
+            # Bu struktur keçərli deyil.
+            reset_to_dib1(state)
+
+            process_search_dib1(
+                state,
+                candle,
+                symbol,
+                log_enabled
+            )
+
+            return False
 
         state.dib1 = state.dib1_candidate
 
@@ -548,12 +526,12 @@ def check_dib1_confirmation(
         )
 
         # ----------------------------------------------------
-        # DIB 2 üçün yeni aşağı hərəkət başlayır
+        # DIB 2 başlayır
+        #
+        # DIB 1-i qıran şamın LOW-u ilk DIB 2 minimumudur.
         # ----------------------------------------------------
 
         state.dib2_candidate = candle["low"]
-
-        state.dib2_candidate_index = index
 
         state.dib2_candidate_time = (
             candle["close_time"]
@@ -561,55 +539,92 @@ def check_dib1_confirmation(
 
         state.dib2_rising = False
 
-        state.state = "SEARCH_DIB2"
+        state.phase = "SEARCH_DIB2"
 
-        print()
-        print("========================================")
-        print(f"✅ {symbol} | DIB 1 + HIGH 1 CONFIRMED")
-        print("========================================")
+        if log_enabled:
 
-        print(
-            "DIB 1:",
-            state.dib1,
-            local_time(state.dib1_time)
-        )
+            print()
+            print(
+                "=========================================="
+            )
 
-        print(
-            "HIGH 1:",
-            state.high1,
-            local_time(state.high1_time)
-        )
+            print(
+                f"✅ {symbol} | "
+                f"DIB 1 + HIGH 1 CONFIRMED"
+            )
 
-        print(
-            "DIB 2 tracking starts:",
-            state.dib2_candidate,
-            local_time(state.dib2_candidate_time)
-        )
+            print(
+                f"DIB 1: "
+                f"{state.dib1:.8f} | "
+                f"{local_time(state.dib1_time)}"
+            )
 
-        print("========================================")
+            print(
+                f"HIGH 1: "
+                f"{state.high1:.8f} | "
+                f"{local_time(state.high1_time)}"
+            )
+
+            print(
+                f"DIB 2 tracking from: "
+                f"{state.dib2_candidate:.8f}"
+            )
+
+            print(
+                "=========================================="
+            )
 
         return True
+
+    # --------------------------------------------------------
+    # DIB qırılmayıbsa HIGH-ı izləyirik
+    # --------------------------------------------------------
+
+    if (
+        state.bars_seen >= LEFT_HIGH_CANDLES
+    ):
+
+        if (
+            state.high1_candidate is None
+            or candle["high"]
+            > state.high1_candidate
+        ):
+
+            state.high1_candidate = candle["high"]
+
+            state.high1_candidate_time = (
+                candle["close_time"]
+            )
+
+            state.high1_candidate_bar = (
+                state.bars_seen
+            )
+
+            if log_enabled:
+
+                print(
+                    f"📈 {symbol} | "
+                    f"HIGH 1 NEW HIGH: "
+                    f"{candle['high']:.8f}"
+                )
 
     return False
 
 
 # ============================================================
-# SEARCH DIB 2
+# PROCESS DIB 2
 # ============================================================
 
-def search_dib2(state, index, symbol):
-
-    candle = state.candles[index]
-
-    # --------------------------------------------------------
-    # Daha aşağı LOW yaranırsa DIB 2 candidate dəyişir.
-    # --------------------------------------------------------
+def process_dib2(
+    state,
+    candle,
+    symbol,
+    log_enabled=True
+):
 
     if state.dib2_candidate is None:
 
         state.dib2_candidate = candle["low"]
-
-        state.dib2_candidate_index = index
 
         state.dib2_candidate_time = (
             candle["close_time"]
@@ -618,88 +633,108 @@ def search_dib2(state, index, symbol):
         return
 
     # --------------------------------------------------------
-    # Hələ yuxarı dönüş yoxdur
+    # Hələ yüksəliş başlamayıb
     # --------------------------------------------------------
 
     if not state.dib2_rising:
 
-        # Yeni daha aşağı LOW
+        # Daha aşağı LOW gəlibsə
+        # əvvəlki DIB 2 namizədi silinir.
         if candle["low"] < state.dib2_candidate:
 
             state.dib2_candidate = candle["low"]
-
-            state.dib2_candidate_index = index
 
             state.dib2_candidate_time = (
                 candle["close_time"]
             )
 
-            print(
-                f"📉 {symbol} | "
-                f"DIB 2 NEW LOW: "
-                f"{candle['low']:.8f} | "
-                f"{local_time(candle['close_time'])}"
-            )
+            if log_enabled:
+
+                print(
+                    f"📉 {symbol} | "
+                    f"DIB 2 NEW LOW: "
+                    f"{candle['low']:.8f} | "
+                    f"{local_time(candle['close_time'])}"
+                )
 
             return
 
         # ----------------------------------------------------
-        # Qiymət ən aşağı nöqtədən yuxarı dönür
+        # Ən aşağı nöqtədən yuxarı dönüş
         # ----------------------------------------------------
 
         if candle["close"] > state.dib2_candidate:
 
             state.dib2_rising = True
 
-            print(
-                f"📈 {symbol} | "
-                f"DIB 2 RISE STARTED | "
-                f"DIB 2: "
-                f"{state.dib2_candidate:.8f} | "
-                f"{local_time(state.dib2_candidate_time)}"
+            if log_enabled:
+
+                print(
+                    f"📈 {symbol} | "
+                    f"DIB 2 RISE STARTED | "
+                    f"DIB 2: "
+                    f"{state.dib2_candidate:.8f}"
+                )
+
+    else:
+
+        # ----------------------------------------------------
+        # DIB 2-dən sonra yenidən daha aşağı LOW yaranarsa,
+        # köhnə DIB 2 ləğv edilir.
+        # ----------------------------------------------------
+
+        if candle["low"] < state.dib2_candidate:
+
+            state.dib2_candidate = candle["low"]
+
+            state.dib2_candidate_time = (
+                candle["close_time"]
             )
 
+            state.dib2_rising = False
+
+            if log_enabled:
+
+                print(
+                    f"📉 {symbol} | "
+                    f"DIB 2 RESET → NEW LOW: "
+                    f"{candle['low']:.8f}"
+                )
+
 
 # ============================================================
-# CHECK HIGH 1 BREAKOUT
+# CHECK BREAKOUT
 # ============================================================
 
-def check_high1_breakout(
+def check_breakout(
     state,
-    index,
-    symbol
+    candle,
+    symbol,
+    log_enabled=True
 ):
 
-    candle = state.candles[index]
-
     if state.high1 is None:
-
         return None
 
     if state.dib2_candidate is None:
-
         return None
 
-    # --------------------------------------------------------
-    # DIB 2-dən yuxarı dönüş başlamalıdır
-    # --------------------------------------------------------
-
+    # DIB 2-dən yüksəliş başlamalıdır
     if not state.dib2_rising:
-
         return None
 
     close_price = candle["close"]
 
     breakout_percent = (
         (
-            close_price - state.high1
+            close_price
+            - state.high1
         )
         / state.high1
     ) * 100
 
     # --------------------------------------------------------
-    # HIGH 1 qırılmalı
-    # və CLOSE minimum +1% yuxarı olmalıdır
+    # HIGH 1 qırılmalı və CLOSE minimum +1% yuxarı olmalıdır
     # --------------------------------------------------------
 
     if (
@@ -707,27 +742,30 @@ def check_high1_breakout(
         and breakout_percent >= MIN_BREAKOUT_PERCENT
     ):
 
-        print()
-        print("========================================")
-        print(f"🚨 {symbol} | BREAKOUT DETECTED")
-        print("========================================")
+        if log_enabled:
 
-        print(
-            "HIGH 1:",
-            state.high1
-        )
+            print()
+            print(
+                "🚨🚨🚨 BREAKOUT 🚨🚨🚨"
+            )
 
-        print(
-            "Close:",
-            close_price
-        )
+            print(
+                f"{symbol} | "
+                f"HIGH 1: "
+                f"{state.high1:.8f}"
+            )
 
-        print(
-            "Breakout:",
-            f"+{breakout_percent:.2f}%"
-        )
+            print(
+                f"{symbol} | "
+                f"CLOSE: "
+                f"{close_price:.8f}"
+            )
 
-        print("========================================")
+            print(
+                f"{symbol} | "
+                f"BREAKOUT: "
+                f"+{breakout_percent:.2f}%"
+            )
 
         return {
 
@@ -763,119 +801,174 @@ def check_high1_breakout(
 
 
 # ============================================================
-# PROCESS NEW CLOSED CANDLE
+# REPLAY HISTORY
+# ============================================================
+#
+# Məqsəd:
+#
+# Son 100 şam struktur konteksti üçün istifadə olunur.
+#
+# Amma burada TELEGRAM SIQNALI göndərilmir.
+#
+# Beləliklə bot keçmişdə baş vermiş breakout-a görə
+# indi siqnal göndərmir.
+#
 # ============================================================
 
-def process_candle(
+def build_initial_state(
+    symbol,
+    history
+):
+
+    state = State()
+
+    for candle in history:
+
+        state.bars_seen += 1
+
+        state.candles.append(
+            candle
+        )
+
+        if state.phase == "SEARCH_DIB1":
+
+            process_search_dib1(
+                state,
+                candle,
+                symbol,
+                log_enabled=False
+            )
+
+        elif state.phase == "TRACK_HIGH1":
+
+            process_track_high1(
+                state,
+                candle,
+                symbol,
+                log_enabled=False
+            )
+
+        elif state.phase == "SEARCH_DIB2":
+
+            process_dib2(
+                state,
+                candle,
+                symbol,
+                log_enabled=False
+            )
+
+            # Tarixi breakout yoxlanılmır.
+            # Yalnız struktur qurulur.
+
+    if history:
+
+        state.last_candle_time = (
+            history[-1]["close_time"]
+        )
+
+    return state
+
+
+# ============================================================
+# PROCESS ONE NEW CANDLE
+# ============================================================
+
+def process_new_candle(
     symbol,
     candle
 ):
 
     if symbol not in states:
 
-        states[symbol] = State()
+        return None
 
     state = states[symbol]
 
-    # --------------------------------------------------------
     # Eyni şamı iki dəfə işlətmə
-    # --------------------------------------------------------
-
     if (
         state.last_candle_time is not None
         and candle["close_time"]
         <= state.last_candle_time
     ):
 
-        return None, False
+        return None
 
     state.last_candle_time = (
         candle["close_time"]
     )
 
-    state.candles.append(candle)
+    state.bars_seen += 1
 
-    index = len(
-        state.candles
-    ) - 1
-
-    # --------------------------------------------------------
-    # YENİ ŞAM
-    # --------------------------------------------------------
+    state.candles.append(
+        candle
+    )
 
     print(
         f"🕐 NEW 15M | "
         f"{symbol} | "
         f"{local_time(candle['close_time'])} | "
-        f"O={candle['open']:.8f} "
-        f"H={candle['high']:.8f} "
         f"L={candle['low']:.8f} "
+        f"H={candle['high']:.8f} "
         f"C={candle['close']:.8f}"
     )
 
     # ========================================================
-    # DIB 1
+    # SEARCH DIB 1
     # ========================================================
 
-    if state.state == "SEARCH_DIB1":
+    if state.phase == "SEARCH_DIB1":
 
-        search_dib1(
+        process_search_dib1(
             state,
-            index,
-            symbol
+            candle,
+            symbol,
+            log_enabled=True
         )
 
-        return None, True
+        return None
 
     # ========================================================
-    # HIGH 1
+    # TRACK HIGH 1
     # ========================================================
 
-    if state.state == "TRACK_HIGH1":
+    if state.phase == "TRACK_HIGH1":
 
-        # DIB qırılıbsa əvvəlcə DIB/HIGH təsdiqlə
-        if check_dib1_confirmation(
+        process_track_high1(
             state,
-            index,
-            symbol
-        ):
-
-            return None, True
-
-        # DIB qırılmayıbsa HIGH-ı izləməyə davam
-        track_high1(
-            state,
-            index,
-            symbol
+            candle,
+            symbol,
+            log_enabled=True
         )
 
-        return None, True
+        return None
 
     # ========================================================
-    # DIB 2
+    # SEARCH DIB 2
     # ========================================================
 
-    if state.state == "SEARCH_DIB2":
+    if state.phase == "SEARCH_DIB2":
 
-        search_dib2(
+        # Əvvəl DIB 2-ni yenilə
+        process_dib2(
             state,
-            index,
-            symbol
+            candle,
+            symbol,
+            log_enabled=True
         )
 
-        signal = check_high1_breakout(
+        # Sonra breakout yoxla
+        signal = check_breakout(
             state,
-            index,
-            symbol
+            candle,
+            symbol,
+            log_enabled=True
         )
 
         if signal:
 
-            return signal, True
+            return signal
 
-        return None, True
-
-    return None, True
+    return None
 
 
 # ============================================================
@@ -922,34 +1015,61 @@ def make_signal_message(
 
 
 # ============================================================
-# RESET AFTER SIGNAL
+# INITIALIZE SYMBOL
 # ============================================================
 
-def reset_after_signal(state):
+def initialize_symbol(symbol):
 
-    state.dib1_candidate = None
-    state.dib1_candidate_index = None
-    state.dib1_candidate_time = None
+    history = get_history(
+        symbol
+    )
 
-    state.dib1_rising = False
+    if not history:
 
-    state.high1_candidate = None
-    state.high1_candidate_index = None
-    state.high1_candidate_time = None
+        print(
+            f"⚠️ {symbol} | "
+            f"No history"
+        )
 
-    state.dib1 = None
-    state.dib1_time = None
+        return False
 
-    state.high1 = None
-    state.high1_time = None
+    state = build_initial_state(
+        symbol,
+        history
+    )
 
-    state.dib2_candidate = None
-    state.dib2_candidate_index = None
-    state.dib2_candidate_time = None
+    states[symbol] = state
 
-    state.dib2_rising = False
+    print(
+        f"🧠 {symbol} | "
+        f"Loaded {len(history)} candles | "
+        f"State: {state.phase}"
+    )
 
-    state.state = "SEARCH_DIB1"
+    # Əgər tarixdə artıq DIB1/HIGH1 təsdiqlənibsə,
+    # bunu yalnız Railway-də göstəririk.
+    if state.dib1 is not None:
+
+        print(
+            f"   DIB 1: "
+            f"{state.dib1:.8f} | "
+            f"{local_time(state.dib1_time)}"
+        )
+
+        print(
+            f"   HIGH 1: "
+            f"{state.high1:.8f} | "
+            f"{local_time(state.high1_time)}"
+        )
+
+    if state.dib2_candidate is not None:
+
+        print(
+            f"   DIB 2 candidate: "
+            f"{state.dib2_candidate:.8f}"
+        )
+
+    return True
 
 
 # ============================================================
@@ -959,75 +1079,120 @@ def reset_after_signal(state):
 def main():
 
     print()
-    print("==============================================")
-    print("🚀 BINANCE 15M DIB/HIGH SIGNAL BOT")
-    print("==============================================")
-    print()
+    print(
+        "================================================"
+    )
+    print(
+        "🚀 BINANCE 15M DIB/HIGH SIGNAL BOT"
+    )
+    print(
+        "================================================"
+    )
+
     print(
         "Bot start:",
         local_time(BOT_START_TIME_MS)
     )
+
     print(
         "Timeframe:",
         INTERVAL
     )
+
     print(
         "Top coins:",
         TOP_COINS
     )
+
     print(
-        "Cooldown: NONE"
+        "Structure candles:",
+        STRUCTURE_CANDLES
     )
-    print(
-        "Previous candles: NOT LOADED"
-    )
-    print(
-        "Alert only: YES"
-    )
+
     print(
         "High left candles:",
         LEFT_HIGH_CANDLES
     )
+
     print(
         "Breakout minimum:",
         f"{MIN_BREAKOUT_PERCENT}%"
     )
+
     print(
-        "Scan interval:",
-        f"{SCAN_SECONDS}s"
+        "Cooldown: NONE"
     )
+
+    print(
+        "Alert only: YES"
+    )
+
     print()
     print(
-        "⚠️ Only candles CLOSED AFTER BOT START "
-        "will be processed."
+        "100 candles = STRUCTURE CONTEXT"
     )
+
+    print(
+        "Historical breakout = NO ALERT"
+    )
+
+    print(
+        "Only NEW candle can trigger Telegram"
+    )
+
     print()
 
-    # --------------------------------------------------------
-    # İlk TOP 100
-    # --------------------------------------------------------
+    # ========================================================
+    # TOP 100
+    # ========================================================
 
     symbols = get_top_symbols()
 
     print(
-        "📊 Tracking:",
-        len(symbols),
-        "symbols"
+        f"📊 Tracking: "
+        f"{len(symbols)} symbols"
     )
 
+    # ========================================================
+    # INITIALIZE ALL 100
+    # ========================================================
+
+    for symbol in symbols:
+
+        try:
+
+            initialize_symbol(
+                symbol
+            )
+
+        except Exception as e:
+
+            print(
+                f"{symbol} initialization error:",
+                e
+            )
+
+    print()
+    print(
+        "=============================================="
+    )
+    print(
+        "✅ INITIALIZATION COMPLETE"
+    )
+    print(
+        "=============================================="
+    )
     print()
 
     last_heartbeat = time.time()
 
-    total_scans = 0
-
-    total_new_candles = 0
+    scan_number = 0
 
     while True:
 
         try:
 
-            total_scans += 1
+            scan_number += 1
 
             # ------------------------------------------------
             # TOP 100 yenilə
@@ -1039,37 +1204,28 @@ def main():
 
                 symbols = new_symbols
 
-            # ------------------------------------------------
-            # SCAN BAŞLADI
-            # ------------------------------------------------
-
-            now = time.time()
-
-            if (
-                now - last_heartbeat
-                >= HEARTBEAT_SECONDS
-            ):
-
-                print(
-                    f"💓 HEARTBEAT | "
-                    f"Scan #{total_scans} | "
-                    f"Symbols: {len(symbols)} | "
-                    f"New candles: {total_new_candles} | "
-                    f"Time: "
-                    f"{local_time(int(now * 1000))}"
-                )
-
-                last_heartbeat = now
+            new_candles = 0
 
             # ------------------------------------------------
-            # Bütün TOP 100
+            # TOP 100
             # ------------------------------------------------
-
-            new_this_scan = 0
 
             for symbol in symbols:
 
                 try:
+
+                    # ------------------------------------------------
+                    # Yeni symbol TOP100-a daxil olubsa
+                    # 100 candle context qur.
+                    # ------------------------------------------------
+
+                    if symbol not in states:
+
+                        initialize_symbol(
+                            symbol
+                        )
+
+                        continue
 
                     candle = (
                         get_latest_closed_candle(
@@ -1082,9 +1238,7 @@ def main():
                         continue
 
                     # ------------------------------------------------
-                    # ÇOX VACİB:
-                    #
-                    # Bot başlamazdan ƏVVƏL bağlanmış şamı keç.
+                    # Bot başlamazdan əvvəlki şam siqnal yaratmır
                     # ------------------------------------------------
 
                     if (
@@ -1094,18 +1248,29 @@ def main():
 
                         continue
 
-                    signal, is_new = (
-                        process_candle(
-                            symbol,
-                            candle
-                        )
+                    old_time = (
+                        states[symbol]
+                        .last_candle_time
                     )
 
-                    if is_new:
+                    # ------------------------------------------------
+                    # Yalnız yeni 15M şam
+                    # ------------------------------------------------
 
-                        new_this_scan += 1
+                    if (
+                        old_time is not None
+                        and candle["close_time"]
+                        <= old_time
+                    ):
 
-                        total_new_candles += 1
+                        continue
+
+                    new_candles += 1
+
+                    signal = process_new_candle(
+                        symbol,
+                        candle
+                    )
 
                     # ------------------------------------------------
                     # SIGNAL
@@ -1131,7 +1296,7 @@ def main():
                         )
 
                         # Cooldown yoxdur.
-                        # Struktur bağlanır.
+                        # Bu struktur bağlanır.
                         reset_after_signal(
                             states[symbol]
                         )
@@ -1144,22 +1309,26 @@ def main():
                     )
 
             # ------------------------------------------------
-            # SCAN NƏTİCƏSİ
+            # HEARTBEAT
             # ------------------------------------------------
 
-            if new_this_scan > 0:
+            now = time.time()
+
+            if (
+                now - last_heartbeat
+                >= 60
+            ):
 
                 print(
-                    f"🔄 SCAN COMPLETE | "
-                    f"Checked: {len(symbols)} | "
-                    f"New candles: {new_this_scan} | "
+                    f"💓 HEARTBEAT | "
+                    f"Scan #{scan_number} | "
+                    f"Symbols: {len(symbols)} | "
+                    f"New candles: {new_candles} | "
                     f"Time: "
-                    f"{local_time(int(time.time() * 1000))}"
+                    f"{local_time(int(now * 1000))}"
                 )
 
-            # ------------------------------------------------
-            # Növbəti scan
-            # ------------------------------------------------
+                last_heartbeat = now
 
             time.sleep(
                 SCAN_SECONDS
@@ -1167,7 +1336,6 @@ def main():
 
         except Exception as e:
 
-            print()
             print(
                 "❌ MAIN LOOP ERROR:",
                 e
