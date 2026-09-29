@@ -14,27 +14,28 @@ from zoneinfo import ZoneInfo
 BINANCE_URL = "https://api.binance.com"
 
 INTERVAL = "15m"
+
 TOP_COINS = 100
 
-# HIGH 1 üçün solda minimum şam sayı
+# HIGH 1 üçün solda minimum 10 şam
 LEFT_HIGH_CANDLES = 10
 
-# DIB 1 strukturu maksimum 100 şam
+# DIB 1 maksimum 100 şam daxilində təsdiqlənməlidir
 MAX_DIB1_CANDLES = 100
 
-# Breakout HIGH 1-dən minimum +1%
+# HIGH 1-dən minimum breakout
 MIN_BREAKOUT_PERCENT = 1.0
 
-# DIB 2-dən qalxış 10 şamdan çox olarsa rollover
+# DIB2-dən qalxış 10-dan çox şam olarsa rollover
 DIB2_LONG_RISE_CANDLES = 10
 
-# 3 və daha az şamlıq uğursuz qalxışda tam reset
+# 3 və daha az şamlıq uğursuz qalxış
 DIB2_SHORT_RISE_CANDLES = 3
 
-# Binance top 100 yenilənməsi
+# TOP 100 yenilənməsi
 TOP_REFRESH_SECONDS = 300
 
-# Scan intervalı
+# Scan
 SCAN_SECONDS = 10
 
 AZ_TZ = ZoneInfo("Asia/Baku")
@@ -42,106 +43,68 @@ AZ_TZ = ZoneInfo("Asia/Baku")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+session = requests.Session()
+
 
 # ============================================================
-# START TIME
+# STARTUP
 # ============================================================
 
+# Bot işə düşdüyü an
 START_TIME_MS = int(time.time() * 1000)
 
 
 # ============================================================
-# SYMBOL STATES
+# STATE
 # ============================================================
 
-states = {}
-
-
-def new_state():
+def empty_state():
     return {
+        # SEARCH_DIB1
+        # TRACK_DIB1
+        # TRACK_DIB2
         "mode": "SEARCH_DIB1",
 
-        # -----------------------------
+        # -------------------------
         # DIB 1
-        # -----------------------------
+        # -------------------------
         "dib1": None,
         "dib1_time": None,
-        "dib1_start_close_time": None,
-        "dib1_candle_count": 0,
 
-        # -----------------------------
+        # DIB1-dən sonra neçə yeni şam keçib
+        "dib1_candles": 0,
+
+        # -------------------------
         # HIGH 1
-        # -----------------------------
+        # -------------------------
         "high1": None,
         "high1_time": None,
-        "high1_index": None,
 
-        # Number of candles processed
-        # since current DIB1 appeared
-        "candles_after_dib1": 0,
-
-        # -----------------------------
+        # -------------------------
         # DIB 2
-        # -----------------------------
+        # -------------------------
         "dib2": None,
         "dib2_time": None,
 
-        # candles elapsed since DIB2
+        # DIB2-dən sonra ümumi şam sayı
         "dib2_candles": 0,
 
-        # candles during the current rise
+        # DIB2-dən yuxarı qalxış şamları
         "dib2_rise_candles": 0,
 
-        # highest price reached from DIB2
+        # DIB2-dən sonra görülən ən yüksək qiymət
         "dib2_high": None,
         "dib2_high_time": None,
 
-        # -----------------------------
-        # Last processed candle
-        # -----------------------------
+        # Son işlənmiş şam
         "last_close_time": None,
 
-        # Alert statistics
+        # Siqnal sayı
         "signals": 0,
     }
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram ENV variables are missing")
-        return
-
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
-
-    try:
-        r = requests.post(
-            url,
-            json=payload,
-            timeout=10
-        )
-
-        if r.status_code != 200:
-            print(
-                "Telegram error:",
-                r.status_code,
-                r.text
-            )
-
-    except Exception as e:
-        print("Telegram exception:", e)
+states = {}
 
 
 # ============================================================
@@ -149,7 +112,8 @@ def send_telegram(message):
 # ============================================================
 
 def fmt_time(ms):
-    if not ms:
+
+    if ms is None:
         return "-"
 
     return datetime.fromtimestamp(
@@ -159,83 +123,133 @@ def fmt_time(ms):
 
 
 # ============================================================
-# BINANCE
+# TELEGRAM
 # ============================================================
 
-session = requests.Session()
+def send_telegram(message):
 
+    if not TELEGRAM_BOT_TOKEN:
+        print("ERROR: TELEGRAM_BOT_TOKEN yoxdur")
+        return
+
+    if not TELEGRAM_CHAT_ID:
+        print("ERROR: TELEGRAM_CHAT_ID yoxdur")
+        return
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    try:
+
+        response = session.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message
+            },
+            timeout=10
+        )
+
+        if response.status_code != 200:
+
+            print(
+                "Telegram error:",
+                response.status_code,
+                response.text
+            )
+
+    except Exception as e:
+
+        print(
+            "Telegram exception:",
+            e
+        )
+
+
+# ============================================================
+# TOP 100
+# ============================================================
 
 def get_top_100():
 
     try:
-        r = session.get(
+
+        response = session.get(
             f"{BINANCE_URL}/api/v3/ticker/24hr",
             timeout=10
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
-        data = r.json()
+        data = response.json()
 
-        symbols = []
+        coins = []
 
-        for x in data:
+        for item in data:
 
-            symbol = x.get("symbol", "")
+            symbol = item.get("symbol", "")
 
+            # USDT
             if not symbol.endswith("USDT"):
                 continue
 
-            if any(
-                symbol.endswith(x)
-                for x in [
-                    "UPUSDT",
-                    "DOWNUSDT",
-                    "BULLUSDT",
-                    "BEARUSDT"
-                ]
+            # Leveraged tokenləri çıxar
+            if (
+                symbol.endswith("UPUSDT")
+                or symbol.endswith("DOWNUSDT")
+                or symbol.endswith("BULLUSDT")
+                or symbol.endswith("BEARUSDT")
             ):
                 continue
 
             try:
-                volume = float(
-                    x.get("quoteVolume", 0)
+                quote_volume = float(
+                    item.get("quoteVolume", 0)
                 )
-            except:
+            except Exception:
                 continue
 
-            if volume <= 0:
+            if quote_volume <= 0:
                 continue
 
-            symbols.append(
-                (symbol, volume)
+            coins.append(
+                (
+                    symbol,
+                    quote_volume
+                )
             )
 
-        symbols.sort(
+        coins.sort(
             key=lambda x: x[1],
             reverse=True
         )
 
         return [
-            x[0]
-            for x in symbols[:TOP_COINS]
+            symbol
+            for symbol, volume in coins[:TOP_COINS]
         ]
 
     except Exception as e:
 
         print(
-            "Top 100 error:",
+            "TOP 100 error:",
             e
         )
 
         return []
 
 
+# ============================================================
+# GET LAST CLOSED CANDLE
+# ============================================================
+
 def get_latest_closed_candle(symbol):
 
     try:
 
-        r = session.get(
+        response = session.get(
             f"{BINANCE_URL}/api/v3/klines",
             params={
                 "symbol": symbol,
@@ -245,14 +259,13 @@ def get_latest_closed_candle(symbol):
             timeout=10
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
-        data = r.json()
+        data = response.json()
 
         if len(data) < 2:
             return None
 
-        # The previous candle is closed.
         k = data[-2]
 
         return {
@@ -275,53 +288,39 @@ def get_latest_closed_candle(symbol):
 
 
 # ============================================================
-# RESET
+# NEW DIB1
 # ============================================================
 
-def reset_state(symbol):
-
-    states[symbol] = new_state()
-
-
-# ============================================================
-# START NEW DIB1
-# ============================================================
-
-def start_new_dib1(
+def make_new_dib1(
     state,
-    low,
     candle
 ):
 
     state["mode"] = "TRACK_DIB1"
 
-    state["dib1"] = low
+    state["dib1"] = candle["low"]
     state["dib1_time"] = candle["close_time"]
 
-    state["dib1_start_close_time"] = (
-        candle["close_time"]
-    )
-
-    state["dib1_candle_count"] = 0
-    state["candles_after_dib1"] = 0
+    state["dib1_candles"] = 0
 
     state["high1"] = None
     state["high1_time"] = None
-    state["high1_index"] = None
 
     state["dib2"] = None
     state["dib2_time"] = None
+
     state["dib2_candles"] = 0
     state["dib2_rise_candles"] = 0
+
     state["dib2_high"] = None
     state["dib2_high_time"] = None
 
 
 # ============================================================
-# INITIAL DIB1 TRACKING
+# INITIAL DIB1 STRUCTURE
 # ============================================================
 
-def process_search_dib1(
+def process_dib1(
     symbol,
     state,
     candle
@@ -330,63 +329,107 @@ def process_search_dib1(
     low = candle["low"]
     high = candle["high"]
 
-    # --------------------------------------------
-    # No DIB1 yet
-    # --------------------------------------------
+    # ========================================================
+    # DIB1 YOXDUR
+    # ========================================================
 
     if state["dib1"] is None:
 
-        start_new_dib1(
+        make_new_dib1(
             state,
-            low,
             candle
         )
 
         return
 
-    # --------------------------------------------
-    # Current candle is lower than DIB1
-    # --------------------------------------------
+    # ========================================================
+    # DIB1 YAŞI
+    # ========================================================
+
+    state["dib1_candles"] += 1
+
+    age = state["dib1_candles"]
+
+    # ========================================================
+    # 100 ŞAM QAYDASI
+    #
+    # 101-ci şama keçibsə və əvvəlki DIB1 təsdiqlənməyibsə,
+    # köhnə struktur ləğv edilir.
+    # Cari şamdan canlı şəkildə yenidən başlanır.
+    # ========================================================
+
+    if age > MAX_DIB1_CANDLES:
+
+        make_new_dib1(
+            state,
+            candle
+        )
+
+        return
+
+    # ========================================================
+    # DIB1 QIRILMASI
+    # ========================================================
 
     if low < state["dib1"]:
 
-        # Old DIB1 failed before confirmation.
+        # ----------------------------------------------------
+        # Əgər 10 şam hələ tamam olmayıbsa:
         #
-        # The new lower price becomes the NEW DIB1.
-        #
-        # Everything connected to old DIB1 is deleted.
+        # köhnə DIB1 təsdiqlənmir.
+        # Qıran yeni aşağı qiymət yeni DIB1 olur.
+        # ----------------------------------------------------
 
-        start_new_dib1(
+        if age < LEFT_HIGH_CANDLES:
+
+            make_new_dib1(
+                state,
+                candle
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # 10+ şam var.
+        #
+        # HIGH1 də yaranıbsa:
+        # DIB1 + HIGH1 təsdiqlənir.
+        # Qıran candle LOW = DIB2.
+        # ----------------------------------------------------
+
+        if state["high1"] is not None:
+
+            confirm_dib1_high1(
+                state,
+                candle
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # 10+ şam var, amma keçərli HIGH1 yoxdur.
+        #
+        # Köhnə DIB1 artıq keçərli deyil.
+        # Qıran aşağı qiymət yeni DIB1 olur.
+        # ----------------------------------------------------
+
+        make_new_dib1(
             state,
-            low,
             candle
         )
 
         return
 
-    # --------------------------------------------
-    # One more candle after DIB1
-    # --------------------------------------------
-
-    state["candles_after_dib1"] += 1
-    state["dib1_candle_count"] = (
-        state["candles_after_dib1"]
-    )
-
-    # --------------------------------------------
-    # HIGH 1 tracking
+    # ========================================================
+    # HIGH1 İZLƏ
     #
-    # HIGH needs at least 10 candles to the left.
-    # Therefore we only accept a HIGH after
-    # 10 candles have already appeared.
+    # HIGH yalnız ən azı 10 şam solda olduqdan sonra
+    # qəbul edilir.
     #
-    # Once eligible, keep the HIGHEST high.
-    # --------------------------------------------
+    # Ən yüksək HIGH daim yenilənir.
+    # ========================================================
 
-    if (
-        state["candles_after_dib1"]
-        >= LEFT_HIGH_CANDLES
-    ):
+    if age >= LEFT_HIGH_CANDLES:
 
         if (
             state["high1"] is None
@@ -398,52 +441,6 @@ def process_search_dib1(
                 candle["close_time"]
             )
 
-            state["high1_index"] = (
-                state["candles_after_dib1"]
-            )
-
-    # --------------------------------------------
-    # DIB1 must be confirmed within 100 candles.
-    #
-    # If this is the 101st candle and DIB1
-    # was not broken, cancel the old structure.
-    # --------------------------------------------
-
-    if (
-        state["candles_after_dib1"]
-        > MAX_DIB1_CANDLES
-    ):
-
-        # Start completely live from this candle.
-        start_new_dib1(
-            state,
-            low,
-            candle
-        )
-
-        return
-
-    # --------------------------------------------
-    # DIB1 confirmation
-    #
-    # Current candle must break below DIB1.
-    # HIGH1 must already be valid.
-    # --------------------------------------------
-
-    if (
-        low < state["dib1"]
-        and state["high1"] is not None
-    ):
-
-        # This branch normally does not happen because
-        # lower-low handling above catches it.
-        #
-        # Kept here for safety.
-        confirm_dib1_high1(
-            state,
-            candle
-        )
-
 
 # ============================================================
 # CONFIRM DIB1 + HIGH1
@@ -451,139 +448,105 @@ def process_search_dib1(
 
 def confirm_dib1_high1(
     state,
-    candle
+    breaking_candle
 ):
 
     state["mode"] = "TRACK_DIB2"
 
-    # Breaking candle becomes the first
-    # live DIB2 candidate.
-    state["dib2"] = candle["low"]
-    state["dib2_time"] = candle["close_time"]
+    # DIB1 və HIGH1 artıq təsdiqləndi.
+    #
+    # DIB1 dəyişmir.
+    # HIGH1 dəyişmir.
+    #
+    # DIB1-i qıran candle LOW = DIB2.
+
+    state["dib2"] = breaking_candle["low"]
+
+    state["dib2_time"] = (
+        breaking_candle["close_time"]
+    )
 
     state["dib2_candles"] = 0
+
     state["dib2_rise_candles"] = 0
 
-    state["dib2_high"] = candle["high"]
-    state["dib2_high_time"] = (
-        candle["close_time"]
-    )
+    state["dib2_high"] = None
+    state["dib2_high_time"] = None
 
 
 # ============================================================
-# TRACK DIB1 / CONFIRMATION
+# DIB2 -> NEW DIB1 ROLLOVER
 # ============================================================
 
-def process_track_dib1(
-    symbol,
+def rollover_dib2(
     state,
-    candle
-):
-
-    # This mode is retained separately so the
-    # state machine is explicit.
-
-    process_search_dib1(
-        symbol,
-        state,
-        candle
-    )
-
-
-# ============================================================
-# DIB2 BREAK ROLLOVER
-# ============================================================
-
-def rollover_from_dib2(
-    state,
-    candle
+    breaking_candle
 ):
 
     old_dib2 = state["dib2"]
     old_dib2_time = state["dib2_time"]
 
-    old_dib2_high = state["dib2_high"]
-    old_dib2_high_time = (
-        state["dib2_high_time"]
-    )
+    old_high = state["dib2_high"]
+    old_high_time = state["dib2_high_time"]
 
-    # --------------------------------------------------------
+    # ========================================================
     # OLD DIB2 -> NEW DIB1
-    # --------------------------------------------------------
-
-    state["mode"] = "TRACK_DIB1"
+    #
+    # Çünki old DIB2 aşağı qırılıb.
+    # ========================================================
 
     state["dib1"] = old_dib2
     state["dib1_time"] = old_dib2_time
 
-    state["dib1_start_close_time"] = (
-        old_dib2_time
+    # Bu DIB1 artıq təsdiqlənmiş strukturdan gəldiyi üçün
+    # yeni HIGH1 də artıq məlumdur.
+    state["dib1_candles"] = (
+        state["dib2_candles"]
     )
 
-    state["candles_after_dib1"] = 0
-    state["dib1_candle_count"] = 0
+    state["high1"] = old_high
+    state["high1_time"] = old_high_time
 
-    # --------------------------------------------------------
-    # The highest price reached from old DIB2
-    # becomes NEW HIGH1 candidate.
-    #
-    # It is valid only if the high has at least
-    # 10 candles to its left.
-    # --------------------------------------------------------
+    # ========================================================
+    # QIRAN YENİ AŞAĞI QİYMƏ -> YENİ DIB2
+    # ========================================================
 
-    state["high1"] = None
-    state["high1_time"] = None
-    state["high1_index"] = None
-
-    if old_dib2_high is not None:
-
-        if state["dib2_candles"] >= LEFT_HIGH_CANDLES:
-
-            state["high1"] = old_dib2_high
-            state["high1_time"] = old_dib2_high_time
-            state["high1_index"] = (
-                state["dib2_candles"]
-            )
-
-    # --------------------------------------------------------
-    # The candle which broke old DIB2 becomes
-    # the new live DIB2.
-    # --------------------------------------------------------
-
-    state["dib2"] = candle["low"]
-    state["dib2_time"] = candle["close_time"]
+    state["dib2"] = breaking_candle["low"]
+    state["dib2_time"] = (
+        breaking_candle["close_time"]
+    )
 
     state["dib2_candles"] = 0
     state["dib2_rise_candles"] = 0
 
-    state["dib2_high"] = candle["high"]
-    state["dib2_high_time"] = (
-        candle["close_time"]
-    )
+    state["dib2_high"] = None
+    state["dib2_high_time"] = None
+
+    state["mode"] = "TRACK_DIB2"
 
 
 # ============================================================
-# SHORT DIB2 FAILURE RESET
+# DIB2 SHORT FAILURE
 # ============================================================
 
-def reset_after_short_dib2_failure(
+def short_dib2_reset(
     state,
     candle
 ):
 
-    # Old DIB1, HIGH1 and DIB2 are all forgotten.
+    # Köhnə DIB1 / HIGH1 / DIB2 hamısı silinir.
     #
-    # Breaking candle's low becomes a fresh DIB1.
+    # DIB2-ni qıran aşağı qiymət
+    # tamamilə yeni DIB1 olur.
 
-    start_new_dib1(
+    make_new_dib1(
         state,
-        candle["low"],
         candle
     )
 
 
 # ============================================================
-# DIB2 PROCESSING
+# DIB2 PROCESS
 # ============================================================
 
 def process_dib2(
@@ -597,30 +560,36 @@ def process_dib2(
 
     if dib2 is None or high1 is None:
 
-        # Safety fallback
-        reset_after_short_dib2_failure(
+        short_dib2_reset(
             state,
             candle
         )
 
-        return False
+        return
 
-    # --------------------------------------------------------
-    # FIRST: BREAKOUT CHECK
+    # ========================================================
+    # 1. BREAKOUT
     #
-    # Breakout gets priority over DIB2 failure.
-    # --------------------------------------------------------
+    # HIGH1-dən minimum +1%
+    #
+    # YALNIZ CLOSE ilə.
+    # Wick kifayət deyil.
+    # ========================================================
 
-    breakout_price = high1 * (
-        1.0 + MIN_BREAKOUT_PERCENT / 100.0
+    breakout_level = (
+        high1
+        * (1 + MIN_BREAKOUT_PERCENT / 100)
     )
 
-    if candle["close"] >= breakout_price:
+    if candle["close"] >= breakout_level:
 
         breakout_percent = (
-            (candle["close"] - high1)
+            (
+                candle["close"]
+                - high1
+            )
             / high1
-            * 100.0
+            * 100
         )
 
         message = (
@@ -633,11 +602,11 @@ def process_dib2(
             f"Time: {fmt_time(state['dib1_time'])}\n\n"
 
             "📈 HIGH 1\n"
-            f"Price: {high1}\n"
+            f"Price: {state['high1']}\n"
             f"Time: {fmt_time(state['high1_time'])}\n\n"
 
             "📉 DIB 2\n"
-            f"Price: {dib2}\n"
+            f"Price: {state['dib2']}\n"
             f"Time: {fmt_time(state['dib2_time'])}\n\n"
 
             "🔥 BREAKOUT\n"
@@ -654,110 +623,104 @@ def process_dib2(
 
         state["signals"] += 1
 
-        # After a signal start a completely new live structure.
-        start_new_dib1(
+        # Siqnaldan sonra yeni canlı struktur.
+        make_new_dib1(
             state,
-            candle["low"],
             candle
         )
 
-        return True
+        return
 
-    # --------------------------------------------------------
-    # CURRENT DIB2 IS STILL HOLDING
-    # --------------------------------------------------------
+    # ========================================================
+    # 2. DIB2 AŞAĞI QIRILIB
+    # ========================================================
 
-    if candle["low"] >= dib2:
+    if candle["low"] < dib2:
 
-        state["dib2_candles"] += 1
+        rise_candles = (
+            state["dib2_rise_candles"]
+        )
 
-        # If price is moving above DIB2,
-        # count the candle as part of the rise.
-        if candle["close"] > dib2:
+        # ----------------------------------------------------
+        # 10-DAN ÇOX ŞAM
+        #
+        # DIB2 -> yeni DIB1
+        # ən yüksək qiymət -> yeni HIGH1
+        # qıran qiymət -> yeni DIB2
+        # ----------------------------------------------------
 
-            state["dib2_rise_candles"] += 1
+        if rise_candles > DIB2_LONG_RISE_CANDLES:
 
-        # Track the highest price from DIB2.
-        if (
-            state["dib2_high"] is None
-            or candle["high"] > state["dib2_high"]
-        ):
-
-            state["dib2_high"] = candle["high"]
-            state["dib2_high_time"] = (
-                candle["close_time"]
+            rollover_dib2(
+                state,
+                candle
             )
 
+            return
+
         # ----------------------------------------------------
-        # If HIGH1 is not broken, the DIB2 structure remains.
+        # 3 VƏ YA DAHA AZ ŞAM
+        #
+        # Tam reset.
         # ----------------------------------------------------
 
-        return False
+        if rise_candles <= DIB2_SHORT_RISE_CANDLES:
 
-    # --------------------------------------------------------
-    # DIB2 HAS BEEN BROKEN
-    # --------------------------------------------------------
+            short_dib2_reset(
+                state,
+                candle
+            )
 
-    rise_candles = state[
-        "dib2_rise_candles"
-    ]
+            return
 
-    # --------------------------------------------------------
-    # MORE THAN 10 CANDLES
-    #
-    # Apply rule 10:
-    #
-    # old DIB2 -> new DIB1
-    # highest from old DIB2 -> new HIGH1
-    # breaking price -> new DIB2
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # 4-10 şam
+        #
+        # HIGH1 qırılmayıbsa,
+        # köhnə struktur saxlanılmır.
+        #
+        # Yeni aşağı qiymət yeni DIB1.
+        # ----------------------------------------------------
 
-    if rise_candles > DIB2_LONG_RISE_CANDLES:
-
-        rollover_from_dib2(
+        short_dib2_reset(
             state,
             candle
         )
 
-        return False
+        return
 
-    # --------------------------------------------------------
-    # 3 OR FEWER CANDLES
-    #
-    # Complete reset.
-    # Breaking candle becomes new DIB1.
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. DIB2 QIRILMAYIB
+    # ========================================================
 
-    if rise_candles <= DIB2_SHORT_RISE_CANDLES:
+    state["dib2_candles"] += 1
 
-        reset_after_short_dib2_failure(
-            state,
-            candle
+    # ========================================================
+    # DIB2-DƏN QALXAN HƏRƏKƏT
+    # ========================================================
+
+    if candle["close"] > dib2:
+
+        state["dib2_rise_candles"] += 1
+
+    # ========================================================
+    # DIB2-DƏN SONRA ƏN YÜKSƏK QİYMƏ
+    # ========================================================
+
+    if (
+        state["dib2_high"] is None
+        or candle["high"] > state["dib2_high"]
+    ):
+
+        state["dib2_high"] = candle["high"]
+
+        state["dib2_high_time"] = (
+            candle["close_time"]
         )
-
-        return False
-
-    # --------------------------------------------------------
-    # 4–10 candles
-    #
-    # Conservative handling:
-    # no successful +1% breakout means the old
-    # structure is discarded and the breaking low
-    # becomes a fresh DIB1.
-    #
-    # This avoids falsely promoting a weak structure.
-    # --------------------------------------------------------
-
-    reset_after_short_dib2_failure(
-        state,
-        candle
-    )
-
-    return False
 
 
 # ============================================================
-# MAIN CANDLE PROCESSOR
+# PROCESS CANDLE
 # ============================================================
 
 def process_candle(
@@ -766,38 +729,50 @@ def process_candle(
 ):
 
     if symbol not in states:
-        states[symbol] = new_state()
+
+        states[symbol] = empty_state()
 
     state = states[symbol]
 
-    close_time = candle["close_time"]
+    # ========================================================
+    # STARTUP-DAN ƏVVƏL BAŞLAYAN ŞAMLAR İSTİFADƏ EDİLMİR
+    #
+    # Məsələn bot 22:13-də başlayıbsa:
+    #
+    # 22:00 -> 22:15 şamı istifadə edilmir.
+    #
+    # İlk istifadə edilən tam yeni şam:
+    #
+    # 22:15 -> 22:30
+    # ========================================================
 
-    # --------------------------------------------------------
-    # NEVER USE A CANDLE THAT CLOSED BEFORE BOT STARTUP
-    # --------------------------------------------------------
+    if candle["open_time"] < START_TIME_MS:
 
-    if close_time <= START_TIME_MS:
         return False
 
-    # --------------------------------------------------------
-    # Duplicate protection
-    # --------------------------------------------------------
+    # ========================================================
+    # DUPLICATE
+    # ========================================================
 
     if (
         state["last_close_time"] is not None
-        and close_time <= state["last_close_time"]
+        and candle["close_time"]
+        <= state["last_close_time"]
     ):
+
         return False
 
-    state["last_close_time"] = close_time
+    state["last_close_time"] = (
+        candle["close_time"]
+    )
 
-    # --------------------------------------------------------
+    # ========================================================
     # STATE MACHINE
-    # --------------------------------------------------------
+    # ========================================================
 
     if state["mode"] == "SEARCH_DIB1":
 
-        process_search_dib1(
+        process_dib1(
             symbol,
             state,
             candle
@@ -805,7 +780,7 @@ def process_candle(
 
     elif state["mode"] == "TRACK_DIB1":
 
-        process_track_dib1(
+        process_dib1(
             symbol,
             state,
             candle
@@ -823,24 +798,19 @@ def process_candle(
 
 
 # ============================================================
-# MAIN LOOP
+# MAIN
 # ============================================================
 
 def main():
 
-    print("=" * 60)
+    print("=" * 65)
     print("BINANCE 15M DIB/HIGH BREAKOUT BOT")
     print("ALERT ONLY / NO AUTOMATIC ORDER")
-    print("=" * 60)
+    print("=" * 65)
 
     print(
-        "START TIME:",
+        "START:",
         fmt_time(START_TIME_MS)
-    )
-
-    print(
-        "TOP COINS:",
-        TOP_COINS
     )
 
     print(
@@ -849,13 +819,18 @@ def main():
     )
 
     print(
-        "DIB1 MAX CANDLES:",
-        MAX_DIB1_CANDLES
+        "TOP:",
+        TOP_COINS
     )
 
     print(
-        "HIGH LEFT CANDLES:",
+        "HIGH LEFT:",
         LEFT_HIGH_CANDLES
+    )
+
+    print(
+        "DIB1 MAX:",
+        MAX_DIB1_CANDLES
     )
 
     print(
@@ -864,6 +839,7 @@ def main():
     )
 
     top_symbols = []
+
     last_top_refresh = 0
 
     scan_number = 0
@@ -874,9 +850,9 @@ def main():
 
             now = time.time()
 
-            # --------------------------------------------
-            # Refresh TOP 100
-            # --------------------------------------------
+            # =================================================
+            # TOP 100
+            # =================================================
 
             if (
                 not top_symbols
@@ -889,6 +865,7 @@ def main():
                 if new_symbols:
 
                     top_symbols = new_symbols
+
                     last_top_refresh = now
 
                     print(
@@ -896,9 +873,9 @@ def main():
                         f"Symbols: {len(top_symbols)}"
                     )
 
-            # --------------------------------------------
-            # Scan
-            # --------------------------------------------
+            # =================================================
+            # SCAN
+            # =================================================
 
             scan_number += 1
 
@@ -913,12 +890,11 @@ def main():
                 if candle is None:
                     continue
 
-                processed = process_candle(
+                if process_candle(
                     symbol,
                     candle
-                )
+                ):
 
-                if processed:
                     new_candles += 1
 
             print(
@@ -933,7 +909,7 @@ def main():
 
         except KeyboardInterrupt:
 
-            print("Bot stopped.")
+            print("BOT STOPPED")
             break
 
         except Exception as e:
