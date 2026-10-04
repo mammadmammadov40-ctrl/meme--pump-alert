@@ -7,6 +7,7 @@ from threading import Lock
 
 # ============================================================
 # BINANCE DIB1 + HIGH1 SCANNER
+# ROLLING 100 CANDLE SYSTEM
 # TELEGRAM ALERT ONLY — NO AUTOMATIC ORDER
 # ============================================================
 
@@ -21,20 +22,21 @@ TOP_COINS = 100
 TIMEFRAMES = [
     "5m",
     "15m",
+    "30m",
     "1h",
 ]
 
 POLL_SECONDS = 10
 TOP_REFRESH_SECONDS = 60
 
-# DIB1-dən sonra struktur maksimum 100 şam izlənir
-MAX_STRUCTURE_CANDLES = 100
-
-# HIGH1 üçün minimum məsafə
-MIN_HIGH_CANDLES = 10
-
-# Hərəkətli period
+# Rolling period — 100 şam
 ROLLING_CANDLES = 100
+
+# DIB1-dən HIGH1-ə minimum şam sayı
+MIN_CANDLES_TO_HIGH1 = 10
+
+# Neçə bağlı şam çəkilsin (rolling 100 üçün kifayət qədər)
+FETCH_LIMIT = 200
 
 REQUEST_TIMEOUT = 10
 
@@ -50,8 +52,13 @@ EXCLUDED_BASES = {
 session = requests.Session()
 state_lock = Lock()
 
+# (symbol, timeframe) -> state dict
 states = {}
+
+# (symbol, timeframe) -> son işlənmiş close_time
 last_processed = {}
+
+# (symbol, timeframe) -> initialized flag
 initialized = {}
 
 
@@ -173,7 +180,7 @@ def get_top_symbols():
 # CLOSED CANDLES
 # ============================================================
 
-def get_closed_candles(symbol, interval, limit=101):
+def get_closed_candles(symbol, interval, limit=FETCH_LIMIT):
 
     try:
 
@@ -197,11 +204,6 @@ def get_closed_candles(symbol, interval, limit=101):
 
         for k in data:
 
-            open_time = int(k[0])
-            open_price = float(k[1])
-            high = float(k[2])
-            low = float(k[3])
-            close = float(k[4])
             close_time = int(k[6])
 
             # Yalnız bağlanmış şamlar
@@ -209,13 +211,15 @@ def get_closed_candles(symbol, interval, limit=101):
                 continue
 
             candles.append({
-                "open_time": open_time,
-                "open": open_price,
-                "high": high,
-                "low": low,
-                "close": close,
+                "open_time": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
                 "close_time": close_time,
             })
+
+        candles.sort(key=lambda x: x["close_time"])
 
         return candles
 
@@ -230,73 +234,26 @@ def get_closed_candles(symbol, interval, limit=101):
 
 
 # ============================================================
-# CREATE DIB1
+# CREATE NEW DIB1
 # ============================================================
 
-def create_new_dib1(symbol, timeframe, candle):
-
-    state = {
-
-        "dib1": candle["low"],
-
-        "dib1_time": candle["close_time"],
-
-        "candles_after_dib1": 0,
-
-        "high1": None,
-
-        "high1_time": None,
-
-        "high1_candle_number": None,
-
-        "rise_10_confirmed": False,
-
-        "structure_candles": 1,
-
-        "dib1_confirmed": False,
-    }
-
-    states[(symbol, timeframe)] = state
-
-    print(
-        f"[{format_time(candle['close_time'])}] "
-        f"{symbol} {timeframe} | "
-        f"NEW DIB1 = {candle['low']}"
-    )
-
-
-# ============================================================
-# REPLACE DIB1
-# ============================================================
-
-def replace_dib1(
-    symbol,
-    timeframe,
-    candle,
-    reason
-):
+def create_dib1(symbol, timeframe, candle, reason=""):
 
     key = (symbol, timeframe)
 
     states[key] = {
 
+        # DIB1
         "dib1": candle["low"],
-
         "dib1_time": candle["close_time"],
 
+        # DIB1-dən sonra neçə şam keçib
         "candles_after_dib1": 0,
 
+        # HIGH1
         "high1": None,
-
         "high1_time": None,
-
         "high1_candle_number": None,
-
-        "rise_10_confirmed": False,
-
-        "structure_candles": 1,
-
-        "dib1_confirmed": False,
     }
 
     print(
@@ -308,27 +265,19 @@ def replace_dib1(
 
 
 # ============================================================
-# CONFIRM DIB1
+# CONFIRM DIB1  → TELEGRAM ALERT
 # ============================================================
 
-def confirm_dib1(
-    symbol,
-    timeframe,
-    state,
-    breaking_candle
-):
-
-    state["dib1_confirmed"] = True
+def confirm_dib1(symbol, timeframe, state, breaking_candle):
 
     dib1 = state["dib1"]
-
     high1 = state["high1"]
+    high1_number = state["high1_candle_number"]
 
-    high_number = state["high1_candle_number"]
-
+    # HIGH1 → DIB1 break arasındakı şam sayı
     break_candles = (
         state["candles_after_dib1"]
-        - high_number
+        - high1_number
     )
 
     message = (
@@ -336,30 +285,19 @@ def confirm_dib1(
         f"🔔 DIB1 CONFIRMED\n\n"
 
         f"Coin: {symbol}\n"
-
         f"TF: {timeframe}\n\n"
 
         f"DIB1: {dib1}\n"
-
-        f"DIB1 time: "
-        f"{format_time(state['dib1_time'])}\n\n"
+        f"DIB1 time: {format_time(state['dib1_time'])}\n\n"
 
         f"HIGH1: {high1}\n"
+        f"HIGH1 time: {format_time(state['high1_time'])}\n\n"
 
-        f"HIGH1 time: "
-        f"{format_time(state['high1_time'])}\n\n"
+        f"DIB1 → HIGH1: {high1_number} candles\n"
+        f"HIGH1 → DIB1 break: {break_candles} candles\n\n"
 
-        f"DIB1 → HIGH1: "
-        f"{high_number} candles\n"
-
-        f"HIGH1 → DIB1 break: "
-        f"{break_candles} candles\n\n"
-
-        f"DIB1 break LOW: "
-        f"{breaking_candle['low']}\n"
-
-        f"Break time: "
-        f"{format_time(breaking_candle['close_time'])}\n"
+        f"DIB1 break LOW: {breaking_candle['low']}\n"
+        f"Break time: {format_time(breaking_candle['close_time'])}\n"
     )
 
     print("\n" + message + "\n")
@@ -383,181 +321,121 @@ def process_candle(
     with state_lock:
 
         # ----------------------------------------------------
-        # Əgər əvvəl heç bir DIB1 yoxdursa
+        # DIB1 MÖVCUDDURSA → idarə et
         # ----------------------------------------------------
 
-        if key not in states:
+        if key in states:
 
-            # İlk DIB1-i avtomatik yaratmırıq.
-            # 100 şamlıq periodun yaranmasını gözləyirik.
+            state = states[key]
 
-            return
+            # DIB1-dən sonra keçən şam sayı
+            state["candles_after_dib1"] += 1
+            candle_number = state["candles_after_dib1"]
 
-        state = states[key]
+            # ------------------------------------------------
+            # 100 ŞAM LİMİTİ → LƏĞV
+            # ------------------------------------------------
+            # DIB1 izlənilir, təsdiqlənməyib və 100 şamlıq
+            # pəncərədən çıxır → silinir, yenidən son şamdan
+            # rolling müqayisəsi başlayır (aşağı fall through)
 
-        # ----------------------------------------------------
-        # Artıq təsdiqlənibsə
-        # ----------------------------------------------------
-
-        if state["dib1_confirmed"]:
-            return
-
-        # ----------------------------------------------------
-        # STRUCTURE CANDLE COUNT
-        # ----------------------------------------------------
-
-        state["structure_candles"] += 1
-
-        if (
-            state["structure_candles"]
-            > MAX_STRUCTURE_CANDLES
-        ):
-
-            replace_dib1(
-                symbol,
-                timeframe,
-                candle,
-                "100 candle structure limit exceeded"
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # 1-CI ŞAM vs 100-CÜ ŞAM
-        # ----------------------------------------------------
-        #
-        # Yeni bağlanan candle = 1-ci şam
-        #
-        # rolling_100th_candle =
-        # həmin 100 şamlıq periodun 100-cü şamı
-        #
-        # CLOSE müqayisəsi:
-        #
-        # 1-ci CLOSE < 100-cü CLOSE
-        #
-        # olarsa:
-        #
-        # 1-ci LOW = DIB1
-        # ----------------------------------------------------
-
-        if rolling_100th_candle is not None:
-
-            current_close = candle["close"]
-
-            candle_100_close = (
-                rolling_100th_candle["close"]
-            )
-
-            if current_close < candle_100_close:
-
-                replace_dib1(
-                    symbol,
-                    timeframe,
-                    candle,
-                    (
-                        "1-ci ŞAM CLOSE < "
-                        "100-cü ŞAM CLOSE | "
-                        f"1-ci CLOSE={current_close} | "
-                        f"100-cü CLOSE={candle_100_close}"
-                    )
-                )
-
-                return
-
-        # ----------------------------------------------------
-        # DIB1 BREAK
-        # ----------------------------------------------------
-
-        if candle["low"] < state["dib1"]:
-
-            if (
-                state["rise_10_confirmed"]
-                and state["high1"] is not None
-            ):
-
-                confirm_dib1(
-                    symbol,
-                    timeframe,
-                    state,
-                    candle
-                )
-
-                return
-
-            else:
-
-                replace_dib1(
-                    symbol,
-                    timeframe,
-                    candle,
-                    "DIB1 broken before valid HIGH1"
-                )
-
-                return
-
-        # ----------------------------------------------------
-        # DIB1 HƏLƏ QORUNUR
-        # ----------------------------------------------------
-
-        state["candles_after_dib1"] += 1
-
-        candle_number = (
-            state["candles_after_dib1"]
-        )
-
-        # ----------------------------------------------------
-        # HIGH1
-        # ----------------------------------------------------
-
-        if (
-            state["high1"] is None
-            or candle["high"] > state["high1"]
-        ):
-
-            state["high1"] = candle["high"]
-
-            state["high1_time"] = (
-                candle["close_time"]
-            )
-
-            state["high1_candle_number"] = (
-                candle_number
-            )
-
-            print(
-                f"[{format_time(candle['close_time'])}] "
-                f"{symbol} {timeframe} | "
-                f"HIGH1 = {candle['high']} | "
-                f"DIB1 → HIGH1 = "
-                f"{candle_number} candles"
-            )
-
-        # ----------------------------------------------------
-        # 10+ CANDLE HIGH1 CONFIRMATION
-        # ----------------------------------------------------
-
-        if (
-            state["high1"] is not None
-            and
-            state["high1_candle_number"] is not None
-            and
-            state["high1_candle_number"]
-            >= MIN_HIGH_CANDLES
-            and
-            state["high1"] > state["dib1"]
-        ):
-
-            if not state["rise_10_confirmed"]:
-
-                state["rise_10_confirmed"] = True
+            if candle_number >= ROLLING_CANDLES:
 
                 print(
                     f"[{format_time(candle['close_time'])}] "
                     f"{symbol} {timeframe} | "
-                    f"10+ HIGH1 CONFIRMED | "
-                    f"HIGH1 candle = "
-                    f"{state['high1_candle_number']}"
+                    f"DIB1 LƏĞV OLUNDU "
+                    f"(100 şamlıq pəncərədən çıxdı) | "
+                    f"old DIB1={state['dib1']}"
                 )
+
+                del states[key]
+
+                # Aşağı düşür → rolling check ilə yeni DIB1 axtar
+
+            else:
+
+                # --------------------------------------------
+                # DIB1 BREAK YOXLAMASI
+                # --------------------------------------------
+
+                if candle["low"] < state["dib1"]:
+
+                    # 10+ şam keçib və HIGH1 mövcuddur → CONFIRM
+                    if (
+                        state["high1"] is not None
+                        and state["high1_candle_number"] is not None
+                        and state["high1_candle_number"] >= MIN_CANDLES_TO_HIGH1
+                    ):
+
+                        confirm_dib1(
+                            symbol,
+                            timeframe,
+                            state,
+                            candle
+                        )
+
+                        del states[key]
+                        return
+
+                    else:
+
+                        # 10+ keçməyib və ya HIGH1 yoxdur → yeni DIB1
+                        create_dib1(
+                            symbol,
+                            timeframe,
+                            candle,
+                            (
+                                "DIB1 broken before 10+ candles / "
+                                "no valid HIGH1 | "
+                                f"old DIB1={state['dib1']}"
+                            )
+                        )
+
+                        return
+
+                # --------------------------------------------
+                # DIB1 HƏLƏ QORUNUR → HIGH1 İZLƏ
+                # --------------------------------------------
+
+                if (
+                    state["high1"] is None
+                    or candle["high"] > state["high1"]
+                ):
+
+                    state["high1"] = candle["high"]
+                    state["high1_time"] = candle["close_time"]
+                    state["high1_candle_number"] = candle_number
+
+                    print(
+                        f"[{format_time(candle['close_time'])}] "
+                        f"{symbol} {timeframe} | "
+                        f"HIGH1 = {candle['high']} | "
+                        f"DIB1 → HIGH1 = {candle_number} candles"
+                    )
+
+                return
+
+        # ----------------------------------------------------
+        # DIB1 YOXDUR → ROLLING MÜQAYİSƏ İLƏ YARAT
+        # ----------------------------------------------------
+        # Şərt: cari şamın LOW < 100-cü şamın LOW
+
+        if rolling_100th_candle is None:
+            return
+
+        if candle["low"] < rolling_100th_candle["low"]:
+
+            create_dib1(
+                symbol,
+                timeframe,
+                candle,
+                (
+                    "Rolling 100: "
+                    f"1-ci LOW={candle['low']} < "
+                    f"100-cü LOW={rolling_100th_candle['low']}"
+                )
+            )
 
 
 # ============================================================
@@ -568,24 +446,17 @@ def scan_symbol(symbol, timeframe):
 
     key = (symbol, timeframe)
 
-    # 100 şamlıq period üçün ən azı 100 bağlı şam alırıq
     candles = get_closed_candles(
         symbol,
         timeframe,
-        limit=101
+        limit=FETCH_LIMIT
     )
 
     if not candles:
         return
 
-    candles.sort(
-        key=lambda x: x["close_time"]
-    )
-
     # --------------------------------------------------------
-    # İlk dəfə yüklənəndə:
-    # Sadəcə məlumatı yadda saxlayırıq.
-    # DIB1 avtomatik yaranmır.
+    # İlk dəfə → yalnız son bağlanmış şamı qeyd et
     # --------------------------------------------------------
 
     if key not in initialized:
@@ -593,38 +464,27 @@ def scan_symbol(symbol, timeframe):
         if len(candles) < ROLLING_CANDLES:
             return
 
-        last_processed[key] = (
-            candles[-1]["close_time"]
-        )
-
+        last_processed[key] = candles[-1]["close_time"]
         initialized[key] = True
 
         print(
             f"{symbol} {timeframe} | "
-            f"100 şamlıq hərəkətli period hazırdır."
+            f"Rolling {ROLLING_CANDLES} period hazırdır."
         )
 
         return
 
-    previous_close_time = (
-        last_processed.get(key, 0)
-    )
+    previous_close_time = last_processed.get(key, 0)
 
     new_candles = [
-
         c for c in candles
-
-        if c["close_time"]
-        > previous_close_time
-
+        if c["close_time"] > previous_close_time
     ]
 
     if not new_candles:
         return
 
-    new_candles.sort(
-        key=lambda x: x["close_time"]
-    )
+    new_candles.sort(key=lambda x: x["close_time"])
 
     # --------------------------------------------------------
     # HƏR YENİ BAĞLANAN ŞAM
@@ -632,45 +492,25 @@ def scan_symbol(symbol, timeframe):
 
     for candle in new_candles:
 
-        # Yeni candle = 1-ci şam
-        #
-        # 100 şamlıq period:
-        #
-        # [1-ci, 2-ci, 3-cü, ... 100-cü]
-        #
-        # Buna görə candles siyahısında
-        # cari candle-dan 99 indeks geridə
-        # 100-cü şamdır.
-        #
-        # candle_index - 99
-
+        # Rolling 100-cü şamı tap
+        # cari şam = 1-ci, 100-cü = 99 indeks geri
         candle_index = candles.index(candle)
 
         rolling_100th_candle = None
 
-        if candle_index >= 99:
-
+        if candle_index >= (ROLLING_CANDLES - 1):
             rolling_100th_candle = (
-                candles[candle_index - 99]
+                candles[candle_index - (ROLLING_CANDLES - 1)]
             )
 
-        # Əgər 100 şamlıq period hazırdırsa
-        if rolling_100th_candle is not None:
-
-            process_candle(
-                symbol,
-                timeframe,
-                candle,
-                rolling_100th_candle
-            )
-
-        # ----------------------------------------------------
-        # Son işlənmiş şam
-        # ----------------------------------------------------
-
-        last_processed[key] = (
-            candle["close_time"]
+        process_candle(
+            symbol,
+            timeframe,
+            candle,
+            rolling_100th_candle
         )
+
+        last_processed[key] = candle["close_time"]
 
 
 # ============================================================
@@ -680,23 +520,12 @@ def scan_symbol(symbol, timeframe):
 def main():
 
     print("=" * 70)
-
-    print(
-        "BINANCE DIB1 + HIGH1 SCANNER"
-    )
-
-    print(
-        "ROLLING 100 CANDLE SYSTEM"
-    )
-
-    print(
-        "TELEGRAM ALERT ONLY"
-    )
-
+    print("BINANCE DIB1 + HIGH1 SCANNER")
+    print("ROLLING 100 CANDLE SYSTEM")
+    print("TELEGRAM ALERT ONLY")
     print("=" * 70)
 
     symbols = []
-
     last_top_refresh = 0
 
     while True:
@@ -711,25 +540,17 @@ def main():
 
             if (
                 not symbols
-                or
-                current_time
-                - last_top_refresh
-                >= TOP_REFRESH_SECONDS
+                or current_time - last_top_refresh >= TOP_REFRESH_SECONDS
             ):
 
                 new_symbols = get_top_symbols()
 
                 if new_symbols:
-
                     symbols = new_symbols
-
-                    last_top_refresh = (
-                        current_time
-                    )
+                    last_top_refresh = current_time
 
                     print(
-                        f"\nTop {len(symbols)} "
-                        f"USDT coins loaded."
+                        f"\nTop {len(symbols)} USDT coins loaded."
                     )
 
             # ------------------------------------------------
@@ -741,43 +562,27 @@ def main():
                 for timeframe in TIMEFRAMES:
 
                     try:
-
-                        scan_symbol(
-                            symbol,
-                            timeframe
-                        )
+                        scan_symbol(symbol, timeframe)
 
                     except Exception as e:
-
                         print(
-                            f"{symbol} "
-                            f"{timeframe} "
-                            f"scan error:",
+                            f"{symbol} {timeframe} scan error:",
                             e
                         )
 
             print(
                 f"[{now_az().strftime('%Y-%m-%d %H:%M:%S')}] "
-                f"Scan completed. "
-                f"Next scan in "
-                f"{POLL_SECONDS}s."
+                f"Scan completed. Next scan in {POLL_SECONDS}s."
             )
 
             time.sleep(POLL_SECONDS)
 
         except KeyboardInterrupt:
-
             print("Bot stopped.")
-
             break
 
         except Exception as e:
-
-            print(
-                "MAIN ERROR:",
-                e
-            )
-
+            print("MAIN ERROR:", e)
             time.sleep(5)
 
 
