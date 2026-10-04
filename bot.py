@@ -182,7 +182,7 @@ def get_top_symbols():
 # GET CLOSED CANDLES
 # ============================================================
 
-def get_closed_candles(symbol, interval, limit=5):
+def get_closed_candles(symbol, interval, limit=101):
 
     try:
 
@@ -371,7 +371,12 @@ def confirm_dib1(
 # PROCESS ONE CLOSED CANDLE
 # ============================================================
 
-def process_candle(symbol, timeframe, candle):
+def process_candle(
+    symbol,
+    timeframe,
+    candle,
+    previous_100_candle=None
+):
 
     key = (symbol, timeframe)
 
@@ -418,6 +423,39 @@ def process_candle(symbol, timeframe, candle):
             )
 
             return
+
+        # ----------------------------------------------------
+        # YENİ DIB1 ŞƏRTİ
+        # ----------------------------------------------------
+        #
+        # Yalnız CLOSE müqayisə olunur.
+        #
+        # Yeni bağlanmış şamın CLOSE-u
+        # ondan 100 şam əvvəlki CLOSE-dan aşağıdırsa,
+        # bu şam yeni DIB1 olur.
+        #
+        # 100 şamlıq müqayisə hər yeni şamda
+        # bir şam irəli sürüşür.
+        #
+        # ----------------------------------------------------
+
+        if previous_100_candle is not None:
+
+            if candle["close"] < previous_100_candle["close"]:
+
+                replace_dib1(
+                    symbol,
+                    timeframe,
+                    candle,
+                    (
+                        f"NEW DIB1 CLOSE CONDITION | "
+                        f"NEW CLOSE={candle['close']} < "
+                        f"100TH CANDLE CLOSE="
+                        f"{previous_100_candle['close']}"
+                    )
+                )
+
+                return
 
         # ----------------------------------------------------
         # 1. ƏVVƏL DIB1 BREAK YOXLAYIRIQ
@@ -541,7 +579,7 @@ def scan_symbol(symbol, timeframe):
     candles = get_closed_candles(
         symbol,
         timeframe,
-        limit=5
+        limit=101
     )
 
     if not candles:
@@ -600,10 +638,25 @@ def scan_symbol(symbol, timeframe):
 
     for candle in new_candles:
 
+        # ----------------------------------------------------
+        # Yeni bağlanmış şamın 100 şam əvvəlindəki şamı tapırıq
+        # ----------------------------------------------------
+
+        candle_index = candles.index(candle)
+
+        previous_100_candle = None
+
+        if candle_index >= 100:
+
+            previous_100_candle = candles[
+                candle_index - 100
+            ]
+
         process_candle(
             symbol,
             timeframe,
-            candle
+            candle,
+            previous_100_candle
         )
 
         last_processed[key] = candle["close_time"]
