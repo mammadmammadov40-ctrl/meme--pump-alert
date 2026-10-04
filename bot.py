@@ -35,8 +35,8 @@ ROLLING_CANDLES = 100
 # DIB1-dən HIGH1-ə minimum şam sayı
 MIN_CANDLES_TO_HIGH1 = 10
 
-# Neçə bağlı şam çəkilsin (rolling 100 üçün kifayət qədər)
-FETCH_LIMIT = 200
+# Neçə bağlı şam çəkilsin
+FETCH_LIMIT = 250
 
 REQUEST_TIMEOUT = 10
 
@@ -307,13 +307,14 @@ def confirm_dib1(symbol, timeframe, state, breaking_candle):
 
 # ============================================================
 # PROCESS CANDLE
+# prev_100_min_low = əvvəlki 100 şamın ən aşağı low-u
 # ============================================================
 
 def process_candle(
     symbol,
     timeframe,
     candle,
-    rolling_100th_candle=None
+    prev_100_min_low=None
 ):
 
     key = (symbol, timeframe)
@@ -337,7 +338,7 @@ def process_candle(
             # ------------------------------------------------
             # DIB1 izlənilir, təsdiqlənməyib və 100 şamlıq
             # pəncərədən çıxır → silinir, yenidən son şamdan
-            # rolling müqayisəsi başlayır (aşağı fall through)
+            # rolling müqayisəsi başlayır
 
             if candle_number >= ROLLING_CANDLES:
 
@@ -351,7 +352,7 @@ def process_candle(
 
                 del states[key]
 
-                # Aşağı düşür → rolling check ilə yeni DIB1 axtar
+                # Aşağı düşür → yeni DIB1 axtarışı
 
             else:
 
@@ -417,23 +418,23 @@ def process_candle(
                 return
 
         # ----------------------------------------------------
-        # DIB1 YOXDUR → ROLLING MÜQAYİSƏ İLƏ YARAT
+        # DIB1 YOXDUR → YENİ DIB1 YOXLAMASI
+        # Şərt: cari şam.low < ƏVVƏLKİ 100 şamın ƏN AŞAĞI low-u
         # ----------------------------------------------------
-        # Şərt: cari şamın LOW < 100-cü şamın LOW
 
-        if rolling_100th_candle is None:
-            return
+        if prev_100_min_low is None:
+            return  # 100 şam hələ tamamlanmayıb
 
-        if candle["low"] < rolling_100th_candle["low"]:
+        if candle["low"] < prev_100_min_low:
 
             create_dib1(
                 symbol,
                 timeframe,
                 candle,
                 (
-                    "Rolling 100: "
-                    f"1-ci LOW={candle['low']} < "
-                    f"100-cü LOW={rolling_100th_candle['low']}"
+                    "New low vs prev 100 candles | "
+                    f"cari LOW={candle['low']} < "
+                    f"prev 100 min LOW={prev_100_min_low}"
                 )
             )
 
@@ -461,7 +462,7 @@ def scan_symbol(symbol, timeframe):
 
     if key not in initialized:
 
-        if len(candles) < ROLLING_CANDLES:
+        if len(candles) < ROLLING_CANDLES + 1:
             return
 
         last_processed[key] = candles[-1]["close_time"]
@@ -486,28 +487,38 @@ def scan_symbol(symbol, timeframe):
 
     new_candles.sort(key=lambda x: x["close_time"])
 
+    # İndeks xəritəsi (sürətli axtarış üçün)
+    index_map = {
+        c["close_time"]: i
+        for i, c in enumerate(candles)
+    }
+
     # --------------------------------------------------------
     # HƏR YENİ BAĞLANAN ŞAM
     # --------------------------------------------------------
 
     for candle in new_candles:
 
-        # Rolling 100-cü şamı tap
-        # cari şam = 1-ci, 100-cü = 99 indeks geri
-        candle_index = candles.index(candle)
+        i = index_map[candle["close_time"]]
 
-        rolling_100th_candle = None
+        # Əvvəlki 100 şamın ən aşağı low-u
+        prev_100_min_low = None
 
-        if candle_index >= (ROLLING_CANDLES - 1):
-            rolling_100th_candle = (
-                candles[candle_index - (ROLLING_CANDLES - 1)]
+        if i >= ROLLING_CANDLES:
+
+            prev_window = candles[
+                i - ROLLING_CANDLES : i
+            ]
+
+            prev_100_min_low = min(
+                c["low"] for c in prev_window
             )
 
         process_candle(
             symbol,
             timeframe,
             candle,
-            rolling_100th_candle
+            prev_100_min_low
         )
 
         last_processed[key] = candle["close_time"]
@@ -522,6 +533,7 @@ def main():
     print("=" * 70)
     print("BINANCE DIB1 + HIGH1 SCANNER")
     print("ROLLING 100 CANDLE SYSTEM")
+    print("PREV-100 MIN LOW DIB1 CONDITION")
     print("TELEGRAM ALERT ONLY")
     print("=" * 70)
 
