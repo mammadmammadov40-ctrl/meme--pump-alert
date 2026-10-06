@@ -7,9 +7,7 @@ from threading import Lock
 
 # ============================================================
 # BINANCE DIB1 + HIGH1 + DIB2 + BREAKOUT + CHAIN SCANNER
-# YALNIZ 2 ALERT:
-#   🚀 BREAKOUT
-#   🎯 CHAIN SIGNAL
+# Alert: 🚀 BREAKOUT | 🎯 CHAIN
 # ============================================================
 
 BINANCE_URL = "https://api.binance.com"
@@ -25,11 +23,11 @@ POLL_SECONDS = 10
 TOP_REFRESH_SECONDS = 60
 
 ROLLING_CANDLES = 100
-MIN_CANDLES_TO_HIGH1 = 10
-MIN_CANDLES_TO_BREAKOUT = 10
+MIN_CANDLES_TO_HIGH1 = 10          # HIGH1 təsdiqi üçün min mövqe
+MIN_CANDLES_TO_BREAKOUT = 10       # Köhnə DIB2 üçün min şam
 CHAIN_BREAKS_TO_SIGNAL = 3
 
-# Breakout % (yalnız bu TF-lər breakout edir)
+# Breakout % — yalnız bu TF-lər breakout edir
 BREAKOUT_PERCENT = {
     "5m":  1.005,   # 0.5%
     "15m": 1.005,   # 0.5%
@@ -187,7 +185,6 @@ def create_dib1(symbol, timeframe, candle, reason=""):
 
 # ============================================================
 # CONFIRM DIB1 → KEÇ DIB2 MƏRHƏLƏSİNƏ
-# (Telegram alert YOX — yalnız terminal)
 # ============================================================
 
 def confirm_dib1_and_start_dib2(symbol, timeframe, state, breaking_candle):
@@ -198,10 +195,9 @@ def confirm_dib1_and_start_dib2(symbol, timeframe, state, breaking_candle):
         f"DIB1: {state['dib1']}\n"
         f"DIB1 time: {format_time(state['dib1_time'])}\n\n"
         f"HIGH1: {state['high1']}\n"
-        f"HIGH1 time: {format_time(state['high1_time'])}\n\n"
-        f"DIB1 → HIGH1: {state['high1_candle_number']} candles\n"
-        f"HIGH1 → DIB1 break: "
-        f"{state['candles_since_dib1'] - state['high1_candle_number']} candles\n\n"
+        f"HIGH1 time: {format_time(state['high1_time'])}\n"
+        f"HIGH1 candle #: {state['high1_candle_number']}\n\n"
+        f"DIB1 → DIB1 break: {state['candles_since_dib1']} candles\n\n"
         f"DIB1 break LOW: {breaking_candle['low']}\n"
         f"Break time: {format_time(breaking_candle['close_time'])}\n\n"
         f"⏳ DIB2 izləməyə başlanılır..."
@@ -209,7 +205,6 @@ def confirm_dib1_and_start_dib2(symbol, timeframe, state, breaking_candle):
     print("\n" + msg + "\n")
 
     # DIB1 CONFIRMED alerti YOX — heç bir TF üçün göndərilmir
-    # (DIB1_ALERT_TIMEFRAMES boş olduğu üçün bu blok işləmir)
 
     state["phase"] = "dib2_watch"
 
@@ -240,10 +235,12 @@ def send_breakout_alert(symbol, timeframe, state, breakout_candle):
         f"DIB2: {state['dib2']}\n"
         f"DIB2 time: {format_time(state['dib2_time'])}\n\n"
         f"HIGH1: {state['high1']}\n"
-        f"HIGH1 time: {format_time(state['high1_time'])}\n\n"
+        f"HIGH1 time: {format_time(state['high1_time'])}\n"
+        f"HIGH1 candle #: {state['high1_candle_number']}\n\n"
         f"Breakout target: {target:.8f}\n"
         f"Breakout close: {breakout_candle['close']}\n"
-        f"Breakout time: {format_time(breakout_candle['close_time'])}\n"
+        f"Breakout time: {format_time(breakout_candle['close_time'])}\n\n"
+        f"DIB2 → Breakout: {state['candles_after_dib2']} candles"
     )
     print("\n" + msg + "\n")
     send_telegram(msg)
@@ -263,7 +260,8 @@ def send_chain_signal(symbol, timeframe, state, breaking_candle):
         f"DIB1: {state['dib1']}\n"
         f"DIB1 time: {format_time(state['dib1_time'])}\n\n"
         f"HIGH1: {state['high1']}\n"
-        f"HIGH1 time: {format_time(state['high1_time'])}\n\n"
+        f"HIGH1 time: {format_time(state['high1_time'])}\n"
+        f"HIGH1 candle #: {state['high1_candle_number']}\n\n"
         f"DIB2: {chain[0] if len(chain) > 0 else '-'}\n"
         f"DIB3: {chain[1] if len(chain) > 1 else '-'}\n"
         f"DIB4: {chain[2] if len(chain) > 2 else '-'}\n\n"
@@ -279,7 +277,7 @@ def send_chain_signal(symbol, timeframe, state, breaking_candle):
 # ============================================================
 
 def send_reset_alert(symbol, timeframe, state, candle):
-    # RESET alert YOXDUR — yalnız terminal
+    # Alert YOXDUR — yalnız terminal
     print(f"[{format_time(candle['close_time'])}] "
           f"{symbol} {timeframe} | "
           f"DIB1 100-candle limit → RESET (alert YOX)")
@@ -288,30 +286,45 @@ def send_reset_alert(symbol, timeframe, state, candle):
 # ============================================================
 # DIB1 FAZASI
 # ============================================================
+# QAYDA:
+#  - HIGH1 HƏR ŞAMDA izlənilir (candle 1-dən)
+#  - Ən yüksək HIGH saxlanılır
+#  - Təsdiq üçün HIGH1-in mövqeyi >= 10 olmalıdır
+#  - Əgər ən yüksək HIGH mövqeyi < 10-dursa → təsdiq YOX
+# ============================================================
 
 def process_dib1_phase(symbol, timeframe, state, candle):
 
     n = state["candles_since_dib1"]
 
+    # --------------------------------------------------------
+    # 1) DIB1 BREAK
+    # --------------------------------------------------------
     if candle["low"] < state["dib1"]:
 
+        # Təsdiq üçün: HIGH1 mövcud OLSUN və mövqeyi >= 10 OLSUN
         if (state["high1"] is not None
             and state["high1_candle_number"] is not None
             and state["high1_candle_number"] >= MIN_CANDLES_TO_HIGH1):
             confirm_dib1_and_start_dib2(symbol, timeframe, state, candle)
             return
         else:
+            # HIGH1 yoxdur və ya mövqeyi < 10 → təsdiq YOX
             create_dib1(symbol, timeframe, candle,
-                        f"DIB1 broken <10 candles | old DIB1={state['dib1']}")
+                        f"DIB1 broken without valid HIGH1 "
+                        f"(high1_pos={state['high1_candle_number']}) | "
+                        f"old DIB1={state['dib1']}")
             return
 
-    if n >= MIN_CANDLES_TO_HIGH1:
-        if state["high1"] is None or candle["high"] > state["high1"]:
-            state["high1"] = candle["high"]
-            state["high1_time"] = candle["close_time"]
-            state["high1_candle_number"] = n
-            print(f"[{format_time(candle['close_time'])}] {symbol} {timeframe} | "
-                  f"HIGH1 = {candle['high']} | DIB1 → HIGH1 = {n} candles")
+    # --------------------------------------------------------
+    # 2) HIGH1 İZLƏ — HƏR ŞAMDA (candle 1-dən etibarən)
+    # --------------------------------------------------------
+    if state["high1"] is None or candle["high"] > state["high1"]:
+        state["high1"] = candle["high"]
+        state["high1_time"] = candle["close_time"]
+        state["high1_candle_number"] = n
+        print(f"[{format_time(candle['close_time'])}] {symbol} {timeframe} | "
+              f"HIGH1 = {candle['high']} | DIB1 → HIGH1 = {n} candles")
 
 
 # ============================================================
