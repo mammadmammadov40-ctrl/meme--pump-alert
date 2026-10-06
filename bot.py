@@ -6,10 +6,10 @@ from zoneinfo import ZoneInfo
 from threading import Lock
 
 # ============================================================
-# BINANCE DIB1 + HIGH1 + DIB2 + BREAKOUT SCANNER
-# TELEGRAM:
-#   - 1h: DIB1 CONFIRMED + BREAKOUT
-#   - Digər TF: yalnız BREAKOUT
+# BINANCE DIB1 + HIGH1 + DIB2 + BREAKOUT + CHAIN SCANNER
+# YALNIZ 2 ALERT:
+#   🚀 BREAKOUT
+#   🎯 CHAIN SIGNAL
 # ============================================================
 
 BINANCE_URL = "https://api.binance.com"
@@ -19,10 +19,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TOP_COINS = 100
-TIMEFRAMES = ["5m", "15m", "30m", "1h"]
-
-# DIB1 CONFIRMED alerti yalnız bu TF-lər üçün Telegram-a gedir
-DIB1_ALERT_TIMEFRAMES = {"1h"}
+TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "6h"]
 
 POLL_SECONDS = 10
 TOP_REFRESH_SECONDS = 60
@@ -30,9 +27,29 @@ TOP_REFRESH_SECONDS = 60
 ROLLING_CANDLES = 100
 MIN_CANDLES_TO_HIGH1 = 10
 MIN_CANDLES_TO_BREAKOUT = 10
-BREAKOUT_PERCENT = 1.01
+CHAIN_BREAKS_TO_SIGNAL = 3
 
-FETCH_LIMIT = 250
+# Breakout % (yalnız bu TF-lər breakout edir)
+BREAKOUT_PERCENT = {
+    "5m":  1.005,   # 0.5%
+    "15m": 1.005,   # 0.5%
+    "30m": 1.007,   # 0.70%
+    "1h":  1.01,    # 1%
+}
+
+# Köhnə DIB2 logikası (1/2-ci qırılma + slide)
+OLD_DIB2_TIMEFRAMES = {"5m", "15m", "30m"}
+
+# Chain logikası (DIB2→DIB3→DIB4→SIGNAL)
+CHAIN_TIMEFRAMES = {"1h", "2h", "4h", "6h"}
+
+# DIB1 CONFIRMED alert — BOŞ (heç bir TF üçün göndərilmir)
+DIB1_ALERT_TIMEFRAMES = set()
+
+# RESET alert — BOŞ (heç bir TF üçün göndərilmir)
+RESET_ALERT_TIMEFRAMES = set()
+
+FETCH_LIMIT = 300
 REQUEST_TIMEOUT = 10
 AZ_TZ = ZoneInfo("Asia/Baku")
 
@@ -148,7 +165,8 @@ def create_dib1(symbol, timeframe, candle, reason=""):
 
         "dib1": candle["low"],
         "dib1_time": candle["close_time"],
-        "candles_after_dib1": 0,
+        "candles_since_dib1": 0,
+
         "high1": None,
         "high1_time": None,
         "high1_candle_number": None,
@@ -160,6 +178,8 @@ def create_dib1(symbol, timeframe, candle, reason=""):
         "high_since_dib2": None,
         "high_since_dib2_time": None,
         "high_since_dib2_candle_num": None,
+
+        "chain_dib_list": [],
     }
     print(f"[{format_time(candle['close_time'])}] {symbol} {timeframe} | "
           f"NEW DIB1 = {candle['low']} | {reason}")
@@ -167,13 +187,13 @@ def create_dib1(symbol, timeframe, candle, reason=""):
 
 # ============================================================
 # CONFIRM DIB1 → KEÇ DIB2 MƏRHƏLƏSİNƏ
-# Telegram alert: YALNIZ 1h üçün
+# (Telegram alert YOX — yalnız terminal)
 # ============================================================
 
 def confirm_dib1_and_start_dib2(symbol, timeframe, state, breaking_candle):
 
     msg = (
-        f"🔔 DIB1 CONFIRMED\n\n"
+        f"🔔 DIB1 CONFIRMED (yalnız terminal)\n\n"
         f"Coin: {symbol}\nTF: {timeframe}\n\n"
         f"DIB1: {state['dib1']}\n"
         f"DIB1 time: {format_time(state['dib1_time'])}\n\n"
@@ -181,21 +201,18 @@ def confirm_dib1_and_start_dib2(symbol, timeframe, state, breaking_candle):
         f"HIGH1 time: {format_time(state['high1_time'])}\n\n"
         f"DIB1 → HIGH1: {state['high1_candle_number']} candles\n"
         f"HIGH1 → DIB1 break: "
-        f"{state['candles_after_dib1'] - state['high1_candle_number']} candles\n\n"
+        f"{state['candles_since_dib1'] - state['high1_candle_number']} candles\n\n"
         f"DIB1 break LOW: {breaking_candle['low']}\n"
         f"Break time: {format_time(breaking_candle['close_time'])}\n\n"
         f"⏳ DIB2 izləməyə başlanılır..."
     )
-
-    # Hər halda terminala yaz
     print("\n" + msg + "\n")
 
-    # YALNIZ seçilmiş timeframe-lər üçün Telegram-a göndər
-    if timeframe in DIB1_ALERT_TIMEFRAMES:
-        send_telegram(msg)
+    # DIB1 CONFIRMED alerti YOX — heç bir TF üçün göndərilmir
+    # (DIB1_ALERT_TIMEFRAMES boş olduğu üçün bu blok işləmir)
 
-    # Keç DIB2 mərhələsinə
     state["phase"] = "dib2_watch"
+
     state["dib2"] = breaking_candle["low"]
     state["dib2_time"] = breaking_candle["close_time"]
     state["candles_after_dib2"] = 0
@@ -204,14 +221,16 @@ def confirm_dib1_and_start_dib2(symbol, timeframe, state, breaking_candle):
     state["high_since_dib2_time"] = None
     state["high_since_dib2_candle_num"] = None
 
+    state["chain_dib_list"] = [breaking_candle["low"]]
+
 
 # ============================================================
-# BREAKOUT SIGNAL — HƏR TF ÜÇÜN TELEGRAMA GEDİR
+# BREAKOUT SIGNAL  🚀
 # ============================================================
 
 def send_breakout_alert(symbol, timeframe, state, breakout_candle):
 
-    target = state["high1"] * BREAKOUT_PERCENT
+    target = state["high1"] * BREAKOUT_PERCENT[timeframe]
 
     msg = (
         f"🚀 BREAKOUT CONFIRMED\n\n"
@@ -222,20 +241,86 @@ def send_breakout_alert(symbol, timeframe, state, breakout_candle):
         f"DIB2 time: {format_time(state['dib2_time'])}\n\n"
         f"HIGH1: {state['high1']}\n"
         f"HIGH1 time: {format_time(state['high1_time'])}\n\n"
-        f"Breakout target (HIGH1 × 1.01): {target:.8f}\n"
+        f"Breakout target: {target:.8f}\n"
         f"Breakout close: {breakout_candle['close']}\n"
-        f"Breakout time: {format_time(breakout_candle['close_time'])}\n\n"
-        f"DIB2 → Breakout: {state['candles_after_dib2']} candles"
+        f"Breakout time: {format_time(breakout_candle['close_time'])}\n"
     )
     print("\n" + msg + "\n")
     send_telegram(msg)
 
 
 # ============================================================
-# DIB2 MƏRHƏLƏSİ EMALI
+# CHAIN SIGNAL  🎯
 # ============================================================
 
-def process_dib2_phase(symbol, timeframe, state, candle):
+def send_chain_signal(symbol, timeframe, state, breaking_candle):
+
+    chain = state["chain_dib_list"]
+
+    msg = (
+        f"🎯 CHAIN SIGNAL (3rd break)\n\n"
+        f"Coin: {symbol}\nTF: {timeframe}\n\n"
+        f"DIB1: {state['dib1']}\n"
+        f"DIB1 time: {format_time(state['dib1_time'])}\n\n"
+        f"HIGH1: {state['high1']}\n"
+        f"HIGH1 time: {format_time(state['high1_time'])}\n\n"
+        f"DIB2: {chain[0] if len(chain) > 0 else '-'}\n"
+        f"DIB3: {chain[1] if len(chain) > 1 else '-'}\n"
+        f"DIB4: {chain[2] if len(chain) > 2 else '-'}\n\n"
+        f"Break LOW: {breaking_candle['low']}\n"
+        f"Break time: {format_time(breaking_candle['close_time'])}\n"
+    )
+    print("\n" + msg + "\n")
+    send_telegram(msg)
+
+
+# ============================================================
+# RESET ALERT — LƏĞV EDİLDİ
+# ============================================================
+
+def send_reset_alert(symbol, timeframe, state, candle):
+    # RESET alert YOXDUR — yalnız terminal
+    print(f"[{format_time(candle['close_time'])}] "
+          f"{symbol} {timeframe} | "
+          f"DIB1 100-candle limit → RESET (alert YOX)")
+
+
+# ============================================================
+# DIB1 FAZASI
+# ============================================================
+
+def process_dib1_phase(symbol, timeframe, state, candle):
+
+    n = state["candles_since_dib1"]
+
+    if candle["low"] < state["dib1"]:
+
+        if (state["high1"] is not None
+            and state["high1_candle_number"] is not None
+            and state["high1_candle_number"] >= MIN_CANDLES_TO_HIGH1):
+            confirm_dib1_and_start_dib2(symbol, timeframe, state, candle)
+            return
+        else:
+            create_dib1(symbol, timeframe, candle,
+                        f"DIB1 broken <10 candles | old DIB1={state['dib1']}")
+            return
+
+    if n >= MIN_CANDLES_TO_HIGH1:
+        if state["high1"] is None or candle["high"] > state["high1"]:
+            state["high1"] = candle["high"]
+            state["high1_time"] = candle["close_time"]
+            state["high1_candle_number"] = n
+            print(f"[{format_time(candle['close_time'])}] {symbol} {timeframe} | "
+                  f"HIGH1 = {candle['high']} | DIB1 → HIGH1 = {n} candles")
+
+
+# ============================================================
+# KÖHNƏ DIB2 FAZASI (5m, 15m, 30m)
+# ============================================================
+
+def process_old_dib2_logic(symbol, timeframe, state, candle):
+
+    key = (symbol, timeframe)
 
     state["candles_after_dib2"] += 1
     n = state["candles_after_dib2"]
@@ -246,23 +331,14 @@ def process_dib2_phase(symbol, timeframe, state, candle):
         state["high_since_dib2_time"] = candle["close_time"]
         state["high_since_dib2_candle_num"] = n
 
-    # BREAKOUT
-    if candle["close"] >= state["high1"] * BREAKOUT_PERCENT:
-        send_breakout_alert(symbol, timeframe, state, candle)
-        del states[(symbol, timeframe)]
-        return
-
-    # DIB2 QIRILMASI
     if candle["low"] < state["dib2"]:
 
         if n < MIN_CANDLES_TO_BREAKOUT:
 
             if state["dib2_break_count"] == 0:
                 print(f"[{format_time(candle['close_time'])}] "
-                      f"{symbol} {timeframe} | "
-                      f"DIB2 BROKEN 1st time (<10 candles) → "
-                      f"NEW DIB2 = {candle['low']} | "
-                      f"old DIB2 = {state['dib2']}")
+                      f"{symbol} {timeframe} | DIB2 BROKEN 1st (<10) → "
+                      f"NEW DIB2 = {candle['low']}")
 
                 state["dib2"] = candle["low"]
                 state["dib2_time"] = candle["close_time"]
@@ -274,33 +350,27 @@ def process_dib2_phase(symbol, timeframe, state, candle):
 
             else:
                 print(f"[{format_time(candle['close_time'])}] "
-                      f"{symbol} {timeframe} | "
-                      f"DIB2 BROKEN 2nd time (<10) → "
-                      f"STRUCTURE RESET | "
-                      f"new DIB1 = {candle['low']}")
+                      f"{symbol} {timeframe} | DIB2 BROKEN 2nd (<10) → RESET")
 
                 create_dib1(symbol, timeframe, candle,
                             "DIB2 broken 2nd time (<10) → RESET")
 
         else:
-
+            # SLIDE
             old_dib2 = state["dib2"]
             old_dib2_time = state["dib2_time"]
-
             new_high1 = state["high_since_dib2"]
             new_high1_time = state["high_since_dib2_time"]
             new_high1_num = state["high_since_dib2_candle_num"]
 
             print(f"[{format_time(candle['close_time'])}] "
-                  f"{symbol} {timeframe} | "
-                  f"DIB2 BROKEN ({n} candles ≥10) → SLIDE DOWN | "
-                  f"new DIB1 = {old_dib2} | "
-                  f"new HIGH1 = {new_high1} | "
-                  f"new DIB2 = {candle['low']}")
+                  f"{symbol} {timeframe} | DIB2 BROKEN ({n} ≥10) → SLIDE | "
+                  f"new DIB1={old_dib2} | new HIGH1={new_high1} | "
+                  f"new DIB2={candle['low']}")
 
             state["dib1"] = old_dib2
             state["dib1_time"] = old_dib2_time
-            state["candles_after_dib1"] = n
+            state["candles_since_dib1"] = 0
 
             state["high1"] = new_high1
             state["high1_time"] = new_high1_time
@@ -314,6 +384,53 @@ def process_dib2_phase(symbol, timeframe, state, candle):
             state["high_since_dib2_time"] = None
             state["high_since_dib2_candle_num"] = None
 
+
+# ============================================================
+# CHAIN FAZASI (1h, 2h, 4h, 6h)
+# ============================================================
+
+def process_chain_logic(symbol, timeframe, state, candle):
+
+    key = (symbol, timeframe)
+    chain = state["chain_dib_list"]
+    current = chain[-1]
+
+    if candle["low"] < current:
+
+        if len(chain) >= CHAIN_BREAKS_TO_SIGNAL:
+            send_chain_signal(symbol, timeframe, state, candle)
+            del states[key]
+            return
+        else:
+            chain.append(candle["low"])
+            print(f"[{format_time(candle['close_time'])}] "
+                  f"{symbol} {timeframe} | "
+                  f"CHAIN dib #{len(chain)} = {candle['low']}")
+
+
+# ============================================================
+# DIB2 FAZASI DİSPATCHER
+# ============================================================
+
+def process_dib2_phase(symbol, timeframe, state, candle):
+
+    key = (symbol, timeframe)
+
+    # Breakout (5m, 15m, 30m, 1h)
+    if timeframe in BREAKOUT_PERCENT:
+        if candle["close"] >= state["high1"] * BREAKOUT_PERCENT[timeframe]:
+            send_breakout_alert(symbol, timeframe, state, candle)
+            del states[key]
+            return
+
+    # Köhnə DIB2 logikası (5m, 15m, 30m)
+    if timeframe in OLD_DIB2_TIMEFRAMES:
+        process_old_dib2_logic(symbol, timeframe, state, candle)
+        return
+
+    # Chain logikası (1h, 2h, 4h, 6h)
+    if timeframe in CHAIN_TIMEFRAMES:
+        process_chain_logic(symbol, timeframe, state, candle)
         return
 
 
@@ -331,41 +448,18 @@ def process_candle(symbol, timeframe, candle, prev_100_min_low=None):
 
             state = states[key]
 
-            if state.get("phase") == "dib2_watch":
-                process_dib2_phase(symbol, timeframe, state, candle)
+            state["candles_since_dib1"] += 1
+
+            if state["candles_since_dib1"] >= ROLLING_CANDLES:
+                send_reset_alert(symbol, timeframe, state, candle)
+                del states[key]
+
+            elif state["phase"] == "dib1_watch":
+                process_dib1_phase(symbol, timeframe, state, candle)
                 return
 
-            state["candles_after_dib1"] += 1
-            n = state["candles_after_dib1"]
-
-            if n >= ROLLING_CANDLES:
-                print(f"[{format_time(candle['close_time'])}] "
-                      f"{symbol} {timeframe} | "
-                      f"DIB1 LƏĞV OLUNDU (100 limit) | "
-                      f"old DIB1={state['dib1']}")
-                del states[key]
-            else:
-                if candle["low"] < state["dib1"]:
-
-                    if (state["high1"] is not None
-                        and state["high1_candle_number"] is not None
-                        and state["high1_candle_number"] >= MIN_CANDLES_TO_HIGH1):
-                        confirm_dib1_and_start_dib2(symbol, timeframe, state, candle)
-                        return
-                    else:
-                        create_dib1(symbol, timeframe, candle,
-                                    f"DIB1 broken <10 candles | "
-                                    f"old DIB1={state['dib1']}")
-                        return
-
-                if state["high1"] is None or candle["high"] > state["high1"]:
-                    state["high1"] = candle["high"]
-                    state["high1_time"] = candle["close_time"]
-                    state["high1_candle_number"] = n
-                    print(f"[{format_time(candle['close_time'])}] "
-                          f"{symbol} {timeframe} | "
-                          f"HIGH1 = {candle['high']} | "
-                          f"DIB1 → HIGH1 = {n} candles")
+            elif state["phase"] == "dib2_watch":
+                process_dib2_phase(symbol, timeframe, state, candle)
                 return
 
         if prev_100_min_low is None:
@@ -424,10 +518,8 @@ def scan_symbol(symbol, timeframe):
 
 def main():
     print("=" * 70)
-    print("BINANCE DIB1 + HIGH1 + DIB2 + BREAKOUT SCANNER")
-    print("TELEGRAM ALERT:")
-    print("  - 1h : DIB1 CONFIRMED + BREAKOUT")
-    print("  - Digər TF : yalnız BREAKOUT")
+    print("BINANCE DIB1 + HIGH1 + DIB2 + BREAKOUT + CHAIN SCANNER")
+    print("Alert: 🚀 BREAKOUT  |  🎯 CHAIN")
     print("=" * 70)
 
     symbols = []
