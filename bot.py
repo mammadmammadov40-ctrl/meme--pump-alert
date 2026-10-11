@@ -8,6 +8,7 @@ from threading import Lock
 # ============================================================
 # BINANCE DIB1 + HIGH1 + DIB2 + BREAKOUT + CHAIN SCANNER
 # Alert: 🚀 BREAKOUT | 🎯 CHAIN
+# Filter: 24h volume >= 10M USDT
 # ============================================================
 
 BINANCE_URL = "https://api.binance.com"
@@ -16,7 +17,9 @@ TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TOP_COINS = 100
+# 24 saatlıq minimum həcm (USDT)
+MIN_24H_VOLUME_USDT = 10_000_000   # 10 milyon USDT
+
 TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "6h"]
 
 POLL_SECONDS = 10
@@ -81,7 +84,7 @@ def send_telegram(message):
 
 
 # ============================================================
-# TOP 100
+# SYMBOLS — 24h həcmə görə filter (>= 10M USDT)
 # ============================================================
 
 def get_top_symbols():
@@ -107,9 +110,14 @@ def get_top_symbols():
                 vol = float(t["quoteVolume"])
             except:
                 continue
+            # YALNIZ 24h həcmi >= 10M USDT olan coinlər
+            if vol < MIN_24H_VOLUME_USDT:
+                continue
             result.append((sym, vol))
+
         result.sort(key=lambda x: x[1], reverse=True)
-        return [x[0] for x in result[:TOP_COINS]]
+        return [x[0] for x in result]
+
     except Exception as e:
         print("Symbol error:", e)
         return []
@@ -254,40 +262,27 @@ def send_reset_alert(symbol, timeframe, state, candle):
 
 
 # ============================================================
-# DIB1 FAZASI — ƏSAS DÜZƏLİŞ BURADADIR
-# ============================================================
-# QAYDA:
-#   1) HIGH1 hər şamda izlənilir (mövqe ilə birlikdə)
-#   2) DIB1 qırıldıqda: ən yüksək HIGH-ın mövqeyi >= 10 olmalıdır
-#   3) Əgər mövqe < 10-dursa → təsdiq YOX → yeni DIB1
+# DIB1 FAZASI
 # ============================================================
 
 def process_dib1_phase(symbol, timeframe, state, candle):
 
     n = state["candles_since_dib1"]
 
-    # --------------------------------------------------------
-    # 1) DIB1 BREAK
-    # --------------------------------------------------------
+    # DIB1 BREAK
     if candle["low"] < state["dib1"]:
 
         high1_pos = state["high1_candle_number"]
 
-        # Təsdiq üçün: HIGH1 mövcud VƏ mövqeyi >= 10
         if (state["high1"] is not None
             and high1_pos is not None
             and high1_pos >= MIN_CANDLES_TO_HIGH1):
-
-            # ✅ CONFIRM + DIB2 mərhələsinə keç
             confirm_dib1_and_start_dib2(symbol, timeframe, state, candle)
             return
-
         else:
-            # ❌ TƏSDİQ YOX → qıran şam YENİ DIB1 olur
             print(f"[{format_time(candle['close_time'])}] "
                   f"{symbol} {timeframe} | DIB1 broken, "
-                  f"high1_pos={high1_pos} < {MIN_CANDLES_TO_HIGH1} → "
-                  f"NEW DIB1")
+                  f"high1_pos={high1_pos} < {MIN_CANDLES_TO_HIGH1} → NEW DIB1")
 
             create_dib1(symbol, timeframe, candle,
                         f"DIB1 broken without valid HIGH1 "
@@ -295,9 +290,7 @@ def process_dib1_phase(symbol, timeframe, state, candle):
                         f"old DIB1={state['dib1']}")
             return
 
-    # --------------------------------------------------------
-    # 2) HIGH1 İZLƏ — HƏR ŞAMDA (candle 1-dən etibarən)
-    # --------------------------------------------------------
+    # HIGH1 İZLƏ — HƏR ŞAMDA
     if state["high1"] is None or candle["high"] > state["high1"]:
         state["high1"] = candle["high"]
         state["high1_time"] = candle["close_time"]
@@ -343,7 +336,6 @@ def process_old_dib2_logic(symbol, timeframe, state, candle):
                 create_dib1(symbol, timeframe, candle,
                             "DIB2 broken 2nd time (<10) → RESET")
         else:
-            # SLIDE
             old_dib2 = state["dib2"]
             old_dib2_time = state["dib2_time"]
             new_high1 = state["high_since_dib2"]
@@ -497,6 +489,7 @@ def scan_symbol(symbol, timeframe):
 def main():
     print("=" * 70)
     print("BINANCE DIB1 + HIGH1 + DIB2 + BREAKOUT + CHAIN SCANNER")
+    print(f"Filter: 24h volume >= {MIN_24H_VOLUME_USDT:,.0f} USDT")
     print("Alert: 🚀 BREAKOUT  |  🎯 CHAIN")
     print("=" * 70)
 
@@ -512,7 +505,8 @@ def main():
                 if ns:
                     symbols = ns
                     last_top_refresh = ct
-                    print(f"\nTop {len(symbols)} USDT coins loaded.")
+                    print(f"\n{len(symbols)} coins loaded "
+                          f"(24h vol >= {MIN_24H_VOLUME_USDT/1_000_000:.0f}M USDT).")
 
             for symbol in symbols:
                 for timeframe in TIMEFRAMES:
