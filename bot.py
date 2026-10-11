@@ -8,7 +8,7 @@ from threading import Lock
 # ============================================================
 # BINANCE DIB1 + HIGH1 + DIB2 + BREAKOUT + CHAIN SCANNER
 # Alert: 🚀 BREAKOUT | 🎯 CHAIN
-# Filter: 24h volume >= 10M USDT
+# Filter: 24h volume >= 1M USDT
 # ============================================================
 
 BINANCE_URL = "https://api.binance.com"
@@ -18,7 +18,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # 24 saatlıq minimum həcm (USDT)
-MIN_24H_VOLUME_USDT = 10_000_000   # 10 milyon USDT
+MIN_24H_VOLUME_USDT = 1_000_000   # 1 milyon USDT
 
 TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "6h"]
 
@@ -84,7 +84,7 @@ def send_telegram(message):
 
 
 # ============================================================
-# SYMBOLS — 24h həcmə görə filter (>= 10M USDT)
+# SYMBOLS — 24h həcmə görə filter (>= 1M USDT)
 # ============================================================
 
 def get_top_symbols():
@@ -110,7 +110,7 @@ def get_top_symbols():
                 vol = float(t["quoteVolume"])
             except:
                 continue
-            # YALNIZ 24h həcmi >= 10M USDT olan coinlər
+            # YALNIZ 24h həcmi >= 1M USDT olan coinlər
             if vol < MIN_24H_VOLUME_USDT:
                 continue
             result.append((sym, vol))
