@@ -8,7 +8,7 @@ from threading import Lock
 # ============================================================
 # BINANCE DIB1 + HIGH1 + DIB2 + BREAKOUT + CHAIN SCANNER
 # Alert: 🚀 BREAKOUT | 🎯 CHAIN
-# Filter: 24h volume >= 1M USDT
+# Filter: Manual COIN_LIST (100 coins) — NO volume filter
 # ============================================================
 
 BINANCE_URL = "https://api.binance.com"
@@ -17,8 +17,28 @@ TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# 24 saatlıq minimum həcm (USDT)
-MIN_24H_VOLUME_USDT = 1_000_000   # 1 milyon USDT
+# ============================================================
+# COIN SİYAHISI — 100 coin
+# ============================================================
+COIN_LIST = [
+    "BTC", "ETH", "BNB", "XRP", "SOL", "TRX", "HYPE", "ZEC",
+    "DOGE", "LINK", "XLM", "ADA", "UNI", "NEAR", "LTC", "AVAX",
+    "HBAR", "SUI", "GRAM", "TAO", "SHIB", "PUMP", "WLD", "ENA",
+    "QNT", "AAVE", "ONDO", "DOT", "ASTER", "WLFI", "SKY", "ARB",
+    "PEPE", "ICP", "ZRO", "FIL", "TRUMP", "RAY", "JUP", "ALGO",
+    "POL", "RENDER", "ATOM", "AERO", "INJ", "STX", "APT", "NIGHT",
+    "CAKE", "VIRTUAL", "ETHFI", "DASH", "OP", "STRK", "TIA", "CRV",
+    "VET", "PYTH", "PENDLE", "FET", "NEXO", "JTO", "PENGU", "SEI",
+    "LDO", "FF", "XPL", "BONK", "FLOKI", "JASMY", "NEO", "EIGEN",
+    "IOTA", "MET", "WIF", "CVX", "ZAMA", "CHZ", "BEAMX", "ORCA",
+    "PLUME", "CHIP", "W", "SPK", "FORM", "GALA", "ARKM", "BIO",
+    "AMP", "AXL", "MINA", "PROM",
+    "APE", "KAIA", "SYRUP", "GRT",
+    # ---- Yeni əlavələr ----
+    "GLM", "CRCLB", "SONIC", "SENT",
+]
+
+COIN_SET = set(c.upper() for c in COIN_LIST)
 
 TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h", "6h"]
 
@@ -84,39 +104,35 @@ def send_telegram(message):
 
 
 # ============================================================
-# SYMBOLS — 24h həcmə görə filter (>= 1M USDT)
+# SYMBOLS — YALNIZ COIN_LIST-də olanlar (volume filter YOX)
 # ============================================================
 
 def get_top_symbols():
     try:
         info = session.get(BINANCE_URL + "/api/v3/exchangeInfo",
                            timeout=REQUEST_TIMEOUT).json()
-        valid = {}
+
+        valid_symbols = []
+        found_bases = set()
+
         for s in info["symbols"]:
             if s["status"] != "TRADING": continue
             if s["quoteAsset"] != "USDT": continue
             if s["isSpotTradingAllowed"] is not True: continue
+
             base = s["baseAsset"].upper()
-            if any(base.endswith(x) for x in EXCLUDED_BASES): continue
-            valid[s["symbol"]] = True
 
-        tickers = session.get(BINANCE_URL + "/api/v3/ticker/24hr",
-                              timeout=REQUEST_TIMEOUT).json()
-        result = []
-        for t in tickers:
-            sym = t["symbol"]
-            if sym not in valid: continue
-            try:
-                vol = float(t["quoteVolume"])
-            except:
+            if base not in COIN_SET:
                 continue
-            # YALNIZ 24h həcmi >= 1M USDT olan coinlər
-            if vol < MIN_24H_VOLUME_USDT:
-                continue
-            result.append((sym, vol))
 
-        result.sort(key=lambda x: x[1], reverse=True)
-        return [x[0] for x in result]
+            valid_symbols.append(s["symbol"])
+            found_bases.add(base)
+
+        missing = COIN_SET - found_bases
+        if missing:
+            print(f"⚠️  Binance USDT-də tapılmayan: {sorted(missing)}")
+
+        return sorted(valid_symbols)
 
     except Exception as e:
         print("Symbol error:", e)
@@ -180,7 +196,7 @@ def create_dib1(symbol, timeframe, candle, reason=""):
 
 
 # ============================================================
-# CONFIRM DIB1 → KEÇ DIB2 MƏRHƏLƏSİNƏ
+# CONFIRM DIB1
 # ============================================================
 
 def confirm_dib1_and_start_dib2(symbol, timeframe, state, breaking_candle):
@@ -212,7 +228,7 @@ def confirm_dib1_and_start_dib2(symbol, timeframe, state, breaking_candle):
 
 
 # ============================================================
-# BREAKOUT / CHAIN / RESET ALERTS
+# ALERTS
 # ============================================================
 
 def send_breakout_alert(symbol, timeframe, state, breakout_candle):
@@ -258,7 +274,7 @@ def send_chain_signal(symbol, timeframe, state, breaking_candle):
 
 def send_reset_alert(symbol, timeframe, state, candle):
     print(f"[{format_time(candle['close_time'])}] "
-          f"{symbol} {timeframe} | DIB1 100-candle RESET (alert YOX)")
+          f"{symbol} {timeframe} | DIB1 100-candle RESET")
 
 
 # ============================================================
@@ -269,7 +285,6 @@ def process_dib1_phase(symbol, timeframe, state, candle):
 
     n = state["candles_since_dib1"]
 
-    # DIB1 BREAK
     if candle["low"] < state["dib1"]:
 
         high1_pos = state["high1_candle_number"]
@@ -290,7 +305,6 @@ def process_dib1_phase(symbol, timeframe, state, candle):
                         f"old DIB1={state['dib1']}")
             return
 
-    # HIGH1 İZLƏ — HƏR ŞAMDA
     if state["high1"] is None or candle["high"] > state["high1"]:
         state["high1"] = candle["high"]
         state["high1_time"] = candle["close_time"]
@@ -300,7 +314,7 @@ def process_dib1_phase(symbol, timeframe, state, candle):
 
 
 # ============================================================
-# KÖHNƏ DIB2 FAZASI (5m, 15m, 30m)
+# KÖHNƏ DIB2 (5m, 15m, 30m)
 # ============================================================
 
 def process_old_dib2_logic(symbol, timeframe, state, candle):
@@ -363,7 +377,7 @@ def process_old_dib2_logic(symbol, timeframe, state, candle):
 
 
 # ============================================================
-# CHAIN FAZASI (1h, 2h, 4h, 6h)
+# CHAIN (1h, 2h, 4h, 6h)
 # ============================================================
 
 def process_chain_logic(symbol, timeframe, state, candle):
@@ -385,7 +399,7 @@ def process_chain_logic(symbol, timeframe, state, candle):
 
 
 # ============================================================
-# DIB2 FAZASI DİSPATCHER
+# DIB2 DISPATCHER
 # ============================================================
 
 def process_dib2_phase(symbol, timeframe, state, candle):
@@ -489,7 +503,7 @@ def scan_symbol(symbol, timeframe):
 def main():
     print("=" * 70)
     print("BINANCE DIB1 + HIGH1 + DIB2 + BREAKOUT + CHAIN SCANNER")
-    print(f"Filter: 24h volume >= {MIN_24H_VOLUME_USDT:,.0f} USDT")
+    print(f"Filter: Manual COIN_LIST ({len(COIN_LIST)} coins)")
     print("Alert: 🚀 BREAKOUT  |  🎯 CHAIN")
     print("=" * 70)
 
@@ -505,8 +519,9 @@ def main():
                 if ns:
                     symbols = ns
                     last_top_refresh = ct
-                    print(f"\n{len(symbols)} coins loaded "
-                          f"(24h vol >= {MIN_24H_VOLUME_USDT/1_000_000:.0f}M USDT).")
+                    print(f"\n{len(symbols)} symbols loaded from COIN_LIST.")
+                else:
+                    print("⚠️  COIN_LIST-dən heç bir symbol tapılmadı.")
 
             for symbol in symbols:
                 for timeframe in TIMEFRAMES:
